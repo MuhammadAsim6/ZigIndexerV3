@@ -58,7 +58,7 @@ export function createPgPool(cfg: PgConfig): Pool {
     database: cfg.database,
     ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
     application_name: cfg.applicationName ?? 'cosmos-indexer',
-    max: cfg.poolSize ?? 16,
+    max: cfg.poolSize ?? 32, // ✅ Increased from 16 for 5.4M+ scale
     idleTimeoutMillis: 30_000,
   });
   return pool;

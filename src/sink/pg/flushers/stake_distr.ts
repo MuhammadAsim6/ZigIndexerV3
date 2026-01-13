@@ -10,10 +10,15 @@ import { execBatchedInsert } from '../batch.js';
  * @returns Promise<void>
  */
 
-export async function flushStakeDistr(client: PoolClient, rows: any[]): Promise<void> {
-  if (!rows.length) return;
+export async function flushStakeDistr(client: PoolClient, rowsAll: any[]): Promise<void> {
+  if (!rowsAll.length) return;
   await client.query(`SET LOCAL statement_timeout = '30s'`);
   await client.query(`SET LOCAL lock_timeout = '5s'`);
+
+  // ✅ FIX: Filter rows with required fields to prevent NULL constraint errors
+  const rows = rowsAll.filter((r) => r && r.delegator_address && r.event_type);
+  if (!rows.length) return;
+
   const cols = [
     'height',
     'tx_hash',

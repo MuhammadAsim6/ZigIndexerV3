@@ -125,8 +125,8 @@ CREATE TABLE core.event_attrs (
     key         TEXT NOT NULL,
     value       TEXT NULL,
     height      BIGINT NOT NULL,
-    PRIMARY KEY (tx_hash, msg_index, event_index, key)
-);
+    PRIMARY KEY (height, tx_hash, msg_index, event_index, key)
+) PARTITION BY RANGE (height);
 
 -- ============================================================================
 -- 3) BANK & STAKE
@@ -154,7 +154,7 @@ CREATE TABLE bank.balance_deltas (
 CREATE TABLE bank.balances_current (
     account  TEXT PRIMARY KEY,
     balances JSONB NOT NULL
-);
+) WITH (FILLFACTOR = 80);
 
 CREATE TABLE stake.delegation_events (
     height            BIGINT         NOT NULL,
@@ -176,7 +176,7 @@ CREATE TABLE stake.delegations_current (
     denom             TEXT           NOT NULL,
     amount            NUMERIC(80, 0) NOT NULL,
     PRIMARY KEY (delegator_address, validator_address, denom)
-);
+) WITH (FILLFACTOR = 80);
 
 CREATE TABLE stake.distribution_events (
     height            BIGINT         NOT NULL,
@@ -281,7 +281,7 @@ CREATE TABLE wasm.codes (
 
 CREATE TABLE wasm.contracts (
     address        TEXT PRIMARY KEY,
-    code_id        BIGINT NOT NULL REFERENCES wasm.codes (code_id),
+    code_id        BIGINT NOT NULL,  -- Removed FK: code may not exist if indexing from later block
     creator        TEXT   NULL,
     admin          TEXT   NULL,
     label          TEXT   NULL,
@@ -290,7 +290,7 @@ CREATE TABLE wasm.contracts (
 );
 
 CREATE TABLE wasm.contract_migrations (
-    contract     TEXT   NOT NULL REFERENCES wasm.contracts (address) ON DELETE CASCADE,
+    contract     TEXT   NOT NULL,  -- Removed FK: contract may not exist if indexing from later block
     from_code_id BIGINT NULL,
     to_code_id   BIGINT NOT NULL,
     height       BIGINT NOT NULL,
@@ -344,3 +344,29 @@ CREATE TABLE core.network_params (
     old_value JSONB       NULL,
     new_value JSONB       NOT NULL
 ) PARTITION BY RANGE (height);
+
+-- ============================================================================
+-- 8) QUERY-PATTERN INDEXES (For 5.4M+ scale)
+-- ============================================================================
+-- Transfers by address (common API query)
+CREATE INDEX IF NOT EXISTS idx_transfers_from ON bank.transfers (from_addr, height DESC);
+CREATE INDEX IF NOT EXISTS idx_transfers_to ON bank.transfers (to_addr, height DESC);
+
+-- Delegation events by delegator (staking dashboard)
+CREATE INDEX IF NOT EXISTS idx_delegation_delegator ON stake.delegation_events (delegator_address, height DESC);
+CREATE INDEX IF NOT EXISTS idx_distribution_delegator ON stake.distribution_events (delegator_address, height DESC);
+
+-- Messages by type (explorer query)
+CREATE INDEX IF NOT EXISTS idx_messages_type ON core.messages (type_url, height DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_signer ON core.messages (signer, height DESC);
+
+-- WASM by contract (dApp queries)
+CREATE INDEX IF NOT EXISTS idx_wasm_exec_contract ON wasm.executions (contract, height DESC);
+CREATE INDEX IF NOT EXISTS idx_wasm_events_contract ON wasm.events (contract, height DESC);
+
+-- IBC by channel (relayer/bridge queries)
+CREATE INDEX IF NOT EXISTS idx_ibc_channel ON ibc.packets (channel_id_src, status);
+
+-- Gov by proposal (governance dashboard)
+CREATE INDEX IF NOT EXISTS idx_gov_votes_proposal ON gov.votes (proposal_id, height DESC);
+CREATE INDEX IF NOT EXISTS idx_gov_deposits_proposal ON gov.deposits (proposal_id, height DESC);

@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS util.height_part_ranges (
 INSERT INTO util.height_part_ranges (schema_name, table_name, range_size) VALUES
  ('core', 'blocks', 1000000), ('core', 'transactions', 1000000), ('core', 'messages', 1000000),
  ('core', 'validator_set', 1000000), ('core', 'validator_missed_blocks', 1000000),
- ('core', 'network_params', 1000000),
+ ('core', 'network_params', 1000000), ('core', 'event_attrs', 100000),
  ('bank', 'transfers', 1000000), ('bank', 'balance_deltas', 1000000),
  ('stake', 'delegation_events', 1000000), ('stake', 'distribution_events', 1000000),
  ('gov', 'deposits', 1000000), ('gov', 'votes', 1000000),
@@ -29,7 +29,7 @@ DELETE FROM util.height_part_ranges
 WHERE (schema_name, table_name) NOT IN (
     ('core', 'blocks'), ('core', 'transactions'), ('core', 'messages'),
     ('core', 'validator_set'), ('core', 'validator_missed_blocks'),
-    ('core', 'network_params'),
+    ('core', 'network_params'), ('core', 'event_attrs'),
     ('bank', 'transfers'), ('bank', 'balance_deltas'),
     ('stake', 'delegation_events'), ('stake', 'distribution_events'),
     ('gov', 'deposits'), ('gov', 'votes'),

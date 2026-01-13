@@ -93,11 +93,11 @@ export function decodeAuthInfoToShape(authBytes: Uint8Array) {
 
   const fee = ai.fee
     ? {
-        amount: coinsToSnake(ai.fee.amount as any),
-        gas_limit: (ai.fee.gasLimit ?? Long.UZERO).toString(),
-        payer: ai.fee.payer ?? '',
-        granter: ai.fee.granter ?? '',
-      }
+      amount: coinsToSnake(ai.fee.amount as any),
+      gas_limit: (ai.fee.gasLimit ?? Long.UZERO).toString(),
+      payer: ai.fee.payer ?? '',
+      granter: ai.fee.granter ?? '',
+    }
     : { amount: [], gas_limit: '0', payer: '', granter: '' };
 
   return { signer_infos, fee, tip: (ai as any).tip ?? null };
@@ -120,8 +120,8 @@ export function decodeTxBase64(base64: string) {
     bodyBytes = txRaw.bodyBytes;
     authInfoBytes = txRaw.authInfoBytes;
     sigs = txRaw.signatures;
-  } catch {
-    /* noop */
+  } catch (e: any) {
+    log.debug('TxRaw decode failed, trying Tx.decode', { len: txBytes.length, error: e?.message });
   }
 
   if (!bodyBytes || bodyBytes.length === 0) {
@@ -132,8 +132,8 @@ export function decodeTxBase64(base64: string) {
       bodyBytes = body;
       authInfoBytes = auth;
       sigs = (full.signatures ?? []) as unknown as Uint8Array[];
-    } catch {
-      /* noop */
+    } catch (e: any) {
+      log.debug('Tx.decode also failed', { len: txBytes.length, error: e?.message });
     }
   }
 

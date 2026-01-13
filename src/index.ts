@@ -103,7 +103,10 @@ async function main() {
             updated_at_height: startFrom,
             updated_at_time: new Date()
           }));
+          // ✅ FIX: Explicit transaction for validator sync
+          await client.query('BEGIN');
           await upsertValidators(client, rows);
+          await client.query('COMMIT');
           log.info(`[start] synced ${vals.length} validators (Consensus ADDRs)`);
         }
       } finally {

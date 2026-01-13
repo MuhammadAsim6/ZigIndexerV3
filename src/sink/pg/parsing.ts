@@ -150,16 +150,32 @@ export function collectSignersFromMessages(msgs: any[]): string[] | null {
 }
 
 /**
- * Parses a Cosmos SDK coin string of the form `${amount}${denom}` (e.g., "123uatom" or "42ibc/ABC123").
- * Denom allows letters and the characters `/:-` after the first char.
+ * Parses a Cosmos SDK coin string of the form `${amount}${denom}` (e.g., "123uatom").
+ * If the string contains multiple coins (e.g., "123uatom,456usdt"), it returns the first one.
  * @param {(string|null|undefined)} amt - Coin string to parse.
  * @returns {{ denom: string, amount: string } | null} Parsed coin parts or `null` if input is invalid.
  */
 export function parseCoin(amt: string | null | undefined): { denom: string; amount: string } | null {
   if (!amt) return null;
-  const m = String(amt).match(/^(\d+)([a-zA-Z/][\w/:-]*)$/);
-  if (!m || !m[1] || !m[2]) return null;
-  return { amount: m[1], denom: m[2] };
+  const parts = String(amt).split(',');
+  const first = (parts[0] || '').trim();
+  if (!first) return null;
+  const m = first.match(/^(\d+)([a-zA-Z/][\w/:-]*)$/);
+  if (!m || m.length < 3) return null;
+  return { amount: m[1]!, denom: m[2]! };
+}
+
+/**
+ * Parses a multi-coin string (e.g., "100uatom,200usdt") into an array of coin objects.
+ * @param {(string|null|undefined)} amt - Multi-coin string to parse.
+ * @returns {{ denom: string, amount: string }[]} Array of parsed coins.
+ */
+export function parseCoins(amt: string | null | undefined): { denom: string; amount: string }[] {
+  if (!amt) return [];
+  return String(amt)
+    .split(',')
+    .map((s) => parseCoin(s.trim()))
+    .filter((c): c is { denom: string; amount: string } => c !== null);
 }
 
 /**
@@ -174,24 +190,24 @@ export function findAttr(attrs: Array<{ key: string; value: string | null }>, ke
 }
 /**
  * Parses a Cosmos SDK "Dec" string (18 decimal places, no point) into a decimal string for Postgres.
- * e.g. "100000000000000000" -> "0.1"
+ * e.g. "100000000000000000" -> "0.1", "1000000000000000000" -> "1"
  * @param {any} val - Value to parse.
  * @returns {string|null} Decimal string or null.
  */
 export function parseDec(val: any): string | null {
   if (val === undefined || val === null || val === '') return null;
-  const s = String(val);
+  const s = String(val).trim();
   if (s.includes('.')) return s; // Already decimal
-  if (s.length <= 18) {
-    const padded = s.padStart(19, '0');
-    const integerPart = padded.slice(0, padded.length - 18);
-    const fractionalPart = padded.slice(padded.length - 18);
-    return `${integerPart}.${fractionalPart}`.replace(/\.?0+$/, '');
-  } else {
-    const integerPart = s.slice(0, s.length - 18);
-    const fractionalPart = s.slice(s.length - 18);
-    return `${integerPart}.${fractionalPart}`.replace(/\.?0+$/, '');
-  }
+
+  // ✅ FIX: Unified logic for all lengths
+  // Pad to at least 18 chars, then split at -18 position
+  const padded = s.padStart(18, '0');
+  const integerPart = padded.length > 18 ? padded.slice(0, padded.length - 18) : '0';
+  const fractionalPart = padded.slice(-18);
+
+  // Combine and strip trailing zeros
+  const result = `${integerPart}.${fractionalPart}`.replace(/\.?0+$/, '');
+  return result || '0';
 }
 
 /**

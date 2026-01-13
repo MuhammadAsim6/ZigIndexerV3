@@ -48,10 +48,9 @@ CREATE INDEX IF NOT EXISTS idx_dex_pools_assets ON zigchain.dex_pools(base_denom
 -- 3. DEX SWAPS (Trading Volume)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
-    id                SERIAL, -- Removed PRIMARY KEY from here
     tx_hash           TEXT NOT NULL,
     msg_index         INT NOT NULL,
-    pool_id           TEXT NOT NULL REFERENCES zigchain.dex_pools(pool_id),
+    pool_id           TEXT NOT NULL,  -- Removed FK: pool may not exist if indexing from later block
     sender_address    TEXT NOT NULL,
     token_in_denom    TEXT,
     token_in_amount   TEXT, 
@@ -60,8 +59,8 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
     price_impact      TEXT, 
     block_height      BIGINT NOT NULL,
     timestamp         TIMESTAMPTZ DEFAULT NOW(),
-    -- 👇 Composite Primary Key (Required for Partitioning)
-    PRIMARY KEY (id, block_height) 
+    -- Composite Primary Key (tx uniqueness + partition key)
+    PRIMARY KEY (tx_hash, msg_index, block_height) 
 ) PARTITION BY RANGE (block_height);
 
 -- Auto-Partition: 0 to 1M Blocks
@@ -76,10 +75,9 @@ CREATE INDEX IF NOT EXISTS idx_dex_swaps_height ON zigchain.dex_swaps(block_heig
 -- 4. DEX LIQUIDITY (Add/Remove Events)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity (
-    id                SERIAL, -- Removed PRIMARY KEY from here
     tx_hash           TEXT NOT NULL,
     msg_index         INT NOT NULL,
-    pool_id           TEXT NOT NULL REFERENCES zigchain.dex_pools(pool_id),
+    pool_id           TEXT NOT NULL,  -- Removed FK: pool may not exist if indexing from later block
     sender_address    TEXT NOT NULL,
     action_type       TEXT NOT NULL, 
     amount_0          TEXT,         
@@ -87,8 +85,8 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity (
     shares_minted_burned TEXT,       
     block_height      BIGINT NOT NULL,
     timestamp         TIMESTAMPTZ DEFAULT NOW(),
-    -- 👇 Composite Primary Key (Required for Partitioning)
-    PRIMARY KEY (id, block_height)
+    -- Composite Primary Key (tx uniqueness + partition key)
+    PRIMARY KEY (tx_hash, msg_index, block_height)
 ) PARTITION BY RANGE (block_height);
 
 CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity_p0 PARTITION OF zigchain.dex_liquidity FOR VALUES FROM (0) TO (1000000);

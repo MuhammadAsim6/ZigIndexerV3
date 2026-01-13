@@ -20,19 +20,23 @@ services:
       - "${PG_PORT:-5432}:5432"
     volumes:
       - pgdata_cosmosindexer:/var/lib/postgresql/data
-    shm_size: 1gb
+    shm_size: 4gb  # ✅ Increased from 1gb for 5.4M+ scale
     command: 
       - "postgres"
       - "-c"
-      - "max_wal_size=4GB"
+      - "max_wal_size=8GB"  # ✅ Increased from 4GB
       - "-c"
-      - "min_wal_size=1GB"
+      - "min_wal_size=2GB"  # ✅ Increased from 1GB
       - "-c"
-      - "checkpoint_timeout=10min"
+      - "checkpoint_timeout=15min"  # ✅ Increased from 10min
       - "-c"
-      - "shared_buffers=1024MB"
+      - "shared_buffers=4096MB"  # ✅ Increased from 1024MB
       - "-c"
-      - "work_mem=64MB"
+      - "work_mem=128MB"  # ✅ Increased from 64MB
+      - "-c"
+      - "maintenance_work_mem=1GB"  # ✅ Added for faster VACUUM/INDEX
+      - "-c"
+      - "effective_cache_size=8GB"  # ✅ Added for query planning
 
   indexer:
     build:

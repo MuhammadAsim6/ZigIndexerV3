@@ -14,7 +14,7 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
   // Full list of partitioned tables (Range by Height/Sequence)
   const tables = [
     // Core
-    ['core', 'blocks'], ['core', 'transactions'], ['core', 'messages'],
+    ['core', 'blocks'], ['core', 'transactions'], ['core', 'messages'], ['core', 'event_attrs'],
     ['core', 'validator_set'], ['core', 'validator_missed_blocks'], ['core', 'network_params'],
 
     // Modules
@@ -35,12 +35,22 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     // 1. Ensure 16 Hash partitions for events
     await ensureEventsHashPartitions(client);
 
-    // 2. Ensure Range partitions
+    // 2. Ensure Range partitions for BOTH min and max heights
     for (const [schema, table] of tables) {
+      // Ensure partition for minHeight (start of range)
       await client.query(
         `SELECT util.ensure_partition_for_height($1, $2, $3)`,
-        [schema, table, maxHeight]
+        [schema, table, minHeight]
       );
+      // Ensure partition for maxHeight (end of range)
+      // Only if maxHeight is in a different partition bucket
+      const rangeSize = 100000; // Default from util.height_part_ranges
+      if (Math.floor(minHeight / rangeSize) !== Math.floor(maxHeight / rangeSize)) {
+        await client.query(
+          `SELECT util.ensure_partition_for_height($1, $2, $3)`,
+          [schema, table, maxHeight]
+        );
+      }
     }
   } catch (err: any) {
     log.error(`Failed to ensure partitions: ${err.message}`);
@@ -52,10 +62,11 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
 }
 
 /**
- * Ensures 16 hash-based partitions exist for the "core.events" table.
+ * Ensures 64 hash-based partitions exist for the "core.events" table.
+ * Using 64 buckets for better distribution at 5.4M+ blocks scale.
  */
 async function ensureEventsHashPartitions(client: PoolClient): Promise<void> {
-  const modulus = 16;
+  const modulus = 64; // ✅ Increased from 16 for better scaling
   for (let r = 0; r < modulus; r++) {
     const suffix = r.toString().padStart(2, '0');
     const sql = `

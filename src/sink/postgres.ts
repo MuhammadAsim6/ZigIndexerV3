@@ -16,6 +16,7 @@ import {
   buildFeeFromDecodedFee,
   collectSignersFromMessages,
   parseCoin,
+  parseCoins, // ✅ ADDED
   findAttr,
   normArray,
   parseDec,
@@ -40,6 +41,12 @@ import { flushGovDeposits, flushGovVotes, upsertGovProposals } from './pg/flushe
 import { upsertValidators } from './pg/flushers/validators.js';
 // ✅ ADDED: IBC Flusher
 import { flushIbcPackets } from './pg/flushers/ibc_packets.js';
+
+// ✅ ADDED: Bank & Params Flushers
+import { flushBalanceDeltas } from './pg/flushers/bank.js';
+import { flushNetworkParams } from './pg/flushers/params.js';
+// ✅ ADDED: WASM Registry Flusher
+import { flushWasmRegistry } from './pg/flushers/wasm.js';
 
 // ✅ Zigchain Flusher
 import { flushZigchainData } from './pg/flushers/zigchain.js';
@@ -97,6 +104,13 @@ export class PostgresSink implements Sink {
 
   // ✅ IBC Buffer
   private bufIbcPackets: any[] = [];
+
+  // ✅ ADDED: Missing Buffers
+  private bufBalanceDeltas: any[] = [];
+  private bufWasmCodes: any[] = [];
+  private bufWasmContracts: any[] = [];
+  private bufWasmMigrations: any[] = [];
+  private bufNetworkParams: any[] = [];
 
   // Zigchain Buffers
   private bufFactoryDenoms: any[] = [];
@@ -216,6 +230,13 @@ export class PostgresSink implements Sink {
     const stakeDelegRows: any[] = [];
     const stakeDistrRows: any[] = [];
 
+    // ✅ ADDED: New Local Arrays
+    const balanceDeltasRows: any[] = [];
+    const wasmCodesRows: any[] = [];
+    const wasmContractsRows: any[] = [];
+    const wasmMigrationsRows: any[] = [];
+    const networkParamsRows: any[] = [];
+
     const txs = Array.isArray(blockLine?.txs) ? blockLine.txs : [];
 
     for (const tx of txs) {
@@ -262,15 +283,31 @@ export class PostgresSink implements Sink {
 
         // 🟢 GOVERNANCE LOGIC (INCLUDED FAILED TXS) 🟢
 
-        // 1. VOTE
+        // 1. VOTE (Simple and Weighted)
         if (type === '/cosmos.gov.v1beta1.MsgVote' || type === '/cosmos.gov.v1.MsgVote') {
           govVotesRows.push({
             proposal_id: m.proposal_id,
             voter: m.voter,
             option: m.option?.toString() ?? 'VOTE_OPTION_UNSPECIFIED',
+            weight: null, // Simple votes have no weight
             height,
             tx_hash
           });
+        }
+
+        // 1b. WEIGHTED VOTE
+        if (type === '/cosmos.gov.v1beta1.MsgVoteWeighted' || type === '/cosmos.gov.v1.MsgVoteWeighted') {
+          const options = Array.isArray(m.options) ? m.options : [];
+          for (const opt of options) {
+            govVotesRows.push({
+              proposal_id: m.proposal_id,
+              voter: m.voter,
+              option: opt.option?.toString() ?? 'VOTE_OPTION_UNSPECIFIED',
+              weight: opt.weight ?? '1.0', // Weight is a decimal string like "0.5"
+              height,
+              tx_hash
+            });
+          }
         }
 
         // 2. DEPOSIT
@@ -295,15 +332,70 @@ export class PostgresSink implements Sink {
           const pid = findAttr(attrsToPairs(event?.attributes), 'proposal_id');
 
           if (pid) {
+            // ✅ FIX: Extract submitter and proposal_type
+            const submitter = m.proposer || m.signer || firstSigner;
+            // v1beta1 uses content.@type, v1 uses messages array
+            const proposalType = m.content?.['@type'] ??
+              (Array.isArray(m.messages) && m.messages[0]?.['@type']) ??
+              findAttr(attrsToPairs(event?.attributes), 'proposal_type') ??
+              null;
+
             govProposalsRows.push({
               proposal_id: pid,
+              submitter,
               title: m.content?.title ?? m.title ?? '',
               summary: m.content?.description ?? m.summary ?? '',
+              proposal_type: proposalType,
               submit_time: time,
               status: 'deposit_period',
-              // Proposal Type logic if needed
             });
           }
+        }
+
+        // 🟢 WASM REGISTRY (STORE/INSTANTIATE) 🟢
+        if (type === '/cosmwasm.wasm.v1.MsgStoreCode') {
+          const event = msgLog?.events.find((e: any) => e.type === 'store_code');
+          const attrs = attrsToPairs(event?.attributes);
+          const codeId = findAttr(attrs, 'code_id');
+          const checksum = findAttr(attrs, 'code_checksum') || findAttr(attrs, 'checksum') || m.checksum;
+
+          if (codeId) {
+            wasmCodesRows.push({
+              code_id: codeId,
+              checksum: checksum || '', // Ensure not null
+              creator: m.sender,
+              instantiate_permission: m.instantiate_permission,
+              store_tx_hash: tx_hash,
+              store_height: height
+            });
+          }
+        }
+
+        if (type === '/cosmwasm.wasm.v1.MsgInstantiateContract' ||
+          type === '/cosmwasm.wasm.v1.MsgInstantiateContract2') {
+          const event = msgLog?.events.find((e: any) => e.type === 'instantiate');
+          const addr = findAttr(attrsToPairs(event?.attributes), '_contract_address') || findAttr(attrsToPairs(event?.attributes), 'contract_address');
+          if (addr) {
+            wasmContractsRows.push({
+              address: addr,
+              code_id: m.code_id,
+              creator: m.sender,
+              admin: m.admin,
+              label: m.label,
+              created_height: height,
+              created_tx_hash: tx_hash
+            });
+          }
+        }
+
+        if (type === '/cosmwasm.wasm.v1.MsgMigrateContract') {
+          wasmMigrationsRows.push({
+            contract: m.contract,
+            from_code_id: null, // Would need Query to find previous, but we track the 'to' here
+            to_code_id: m.code_id,
+            height,
+            tx_hash
+          });
         }
 
         // 🟢 ZIGCHAIN LOGIC 🟢
@@ -327,6 +419,9 @@ export class PostgresSink implements Sink {
         if (type.endsWith('.MsgCreatePool')) {
           let poolId = null;
           let lpToken = null;
+          let pairId = null;
+          let baseReserve = null;
+          let quoteReserve = null;
 
           if (msgLog) {
             for (const e of msgLog.events) {
@@ -335,16 +430,26 @@ export class PostgresSink implements Sink {
               if (pid) poolId = pid;
               const lpt = findAttr(pairs, 'lp_token') || findAttr(pairs, 'lptoken_denom');
               if (lpt) lpToken = lpt;
+              // ✅ Extract pair_id if present
+              const pId = findAttr(pairs, 'pair_id');
+              if (pId) pairId = pId;
             }
           }
+
+          // Initial reserves from the message (create pool deposits initial liquidity)
+          baseReserve = m.base?.amount || '0';
+          quoteReserve = m.quote?.amount || '0';
 
           if (poolId) {
             dexPoolsRows.push({
               pool_id: poolId,
               creator_address: m.creator,
+              pair_id: pairId,
               base_denom: m.base?.denom,
               quote_denom: m.quote?.denom,
               lp_token_denom: lpToken,
+              base_reserve: baseReserve,
+              quote_reserve: quoteReserve,
               block_height: height,
               tx_hash: tx_hash
             });
@@ -444,15 +549,17 @@ export class PostgresSink implements Sink {
         if (type === '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward') {
           const event = msgLog?.events.find((e: any) => e.type === 'withdraw_rewards');
           const amountStr = event ? findAttr(attrsToPairs(event.attributes), 'amount') : null;
-          const coin = parseCoin(amountStr);
-          stakeDistrRows.push({
-            height, tx_hash, msg_index: i,
-            event_type: 'withdraw_reward',
-            delegator_address: m.delegator_address,
-            validator_address: m.validator_address,
-            denom: coin?.denom, amount: coin?.amount,
-            withdraw_address: null
-          });
+          const coins = parseCoins(amountStr);
+          for (const coin of coins) {
+            stakeDistrRows.push({
+              height, tx_hash, msg_index: i,
+              event_type: 'withdraw_reward',
+              delegator_address: m.delegator_address,
+              validator_address: m.validator_address,
+              denom: coin.denom, amount: coin.amount,
+              withdraw_address: null
+            });
+          }
         }
         if (type === '/cosmos.distribution.v1beta1.MsgSetWithdrawAddress') {
           stakeDistrRows.push({
@@ -493,8 +600,8 @@ export class PostgresSink implements Sink {
             const sender = findAttr(attrsPairs, 'sender');
             const recipient = findAttr(attrsPairs, 'recipient');
             const amountStr = findAttr(attrsPairs, 'amount');
-            const coin = parseCoin(amountStr);
-            if (sender && recipient && coin) {
+            const coins = parseCoins(amountStr);
+            for (const coin of coins) {
               transfersRows.push({
                 tx_hash, msg_index, from_addr: sender, to_addr: recipient,
                 denom: coin.denom, amount: coin.amount, height
@@ -511,16 +618,31 @@ export class PostgresSink implements Sink {
             const dstPort = findAttr(attrsPairs, 'packet_dst_port');
             const dstChan = findAttr(attrsPairs, 'packet_dst_channel');
 
+            // ✅ FIX: Extract timeout fields
+            const timeoutHeightStr = findAttr(attrsPairs, 'packet_timeout_height');
+            const timeoutTsStr = findAttr(attrsPairs, 'packet_timeout_timestamp');
+
             if (sequence && srcChan) {
               const dataJson = findAttr(attrsPairs, 'packet_data');
-              let amount = null, denom = null, relayer = null, memo = null;
+              let amount: string | null = null;
+              let denom: string | null = null;
+              let relayer: string | null = null;
+              let memo: string | null = null;
+              let sender: string | null = null;
+              let receiver: string | null = null;
+
               try {
                 if (dataJson) {
                   const d = JSON.parse(dataJson);
-                  amount = d.amount;
-                  denom = d.denom;
-                  relayer = d.sender || d.receiver;
-                  memo = d.memo;
+                  amount = d.amount ?? null;
+                  denom = d.denom ?? null;
+                  sender = d.sender ?? null;
+                  receiver = d.receiver ?? null;
+                  memo = d.memo ?? null;
+                  // Relayer is typically the sender for send_packet, receiver for recv_packet
+                  relayer = event_type === 'send_packet' ? sender :
+                    event_type === 'recv_packet' ? receiver :
+                      findAttr(attrsPairs, 'packet_ack_relayer') ?? sender;
                 }
               } catch { /* ignore parse error */ }
 
@@ -537,6 +659,8 @@ export class PostgresSink implements Sink {
                 sequence: sequence,
                 port_id_dst: dstPort,
                 channel_id_dst: dstChan,
+                timeout_height: timeoutHeightStr ?? null,
+                timeout_ts: timeoutTsStr ?? null,
                 status: statusMap[event_type] || 'failed',
                 tx_hash_send: event_type === 'send_packet' ? tx_hash : null,
                 height_send: event_type === 'send_packet' ? height : null,
@@ -544,7 +668,42 @@ export class PostgresSink implements Sink {
                 height_recv: event_type === 'recv_packet' ? height : null,
                 tx_hash_ack: event_type === 'acknowledge_packet' ? tx_hash : null,
                 height_ack: event_type === 'acknowledge_packet' ? height : null,
-                relayer, denom, amount, memo
+                relayer,
+                denom,
+                amount,
+                memo
+              });
+            }
+          }
+
+          // 🟢 BANK BALANCE DELTAS 🟢
+          if (event_type === 'coin_received' || event_type === 'coin_spent') {
+            const acc = findAttr(attrsPairs, event_type === 'coin_received' ? 'receiver' : 'spender');
+            const amountStr = findAttr(attrsPairs, 'amount');
+            const coins = parseCoins(amountStr);
+            for (const coin of coins) {
+              balanceDeltasRows.push({
+                height,
+                account: acc,
+                denom: coin.denom,
+                delta: event_type === 'coin_received' ? coin.amount : `-${coin.amount}`
+              });
+            }
+          }
+
+          // 🟢 NETWORK PARAMS 🟢
+          if (event_type === 'param_change') {
+            const module = findAttr(attrsPairs, 'module');
+            const key = findAttr(attrsPairs, 'key');
+            const value = findAttr(attrsPairs, 'value');
+            if (module && key) {
+              networkParamsRows.push({
+                height,
+                time,
+                module,
+                param_key: key,
+                old_value: null, // Event typically only has new value
+                new_value: tryParseJson(value)
               });
             }
           }
@@ -564,6 +723,7 @@ export class PostgresSink implements Sink {
       validatorsRows, // 👈 Returning Validator Data
       ibcPacketsRows, // 👈 Returning IBC Data
       factoryDenomsRows, dexPoolsRows, dexSwapsRows, dexLiquidityRows, wrapperSettingsRows,
+      balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, networkParamsRows,
       height
     };
   }
@@ -597,6 +757,13 @@ export class PostgresSink implements Sink {
     // ✅ Staking (Pushing to Buffers)
     this.bufStakeDeleg.push(...data.stakeDelegRows);
     this.bufStakeDistr.push(...data.stakeDistrRows);
+
+    // ✅ ADDED: New Buffers Persistence
+    this.bufBalanceDeltas.push(...data.balanceDeltasRows);
+    this.bufWasmCodes.push(...data.wasmCodesRows);
+    this.bufWasmContracts.push(...data.wasmContractsRows);
+    this.bufWasmMigrations.push(...data.wasmMigrationsRows);
+    this.bufNetworkParams.push(...data.networkParamsRows);
 
     // ✅ Validator (Pushing to Buffer)
     this.bufValidators.push(...data.validatorsRows);
@@ -658,6 +825,22 @@ export class PostgresSink implements Sink {
 
       // ✅ Flushing IBC Data
       await flushIbcPackets(client, this.bufIbcPackets); this.bufIbcPackets = [];
+
+      // ✅ ADDED: New Flushers
+      if (this.bufBalanceDeltas.length > 0) {
+        await flushBalanceDeltas(client, this.bufBalanceDeltas); this.bufBalanceDeltas = [];
+      }
+      if (this.bufWasmCodes.length > 0 || this.bufWasmContracts.length > 0 || this.bufWasmMigrations.length > 0) {
+        await flushWasmRegistry(client, {
+          codes: this.bufWasmCodes,
+          contracts: this.bufWasmContracts,
+          migrations: this.bufWasmMigrations
+        });
+        this.bufWasmCodes = []; this.bufWasmContracts = []; this.bufWasmMigrations = [];
+      }
+      if (this.bufNetworkParams.length > 0) {
+        await flushNetworkParams(client, this.bufNetworkParams); this.bufNetworkParams = [];
+      }
 
       // 3. Zigchain
       await flushZigchainData(client, {

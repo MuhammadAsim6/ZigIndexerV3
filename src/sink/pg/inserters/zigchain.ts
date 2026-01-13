@@ -5,7 +5,7 @@ import { makeMultiInsert } from '../batch.js';
 export async function insertFactoryDenoms(client: PoolClient, rows: any[]): Promise<void> {
   if (!rows?.length) return;
   const cols = [
-    'denom', 'creator_address', 'sub_denom', 'minting_cap', 
+    'denom', 'creator_address', 'sub_denom', 'minting_cap',
     'uri', 'uri_hash', 'description', 'creation_tx_hash', 'block_height'
   ];
   const { text, values } = makeMultiInsert(
@@ -21,8 +21,8 @@ export async function insertFactoryDenoms(client: PoolClient, rows: any[]): Prom
 export async function insertDexPools(client: PoolClient, rows: any[]): Promise<void> {
   if (!rows?.length) return;
   const cols = [
-    'pool_id', 'creator_address', 'pair_id', 
-    'base_denom', 'quote_denom', 'lp_token_denom', 
+    'pool_id', 'creator_address', 'pair_id',
+    'base_denom', 'quote_denom', 'lp_token_denom',
     'base_reserve', 'quote_reserve', // 👈 Added for Analytics
     'block_height', 'tx_hash'
   ];
@@ -47,7 +47,7 @@ export async function insertDexSwaps(client: PoolClient, rows: any[]): Promise<v
     'zigchain.dex_swaps',
     cols,
     rows,
-    'ON CONFLICT DO NOTHING'
+    'ON CONFLICT (tx_hash, msg_index, block_height) DO NOTHING'
   );
   await client.query(text, values);
 }
@@ -65,7 +65,7 @@ export async function insertDexLiquidity(client: PoolClient, rows: any[]): Promi
     'zigchain.dex_liquidity',
     cols,
     rows,
-    'ON CONFLICT DO NOTHING'
+    'ON CONFLICT (tx_hash, msg_index, block_height) DO NOTHING'
   );
   await client.query(text, values);
 }
@@ -74,7 +74,7 @@ export async function insertDexLiquidity(client: PoolClient, rows: any[]): Promi
 export async function insertWrapperSettings(client: PoolClient, rows: any[]): Promise<void> {
   if (!rows?.length) return;
   const cols = [
-    'denom', 'native_client_id', 'native_channel', 
+    'denom', 'native_client_id', 'native_channel',
     'decimal_difference', 'updated_at_height'
   ];
   const { text, values } = makeMultiInsert(
