@@ -1,28 +1,14 @@
-// src/sink/postgres.ts
 /**
  * PostgreSQL sink implementation.
- *
- * Consumes assembled block objects and persists them into a partitioned PostgreSQL schema.
- * Supports two modes:
- *  - "batch-insert": accumulate rows in memory and flush in batches within a single transaction
- *  - "block-atomic": write a single block and its related rows atomically within one transaction
- *
- * The sink is responsible for:
- *  - extracting row models from the assembled block
- *  - ensuring required partitions exist for the target height ranges
- *  - buffering rows and flushing in batches
- *  - recording sync progress (last processed height)
+ * Updated for Zigchain Custom Modules (DEX, Liquidity, WASM) AND Governance.
  */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Sink, SinkConfig } from './types.js';
 import { createPgPool, getPgPool, closePgPool } from '../db/pg.js';
 import { ensureCorePartitions } from '../db/partitions.js';
-import type { PoolClient } from 'pg';
 import { upsertProgress } from '../db/progress.js';
 import { getLogger } from '../utils/logger.js';
-import { makeMultiInsert, execBatchedInsert } from './pg/batch.ts';
 import {
-  normArray,
   pickMessages,
   pickLogs,
   attrsToPairs,
@@ -31,59 +17,37 @@ import {
   collectSignersFromMessages,
   parseCoin,
   findAttr,
-} from './pg/parsing.ts';
-import { flushBlocks } from './pg/flushers/blocks.ts';
-import { flushTxs } from './pg/flushers/txs.ts';
-import { flushMsgs } from './pg/flushers/msgs.ts';
-import { flushEvents } from './pg/flushers/events.ts';
-import { flushAttrs } from './pg/flushers/attrs.ts';
-import { flushTransfers } from './pg/flushers/transfers.ts';
-import { flushStakeDeleg } from './pg/flushers/stake_deleg.ts';
-import { flushStakeDistr } from './pg/flushers/stake_distr.ts';
-import { flushWasmExec } from './pg/flushers/wasm_exec.ts';
-import { flushWasmEvents } from './pg/flushers/wasm_events.ts';
-import { flushGovDeposits, flushGovVotes, upsertGovProposals } from './pg/flushers/gov.ts';
+  normArray,
+  parseDec,
+  tryParseJson,
+  toBigIntStr
+} from './pg/parsing.js';
 
-import { insertBlocks } from './pg/inserters/blocks.ts';
-import { insertTxs } from './pg/inserters/txs.ts';
-import { insertMsgs } from './pg/inserters/msgs.ts';
-import { insertEvents } from './pg/inserters/events.ts';
-import { insertAttrs } from './pg/inserters/attrs.ts';
-import { insertTransfers } from './pg/inserters/transfers.ts';
-import { insertStakeDeleg } from './pg/inserters/stake_deleg.ts';
-import { insertStakeDistr } from './pg/inserters/stake_distr.ts';
-import { insertWasmExec } from './pg/inserters/wasm_exec.ts';
-import { insertWasmEvents } from './pg/inserters/wasm_events.ts';
+// Standard Flushers
+import { flushBlocks } from './pg/flushers/blocks.js';
+import { flushTxs } from './pg/flushers/txs.js';
+import { flushMsgs } from './pg/flushers/msgs.js';
+import { flushEvents } from './pg/flushers/events.js';
+import { flushAttrs } from './pg/flushers/attrs.js';
+import { flushTransfers } from './pg/flushers/transfers.js';
+import { flushStakeDeleg } from './pg/flushers/stake_deleg.js';
+import { flushStakeDistr } from './pg/flushers/stake_distr.js';
+import { flushWasmExec } from './pg/flushers/wasm_exec.js';
+import { flushWasmEvents } from './pg/flushers/wasm_events.js';
+// ✅ ADDED: Gov Flushers
+import { flushGovDeposits, flushGovVotes, upsertGovProposals } from './pg/flushers/gov.js';
+// ✅ ADDED: Validator Flusher
+import { upsertValidators } from './pg/flushers/validators.js';
+// ✅ ADDED: IBC Flusher
+import { flushIbcPackets } from './pg/flushers/ibc_packets.js';
+
+// ✅ Zigchain Flusher
+import { flushZigchainData } from './pg/flushers/zigchain.js';
 
 const log = getLogger('sink/postgres');
 
-/**
- * Allowed persistence strategies for the PostgreSQL sink.
- * - `block-atomic`: each block is written in a dedicated transaction.
- * - `batch-insert`: rows are buffered and inserted in larger batches.
- */
 export type PostgresMode = 'block-atomic' | 'batch-insert';
 
-/**
- * Configuration for {@link PostgresSink}.
- * Extends the generic {@link SinkConfig} with PostgreSQL-specific options.
- * @property {object} pg                                   PostgreSQL connection options.
- * @property {string} [pg.connectionString]                Full PostgreSQL connection string (overrides discrete fields if provided).
- * @property {string} [pg.host]                            Hostname of the PostgreSQL server.
- * @property {number} [pg.port]                            Port of the PostgreSQL server.
- * @property {string} [pg.user]                            Database user.
- * @property {string} [pg.password]                        Database password.
- * @property {string} [pg.database]                        Database name.
- * @property {boolean} [pg.ssl]                            Whether to enable SSL for the connection.
- * @property {string} [pg.progressId]                      Identifier for storing sync progress checkpoints.
- * @property {PostgresMode} [mode='batch-insert']          Persistence mode.
- * @property {object} [batchSizes]                         Batch sizes per entity when `mode` is `batch-insert`.
- * @property {number} [batchSizes.blocks=1000]             Max buffered blocks before flush.
- * @property {number} [batchSizes.txs=2000]                Max buffered transactions before flush.
- * @property {number} [batchSizes.msgs=5000]               Max buffered messages before flush.
- * @property {number} [batchSizes.events=5000]             Max buffered events before flush.
- * @property {number} [batchSizes.attrs=10000]             Max buffered event attributes before flush.
- */
 export interface PostgresSinkConfig extends SinkConfig {
   pg: {
     connectionString?: string;
@@ -107,19 +71,11 @@ export interface PostgresSinkConfig extends SinkConfig {
 
 type BlockLine = any;
 
-type NormalizedLog = {
-  msg_index: number;
-  events: Array<{ type: string; attributes: any }>;
-};
-
-/**
- * Sink that writes blocks, transactions, messages and related rows into PostgreSQL.
- * @implements {Sink}
- */
 export class PostgresSink implements Sink {
   private cfg: PostgresSinkConfig;
   private mode: PostgresMode;
 
+  // Standard Buffers
   private bufBlocks: any[] = [];
   private bufTxs: any[] = [];
   private bufMsgs: any[] = [];
@@ -130,9 +86,24 @@ export class PostgresSink implements Sink {
   private bufStakeDistr: any[] = [];
   private bufWasmExec: any[] = [];
   private bufWasmEvents: any[] = [];
+
+  // ✅ Gov Buffers (Now Used)
   private bufGovDeposits: any[] = [];
   private bufGovVotes: any[] = [];
   private bufGovProposals: any[] = [];
+
+  // ✅ Validator Buffer
+  private bufValidators: any[] = [];
+
+  // ✅ IBC Buffer
+  private bufIbcPackets: any[] = [];
+
+  // Zigchain Buffers
+  private bufFactoryDenoms: any[] = [];
+  private bufDexPools: any[] = [];
+  private bufDexSwaps: any[] = [];
+  private bufDexLiquidity: any[] = [];
+  private bufWrapperSettings: any[] = [];
 
   private batchSizes = {
     blocks: 1000,
@@ -148,35 +119,21 @@ export class PostgresSink implements Sink {
     govDeposits: 5000,
     govVotes: 5000,
     govProposals: 1000,
+    validators: 500,
+    ibcPackets: 2000,
+    zigchain: 2000
   };
 
-  /**
-   * Create a new PostgreSQL sink.
-   * @param {PostgresSinkConfig} cfg Configuration for the sink.
-   */
   constructor(cfg: PostgresSinkConfig) {
     this.cfg = cfg;
     this.mode = cfg.mode ?? 'batch-insert';
     if (cfg.batchSizes) Object.assign(this.batchSizes, cfg.batchSizes);
   }
 
-  /**
-   * Initialize the sink by creating (or reusing) a PostgreSQL connection pool.
-   * Should be called once before the first {@link write}.
-   * @returns {Promise<void>}
-   */
   async init(): Promise<void> {
-    createPgPool({ ...this.cfg.pg, applicationName: 'cosmos-indexer' });
+    await createPgPool({ ...this.cfg.pg, applicationName: 'cosmos-indexer' });
   }
 
-  /**
-   * Ingest a single assembled block line (object or JSON string).
-   * Depending on the selected mode, the block is either written atomically or buffered for batch flush.
-   * Lines containing `{ error: ... }` are ignored.
-   * @param {unknown} line Assembled block object or its JSON string representation.
-   * @returns {Promise<void>}
-   * @throws {Error} Rethrows persistence errors from underlying operations.
-   */
   async write(line: any): Promise<void> {
     let obj: BlockLine;
     if (typeof line === 'string') {
@@ -197,56 +154,28 @@ export class PostgresSink implements Sink {
     }
   }
 
-  /**
-   * Flush buffered rows if the sink operates in `batch-insert` mode.
-   * No-op in `block-atomic` mode.
-   * @returns {Promise<void>}
-   */
   async flush(): Promise<void> {
     if (this.mode === 'batch-insert') {
       await this.flushAll();
     }
   }
 
-  /**
-   * Flush any remaining buffered data and close the PostgreSQL pool.
-   * Safe to call multiple times.
-   * @returns {Promise<void>}
-   */
   async close(): Promise<void> {
     await this.flush?.();
     await closePgPool();
   }
 
-  /**
-   * Transform an assembled block object into row-model arrays for all target tables.
-   * Also computes basic derived values (e.g., signers, parsed amounts) and normalizes logs.
-   *
-   * @param {any} blockLine The assembled block object produced by the pipeline.
-   * @returns {{
-   *   blockRow: any,
-   *   txRows: any[],
-   *   msgRows: any[],
-   *   evRows: any[],
-   *   attrRows: any[],
-   *   transfersRows: any[],
-   *   stakeDelegRows: any[],
-   *   stakeDistrRows: any[],
-   *   wasmExecRows: any[],
-   *   wasmEventsRows: any[],
-   *   height: number
-   * }} A bag of row arrays ready for persistence plus the block height.
-   */
   private extractRows(blockLine: BlockLine) {
     const height = Number(blockLine?.meta?.height);
     const time = new Date(blockLine?.meta?.time);
 
+    // Block Extraction
     const b = blockLine.block;
     const blockRow = {
       height,
       block_hash: b?.block_id?.hash ?? null,
       time,
-      proposer_address: b?.block?.last_commit?.signatures?.[0]?.validator_address ?? null,
+      proposer_address: b?.block?.header?.proposer_address ?? null,
       tx_count: Array.isArray(blockLine?.txs) ? blockLine.txs.length : 0,
       size_bytes: b?.block?.size ?? null,
       last_commit_hash: b?.block?.last_commit?.block_id?.hash ?? null,
@@ -260,15 +189,35 @@ export class PostgresSink implements Sink {
     const evRows: any[] = [];
     const attrRows: any[] = [];
     const transfersRows: any[] = [];
-    const stakeDelegRows: any[] = [];
-    const stakeDistrRows: any[] = [];
+
+    // Zigchain
+    const factoryDenomsRows: any[] = [];
+    const dexPoolsRows: any[] = [];
+    const dexSwapsRows: any[] = [];
+    const dexLiquidityRows: any[] = [];
+    const wrapperSettingsRows: any[] = [];
+
+    // WASM
     const wasmExecRows: any[] = [];
     const wasmEventsRows: any[] = [];
-    const govDepositsRows: any[] = [];
+
+    // ✅ Gov
     const govVotesRows: any[] = [];
+    const govDepositsRows: any[] = [];
     const govProposalsRows: any[] = [];
 
+    // ✅ Validator
+    const validatorsRows: any[] = [];
+
+    // ✅ IBC
+    const ibcPacketsRows: any[] = [];
+
+    // ✅ Staking & Distribution
+    const stakeDelegRows: any[] = [];
+    const stakeDistrRows: any[] = [];
+
     const txs = Array.isArray(blockLine?.txs) ? blockLine.txs : [];
+
     for (const tx of txs) {
       const tx_hash = tx.hash ?? tx.txhash ?? tx.tx_hash ?? null;
       const tx_index = Number(tx.index ?? tx.tx_index ?? tx?.tx_response?.index ?? 0);
@@ -281,7 +230,6 @@ export class PostgresSink implements Sink {
       const raw_tx = tx.raw_tx ?? tx?.decoded ?? tx?.raw ?? null;
       const log_summary = tx.log_summary ?? tx?.tx_response?.raw_log ?? null;
 
-      // determine messages early so we can derive signers if needed
       const msgs = pickMessages(tx);
       if (!signers || signers.length === 0) {
         const derived = collectSignersFromMessages(msgs);
@@ -290,68 +238,256 @@ export class PostgresSink implements Sink {
       const firstSigner = Array.isArray(signers) && signers.length ? signers[0] : null;
 
       txRows.push({
-        tx_hash,
-        height,
-        tx_index,
-        code,
-        gas_wanted,
-        gas_used,
-        fee,
-        memo,
-        signers,
-        raw_tx,
-        log_summary,
-        time,
+        tx_hash, height, tx_index, code, gas_wanted, gas_used, fee, memo, signers, raw_tx, log_summary, time
       });
 
-      // msgs already defined above
-      for (let i = 0; i < msgs.length; i++) {
-        const m = msgs[i];
-        msgRows.push({
-          tx_hash,
-          msg_index: i,
-          height,
-          type_url: m?.['@type'] ?? m?.type_url ?? '',
-          value: m,
-          signer: m?.signer ?? m?.from_address ?? m?.delegator_address ?? null,
-        });
+      const logs = pickLogs(tx);
+      // 🚀 PERFORMANCE: Map-based log lookup (O(1) instead of O(N))
+      const logMap = new Map<number, any>();
+      for (const l of logs) {
+        logMap.set(Number(l.msg_index), l);
       }
 
+      // --- PROCESS MESSAGES ---
       for (let i = 0; i < msgs.length; i++) {
         const m = msgs[i];
-        const t = m?.['@type'] ?? m?.type_url ?? '';
-        if (t === '/cosmwasm.wasm.v1.MsgExecuteContract') {
-          wasmExecRows.push({
+        const type = m?.['@type'] ?? m?.type_url ?? '';
+
+        msgRows.push({
+          tx_hash, msg_index: i, height, type_url: type, value: m,
+          signer: m?.signer ?? m?.from_address ?? m?.delegator_address ?? null,
+        });
+
+        const msgLog = logMap.get(i) || logMap.get(-1); // Fallback to flat log if per-msg missing
+
+        // 🟢 GOVERNANCE LOGIC (INCLUDED FAILED TXS) 🟢
+
+        // 1. VOTE
+        if (type === '/cosmos.gov.v1beta1.MsgVote' || type === '/cosmos.gov.v1.MsgVote') {
+          govVotesRows.push({
+            proposal_id: m.proposal_id,
+            voter: m.voter,
+            option: m.option?.toString() ?? 'VOTE_OPTION_UNSPECIFIED',
+            height,
+            tx_hash
+          });
+        }
+
+        // 2. DEPOSIT
+        if (type === '/cosmos.gov.v1beta1.MsgDeposit' || type === '/cosmos.gov.v1.MsgDeposit') {
+          const amounts = Array.isArray(m.amount) ? m.amount : [m.amount];
+          for (const coin of amounts) {
+            if (!coin) continue;
+            govDepositsRows.push({
+              proposal_id: m.proposal_id,
+              depositor: m.depositor,
+              amount: coin.amount,
+              denom: coin.denom,
+              height,
+              tx_hash
+            });
+          }
+        }
+
+        // 3. PROPOSAL (Only Success - ID is generated on-chain)
+        if ((type === '/cosmos.gov.v1beta1.MsgSubmitProposal' || type === '/cosmos.gov.v1.MsgSubmitProposal') && code === 0) {
+          const event = msgLog?.events.find((e: any) => e.type === 'submit_proposal');
+          const pid = findAttr(attrsToPairs(event?.attributes), 'proposal_id');
+
+          if (pid) {
+            govProposalsRows.push({
+              proposal_id: pid,
+              title: m.content?.title ?? m.title ?? '',
+              summary: m.content?.description ?? m.summary ?? '',
+              submit_time: time,
+              status: 'deposit_period',
+              // Proposal Type logic if needed
+            });
+          }
+        }
+
+        // 🟢 ZIGCHAIN LOGIC 🟢
+        if (type.endsWith('.MsgCreateDenom')) {
+          const event = msgLog?.events.find((e: any) => e.type === 'create_denom');
+          let finalDenom = event ? findAttr(attrsToPairs(event.attributes), 'denom') : `factory/${m.creator}/${m.sub_denom}`;
+
+          factoryDenomsRows.push({
+            denom: finalDenom,
+            creator_address: m.creator,
+            sub_denom: m.sub_denom,
+            minting_cap: m.minting_cap,
+            uri: m.URI,
+            uri_hash: m.URI_hash,
+            description: m.description,
+            creation_tx_hash: tx_hash,
+            block_height: height
+          });
+        }
+
+        if (type.endsWith('.MsgCreatePool')) {
+          let poolId = null;
+          let lpToken = null;
+
+          if (msgLog) {
+            for (const e of msgLog.events) {
+              const pairs = attrsToPairs(e.attributes);
+              const pid = findAttr(pairs, 'pool_id');
+              if (pid) poolId = pid;
+              const lpt = findAttr(pairs, 'lp_token') || findAttr(pairs, 'lptoken_denom');
+              if (lpt) lpToken = lpt;
+            }
+          }
+
+          if (poolId) {
+            dexPoolsRows.push({
+              pool_id: poolId,
+              creator_address: m.creator,
+              base_denom: m.base?.denom,
+              quote_denom: m.quote?.denom,
+              lp_token_denom: lpToken,
+              block_height: height,
+              tx_hash: tx_hash
+            });
+          }
+        }
+
+        if (type.endsWith('.MsgSwapExactIn') || type.endsWith('.MsgSwapExactOut') || type.endsWith('.MsgSwap')) {
+          dexSwapsRows.push({
             tx_hash,
             msg_index: i,
-            contract: m?.contract ?? m?.contract_address ?? null,
-            caller: m?.sender ?? null,
-            funds: m?.funds ?? null,
-            msg: m?.msg ?? null,
-            success: code === 0,
-            error: code === 0 ? null : (log_summary ?? null),
-            gas_used: gas_used,
-            height,
+            pool_id: m.pool_id,
+            sender_address: m.signer || m.creator || firstSigner,
+            token_in_denom: m.incoming?.denom || m.incoming_max?.denom,
+            token_in_amount: m.incoming?.amount || m.incoming_max?.amount,
+            token_out_denom: m.outgoing?.denom || m.outgoing_min?.denom,
+            token_out_amount: m.outgoing?.amount || m.outgoing_min?.amount,
+            block_height: height
+          });
+        }
+
+        if (type.endsWith('.MsgAddLiquidity') || type.endsWith('.MsgRemoveLiquidity')) {
+          dexLiquidityRows.push({
+            tx_hash,
+            msg_index: i,
+            pool_id: m.pool_id,
+            sender_address: m.creator || m.signer || firstSigner,
+            action_type: type.includes('Add') ? 'ADD' : 'REMOVE',
+            amount_0: m.token_0_amount || m.max_token_0,
+            amount_1: m.token_1_amount || m.max_token_1,
+            shares_minted_burned: m.share_amount || m.lp_token_out,
+            block_height: height
+          });
+        }
+
+        if (type.endsWith('.MsgUpdateIbcSettings')) {
+          wrapperSettingsRows.push({
+            denom: m.denom,
+            native_client_id: m.native_client_id,
+            native_channel: m.native_channel,
+            decimal_difference: m.decimal_difference,
+            updated_at_height: height
+          });
+        }
+
+        // 🟢 WASM LOGIC 🟢
+        if (type.endsWith('.MsgExecuteContract')) {
+          wasmExecRows.push({
+            tx_hash, msg_index: i, contract: m?.contract ?? m?.contract_address, caller: m?.sender,
+            funds: m?.funds, msg: tryParseJson(m?.msg), success: code === 0, error: code === 0 ? null : (log_summary),
+            gas_used, height
+          });
+        }
+
+        // 🟢 STAKING LOGIC 🟢
+        if (type === '/cosmos.staking.v1beta1.MsgCreateValidator' || type === '/cosmos.staking.v1beta1.MsgEditValidator') {
+          validatorsRows.push({
+            operator_address: m.validator_address || m.operator_address,
+            moniker: m.description?.moniker,
+            website: m.description?.website,
+            details: m.description?.details,
+            commission_rate: parseDec(m.commission?.rate || m.commission_rate),
+            max_commission_rate: parseDec(m.commission?.max_rate),
+            max_change_rate: parseDec(m.commission?.max_change_rate),
+            min_self_delegation: m.min_self_delegation,
+            status: 'BOND_STATUS_BONDED', // Default, would need Query or Event for real-time
+            updated_at_height: height,
+            updated_at_time: time
+          });
+        }
+
+        if (type === '/cosmos.staking.v1beta1.MsgDelegate' || type === '/cosmos.staking.v1beta1.MsgUndelegate') {
+          const coin = m.amount;
+          stakeDelegRows.push({
+            height, tx_hash, msg_index: i,
+            event_type: type.includes('Undelegate') ? 'undelegate' : 'delegate',
+            delegator_address: m.delegator_address,
+            validator_src: null,
+            validator_dst: m.validator_address,
+            denom: coin?.denom, amount: coin?.amount,
+            completion_time: null
+          });
+        }
+        if (type === '/cosmos.staking.v1beta1.MsgBeginRedelegate') {
+          const coin = m.amount;
+          stakeDelegRows.push({
+            height, tx_hash, msg_index: i,
+            event_type: 'redelegate',
+            delegator_address: m.delegator_address,
+            validator_src: m.validator_src_address,
+            validator_dst: m.validator_dst_address,
+            denom: coin?.denom, amount: coin?.amount,
+            completion_time: null
+          });
+        }
+
+        // 🟢 DISTRIBUTION LOGIC 🟢
+        if (type === '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward') {
+          const event = msgLog?.events.find((e: any) => e.type === 'withdraw_rewards');
+          const amountStr = event ? findAttr(attrsToPairs(event.attributes), 'amount') : null;
+          const coin = parseCoin(amountStr);
+          stakeDistrRows.push({
+            height, tx_hash, msg_index: i,
+            event_type: 'withdraw_reward',
+            delegator_address: m.delegator_address,
+            validator_address: m.validator_address,
+            denom: coin?.denom, amount: coin?.amount,
+            withdraw_address: null
+          });
+        }
+        if (type === '/cosmos.distribution.v1beta1.MsgSetWithdrawAddress') {
+          stakeDistrRows.push({
+            height, tx_hash, msg_index: i,
+            event_type: 'set_withdraw_address',
+            delegator_address: m.delegator_address,
+            withdraw_address: m.withdraw_address,
+            validator_address: null, denom: null, amount: null
           });
         }
       }
 
-      const logs = pickLogs(tx);
+      // --- PROCESS LOGS (Events) ---
       for (const log of logs) {
         const msg_index = Number(log?.msg_index ?? -1);
         const events = normArray<any>(log?.events);
+
         for (let ei = 0; ei < events.length; ei++) {
           const ev = events[ei];
           const event_type = String(ev?.type ?? 'unknown');
           const attrsPairs = attrsToPairs(ev?.attributes);
+
           evRows.push({
-            tx_hash,
-            msg_index,
-            event_index: ei,
-            event_type,
-            attributes: attrsPairs,
-            height,
+            tx_hash, msg_index, event_index: ei, event_type,
+            attributes: attrsPairs, height
           });
+
+          if (event_type === 'wasm') {
+            const contract = findAttr(attrsPairs, 'contract_address') || findAttr(attrsPairs, '_contract_address');
+            if (contract) {
+              wasmEventsRows.push({
+                contract, height, tx_hash, msg_index, event_type, attributes: attrsPairs
+              });
+            }
+          }
 
           if (event_type === 'transfer') {
             const sender = findAttr(attrsPairs, 'sender');
@@ -360,415 +496,185 @@ export class PostgresSink implements Sink {
             const coin = parseCoin(amountStr);
             if (sender && recipient && coin) {
               transfersRows.push({
-                tx_hash,
-                msg_index,
-                from_addr: sender,
-                to_addr: recipient,
-                denom: coin.denom,
-                amount: coin.amount,
-                height,
+                tx_hash, msg_index, from_addr: sender, to_addr: recipient,
+                denom: coin.denom, amount: coin.amount, height
               });
             }
           }
 
-          if (
-            event_type === 'delegate' ||
-            event_type === 'redelegate' ||
-            event_type === 'unbond' ||
-            event_type === 'complete_unbonding'
-          ) {
-            // Pull from event attributes first
-            let delegator = findAttr(attrsPairs, 'delegator');
-            let validator = findAttr(attrsPairs, 'validator');
-            let srcVal = findAttr(attrsPairs, 'source_validator');
-            let dstVal = findAttr(attrsPairs, 'destination_validator');
+          // 🟢 IBC LOGIC 🟢
+          if (['send_packet', 'recv_packet', 'acknowledge_packet', 'timeout_packet'].includes(event_type)) {
+            const sequenceStr = findAttr(attrsPairs, 'packet_sequence');
+            const sequence = toBigIntStr(sequenceStr);
+            const srcPort = findAttr(attrsPairs, 'packet_src_port');
+            const srcChan = findAttr(attrsPairs, 'packet_src_channel');
+            const dstPort = findAttr(attrsPairs, 'packet_dst_port');
+            const dstChan = findAttr(attrsPairs, 'packet_dst_channel');
 
-            // Amount may be in "amount" or "completion_amount" as a joined string like "12345uatom"
-            let amountStr = findAttr(attrsPairs, 'amount') ?? findAttr(attrsPairs, 'completion_amount');
-            let coin = parseCoin(amountStr ?? '');
-
-            // Fallbacks from the original message when logs are sparse (older ABCI formats)
-            // msg_index may be -1 for flat logs; only fallback when we know the specific message
-            if ((!delegator || !srcVal || !dstVal || !coin) && msg_index >= 0 && msg_index < msgs.length) {
-              const mm = msgs[msg_index] ?? {};
-              // Delegator present in most staking messages
-              if (!delegator && typeof mm.delegator_address === 'string') {
-                delegator = mm.delegator_address;
-              }
-              // Validators by message type
-              const mType = mm?.['@type'] ?? mm?.type_url ?? '';
-              if (mType.includes('MsgBeginRedelegate')) {
-                if (!srcVal && typeof mm.source_validator_address === 'string') srcVal = mm.source_validator_address;
-                if (!dstVal && typeof mm.destination_validator_address === 'string')
-                  dstVal = mm.destination_validator_address;
-              } else if (mType.includes('MsgDelegate') || mType.includes('MsgUndelegate')) {
-                if (!validator && typeof mm.validator_address === 'string') validator = mm.validator_address;
-                if (!dstVal) dstVal = validator ?? dstVal ?? null;
-              }
-              // Amount/denom may be structured in the message (object or array)
-              if (!coin) {
-                const mAmt = mm.amount;
-                if (mAmt && typeof mAmt === 'object') {
-                  if (Array.isArray(mAmt) && mAmt.length > 0) {
-                    const first = mAmt[0];
-                    if (first && typeof first.amount === 'string' && typeof first.denom === 'string') {
-                      coin = { amount: first.amount, denom: first.denom };
-                    }
-                  } else if (typeof mAmt.amount === 'string' && typeof mAmt.denom === 'string') {
-                    coin = { amount: mAmt.amount, denom: mAmt.denom };
-                  }
+            if (sequence && srcChan) {
+              const dataJson = findAttr(attrsPairs, 'packet_data');
+              let amount = null, denom = null, relayer = null, memo = null;
+              try {
+                if (dataJson) {
+                  const d = JSON.parse(dataJson);
+                  amount = d.amount;
+                  denom = d.denom;
+                  relayer = d.sender || d.receiver;
+                  memo = d.memo;
                 }
-              }
-            }
+              } catch { /* ignore parse error */ }
 
-            const completion_time = findAttr(attrsPairs, 'completion_time');
+              const statusMap: Record<string, string> = {
+                send_packet: 'sent',
+                recv_packet: 'received',
+                acknowledge_packet: 'acknowledged',
+                timeout_packet: 'timeout'
+              };
 
-            stakeDelegRows.push({
-              height,
-              tx_hash,
-              msg_index,
-              event_type,
-              delegator_address: delegator ?? firstSigner ?? null,
-              validator_src: srcVal ?? null,
-              validator_dst: dstVal ?? validator ?? null,
-              denom: coin?.denom ?? null,
-              amount: coin?.amount ?? null,
-              completion_time: completion_time ? new Date(completion_time) : null,
-            });
-          }
-
-          if (
-            event_type === 'withdraw_rewards' ||
-            event_type === 'withdraw_commission' ||
-            event_type === 'set_withdraw_address'
-          ) {
-            const delegator = findAttr(attrsPairs, 'delegator');
-            const validator = findAttr(attrsPairs, 'validator') ?? findAttr(attrsPairs, 'validator_address');
-            const withdrawAddr =
-              findAttr(attrsPairs, 'withdraw_address') ?? findAttr(attrsPairs, 'withdraw_address_old');
-            // суммы могут быть как "123uatom" так и списком, но в ABCI обычно одна
-            const amountStr = findAttr(attrsPairs, 'amount');
-            const coin = parseCoin(amountStr ?? '');
-
-            stakeDistrRows.push({
-              height,
-              tx_hash,
-              msg_index,
-              event_type,
-              delegator_address: delegator ?? null,
-              validator_address: validator ?? null,
-              denom: coin?.denom ?? null,
-              amount: coin?.amount ?? null,
-              withdraw_address: withdrawAddr ?? null,
-            });
-          }
-
-          if (event_type === 'wasm') {
-            const contract = findAttr(attrsPairs, '_contract_address') ?? findAttr(attrsPairs, 'contract_address');
-            if (contract) {
-              wasmEventsRows.push({
-                contract,
-                height,
-                tx_hash,
-                msg_index,
-                event_type,
-                attributes: attrsPairs,
+              ibcPacketsRows.push({
+                port_id_src: srcPort,
+                channel_id_src: srcChan,
+                sequence: sequence,
+                port_id_dst: dstPort,
+                channel_id_dst: dstChan,
+                status: statusMap[event_type] || 'failed',
+                tx_hash_send: event_type === 'send_packet' ? tx_hash : null,
+                height_send: event_type === 'send_packet' ? height : null,
+                tx_hash_recv: event_type === 'recv_packet' ? tx_hash : null,
+                height_recv: event_type === 'recv_packet' ? height : null,
+                tx_hash_ack: event_type === 'acknowledge_packet' ? tx_hash : null,
+                height_ack: event_type === 'acknowledge_packet' ? height : null,
+                relayer, denom, amount, memo
               });
             }
           }
 
           for (const { key, value } of attrsPairs) {
-            attrRows.push({
-              tx_hash,
-              msg_index,
-              event_index: ei,
-              key,
-              value,
-              height,
-            });
+            attrRows.push({ tx_hash, msg_index, event_index: ei, key, value, height });
           }
         }
       }
     }
 
-    // Governance rows extraction
-    const gov = blockLine?.gov ?? {};
-    if (Array.isArray(gov.deposits)) {
-      for (const r of gov.deposits) govDepositsRows.push(r);
-    }
-    if (Array.isArray(gov.votes)) {
-      for (const r of gov.votes) govVotesRows.push(r);
-    }
-    if (Array.isArray(gov.proposals)) {
-      for (const r of gov.proposals) govProposalsRows.push(r);
-    }
-
     return {
-      blockRow,
-      txRows,
-      msgRows,
-      evRows,
-      attrRows,
-      transfersRows,
-      stakeDelegRows,
-      stakeDistrRows,
-      wasmExecRows,
-      wasmEventsRows,
-      govDepositsRows,
-      govVotesRows,
-      govProposalsRows,
-      height,
+      blockRow, txRows, msgRows, evRows, attrRows,
+      transfersRows, wasmExecRows, wasmEventsRows,
+      govVotesRows, govDepositsRows, govProposalsRows, // 👈 Returning Gov Data
+      stakeDelegRows, stakeDistrRows, // 👈 Returning Staking Data
+      validatorsRows, // 👈 Returning Validator Data
+      ibcPacketsRows, // 👈 Returning IBC Data
+      factoryDenomsRows, dexPoolsRows, dexSwapsRows, dexLiquidityRows, wrapperSettingsRows,
+      height
     };
   }
 
-  /**
-   * Persist a single block atomically within one database transaction.
-   * Ensures partitions for the block's height exist, writes all related rows,
-   * and commits on success or rolls back on error.
-   * @param {any} blockLine Assembled block object.
-   * @returns {Promise<void>}
-   * @throws {Error} When any insert fails; the transaction is rolled back.
-   */
-  private async persistBlockAtomic(blockLine: BlockLine): Promise<void> {
-    const pool = getPgPool();
-    const {
-      blockRow,
-      txRows,
-      msgRows,
-      evRows,
-      attrRows,
-      transfersRows,
-      stakeDelegRows,
-      stakeDistrRows,
-      wasmExecRows,
-      wasmEventsRows,
-      height,
-    } = this.extractRows(blockLine);
-
-    const client = await pool.connect();
-    try {
-      await ensureCorePartitions(client, height);
-      await client.query('BEGIN');
-      await insertBlocks(client, [blockRow]);
-      if (txRows.length) await insertTxs(client, txRows);
-      if (msgRows.length) await insertMsgs(client, msgRows);
-      if (evRows.length) await insertEvents(client, evRows);
-      if (attrRows.length) await insertAttrs(client, attrRows);
-      if (transfersRows.length) await insertTransfers(client, transfersRows);
-      if (stakeDelegRows.length) await insertStakeDeleg(client, stakeDelegRows);
-      if (stakeDistrRows.length) await insertStakeDistr(client, stakeDistrRows);
-      if (wasmExecRows.length) await insertWasmExec(client, wasmExecRows);
-      if (wasmEventsRows.length) await insertWasmEvents(client, wasmEventsRows);
-      await client.query('COMMIT');
-    } catch (e) {
-      await client.query('ROLLBACK');
-      throw e;
-    } finally {
-      client.release();
-    }
-  }
-
-  /**
-   * Buffer rows derived from the given block and trigger a batch flush once any buffer
-   * exceeds its configured threshold.
-   * @param {any} blockLine Assembled block object.
-   * @returns {Promise<void>}
-   */
   private async persistBlockBuffered(blockLine: BlockLine): Promise<void> {
-    const {
-      blockRow,
-      txRows,
-      msgRows,
-      evRows,
-      attrRows,
-      transfersRows,
-      stakeDelegRows,
-      stakeDistrRows,
-      wasmExecRows,
-      wasmEventsRows,
-      govDepositsRows,
-      govVotesRows,
-      govProposalsRows,
-    } = this.extractRows(blockLine);
+    const data = this.extractRows(blockLine);
 
-    this.bufBlocks.push(blockRow);
-    this.bufTxs.push(...txRows);
-    this.bufMsgs.push(...msgRows);
-    this.bufEvents.push(...evRows);
-    this.bufAttrs.push(...attrRows);
+    this.bufBlocks.push(data.blockRow);
+    this.bufTxs.push(...data.txRows);
+    this.bufMsgs.push(...data.msgRows);
+    this.bufEvents.push(...data.evRows);
+    this.bufAttrs.push(...data.attrRows);
+    this.bufTransfers.push(...data.transfersRows);
 
-    this.bufTransfers.push(...transfersRows);
-    this.bufStakeDeleg.push(...stakeDelegRows);
-    this.bufStakeDistr.push(...stakeDistrRows);
-    this.bufWasmExec.push(...wasmExecRows);
-    this.bufWasmEvents.push(...wasmEventsRows);
+    // Zigchain
+    this.bufFactoryDenoms.push(...data.factoryDenomsRows);
+    this.bufDexPools.push(...data.dexPoolsRows);
+    this.bufDexSwaps.push(...data.dexSwapsRows);
+    this.bufDexLiquidity.push(...data.dexLiquidityRows);
+    this.bufWrapperSettings.push(...data.wrapperSettingsRows);
 
-    this.bufGovDeposits.push(...govDepositsRows);
-    this.bufGovVotes.push(...govVotesRows);
-    this.bufGovProposals.push(...govProposalsRows);
+    // WASM
+    this.bufWasmExec.push(...data.wasmExecRows);
+    this.bufWasmEvents.push(...data.wasmEventsRows);
+
+    // ✅ Gov (Pushing to Buffers)
+    this.bufGovVotes.push(...data.govVotesRows);
+    this.bufGovDeposits.push(...data.govDepositsRows);
+    this.bufGovProposals.push(...data.govProposalsRows);
+
+    // ✅ Staking (Pushing to Buffers)
+    this.bufStakeDeleg.push(...data.stakeDelegRows);
+    this.bufStakeDistr.push(...data.stakeDistrRows);
+
+    // ✅ Validator (Pushing to Buffer)
+    this.bufValidators.push(...data.validatorsRows);
+
+    // ✅ IBC (Pushing to Buffer)
+    this.bufIbcPackets.push(...data.ibcPacketsRows);
+
+    const zCount = this.bufFactoryDenoms.length + this.bufDexPools.length + this.bufDexSwaps.length + this.bufDexLiquidity.length;
+    const gCount = this.bufGovVotes.length + this.bufGovDeposits.length;
 
     const needFlush =
       this.bufBlocks.length >= this.batchSizes.blocks ||
       this.bufTxs.length >= this.batchSizes.txs ||
-      this.bufMsgs.length >= this.batchSizes.msgs ||
-      this.bufEvents.length >= this.batchSizes.events ||
-      this.bufAttrs.length >= this.batchSizes.attrs ||
-      this.bufTransfers.length >= this.batchSizes.transfers ||
-      this.bufStakeDeleg.length >= this.batchSizes.stakeDeleg ||
-      this.bufStakeDistr.length >= this.batchSizes.stakeDistr ||
-      this.bufWasmExec.length >= this.batchSizes.wasmExec ||
-      this.bufWasmEvents.length >= this.batchSizes.wasmEvents ||
-      this.bufGovDeposits.length >= this.batchSizes.govDeposits ||
-      this.bufGovVotes.length >= this.batchSizes.govVotes ||
-      this.bufGovProposals.length >= this.batchSizes.govProposals;
+      zCount >= this.batchSizes.zigchain ||
+      gCount >= this.batchSizes.govVotes;
 
     if (needFlush) {
-      const counts = {
-        blocks: this.bufBlocks.length,
-        txs: this.bufTxs.length,
-        msgs: this.bufMsgs.length,
-        events: this.bufEvents.length,
-        attrs: this.bufAttrs.length,
-        transfers: this.bufTransfers.length,
-        stakeDeleg: this.bufStakeDeleg.length,
-        stakeDistr: this.bufStakeDistr.length,
-        wasmExec: this.bufWasmExec.length,
-        wasmEvents: this.bufWasmEvents.length,
-        govDeposits: this.bufGovDeposits.length,
-        govVotes: this.bufGovVotes.length,
-        govProposals: this.bufGovProposals.length,
-      };
-      log.debug(
-        `flush trigger: blocks=${counts.blocks} txs=${counts.txs} msgs=${counts.msgs} events=${counts.events} attrs=${counts.attrs}`,
-      );
+      log.debug(`flush trigger: blocks=${this.bufBlocks.length}`);
       await this.flushAll();
     }
   }
 
-  /**
-   * Flush all buffered rows in a single transaction, creating any missing partitions
-   * for the covered height range. On success, clears the buffers and updates the sync progress.
-   * @returns {Promise<void>}
-   * @throws {Error} Rethrows database errors; buffers remain intact if the transaction fails.
-   */
   private async flushAll(): Promise<void> {
-    if (
-      this.bufBlocks.length === 0 &&
-      this.bufTxs.length === 0 &&
-      this.bufMsgs.length === 0 &&
-      this.bufEvents.length === 0 &&
-      this.bufAttrs.length === 0 &&
-      this.bufTransfers.length === 0 &&
-      this.bufStakeDeleg.length === 0 &&
-      this.bufStakeDistr.length === 0 &&
-      this.bufWasmExec.length === 0 &&
-      this.bufWasmEvents.length === 0 &&
-      this.bufGovDeposits.length === 0 &&
-      this.bufGovVotes.length === 0 &&
-      this.bufGovProposals.length === 0
-    )
-      return;
+    if (this.bufBlocks.length === 0 && this.bufTxs.length === 0) return;
 
     const pool = getPgPool();
     const client = await pool.connect();
     try {
-      const heights: number[] = [
-        ...this.bufBlocks.map((r) => r.height),
-        ...this.bufTxs.map((r) => r.height),
-        ...this.bufMsgs.map((r) => r.height),
-        ...this.bufEvents.map((r) => r.height),
-        ...this.bufAttrs.map((r) => r.height),
-        ...this.bufTransfers.map((r) => r.height),
-        ...this.bufStakeDeleg.map((r) => r.height),
-        ...this.bufStakeDistr.map((r) => r.height),
-        ...this.bufWasmExec.map((r) => r.height),
-        ...this.bufWasmEvents.map((r) => r.height),
-        ...this.bufGovDeposits.map((r) => r.height),
-        ...this.bufGovVotes.map((r) => r.height),
-        ...this.bufGovProposals.map((r) => r.height),
-      ].filter((h): h is number => Number.isFinite(h)); // ← фильтр
-
-      if (heights.length === 0) {
-        client.release();
-        return;
-      }
-
+      const heights = this.bufBlocks.map(r => r.height);
       const minH = Math.min(...heights);
       const maxH = Math.max(...heights);
 
-      log.debug('ensure partitions', {
-        minH,
-        maxH,
-        counts: {
-          blocks: this.bufBlocks.length,
-          txs: this.bufTxs.length,
-          msgs: this.bufMsgs.length,
-          events: this.bufEvents.length,
-          attrs: this.bufAttrs.length,
-          govDeposits: this.bufGovDeposits.length,
-          govVotes: this.bufGovVotes.length,
-          govProposals: this.bufGovProposals.length,
-        },
-      });
-      const snapshotCounts = {
-        blocks: this.bufBlocks.length,
-        txs: this.bufTxs.length,
-        msgs: this.bufMsgs.length,
-        events: this.bufEvents.length,
-        attrs: this.bufAttrs.length,
-        transfers: this.bufTransfers.length,
-        stakeDeleg: this.bufStakeDeleg.length,
-        stakeDistr: this.bufStakeDistr.length,
-        wasmExec: this.bufWasmExec.length,
-        wasmEvents: this.bufWasmEvents.length,
-        govDeposits: this.bufGovDeposits.length,
-        govVotes: this.bufGovVotes.length,
-        govProposals: this.bufGovProposals.length,
-      };
-      const t0 = Date.now();
-
       await ensureCorePartitions(client, minH, maxH);
-
       await client.query('BEGIN');
 
-      await flushBlocks(client, this.bufBlocks);
-      this.bufBlocks = [];
-      await flushTxs(client, this.bufTxs);
-      this.bufTxs = [];
-      await flushMsgs(client, this.bufMsgs);
-      this.bufMsgs = [];
-      await flushEvents(client, this.bufEvents);
-      this.bufEvents = [];
-      await flushAttrs(client, this.bufAttrs);
-      this.bufAttrs = [];
+      // 1. Standard
+      await flushBlocks(client, this.bufBlocks); this.bufBlocks = [];
+      await flushTxs(client, this.bufTxs); this.bufTxs = [];
+      await flushMsgs(client, this.bufMsgs); this.bufMsgs = [];
+      await flushEvents(client, this.bufEvents); this.bufEvents = [];
+      await flushAttrs(client, this.bufAttrs); this.bufAttrs = [];
+      await flushTransfers(client, this.bufTransfers); this.bufTransfers = [];
 
-      await flushTransfers(client, this.bufTransfers);
-      this.bufTransfers = [];
-      await flushStakeDeleg(client, this.bufStakeDeleg);
-      this.bufStakeDeleg = [];
-      await flushStakeDistr(client, this.bufStakeDistr);
-      this.bufStakeDistr = [];
-      await flushWasmExec(client, this.bufWasmExec);
-      this.bufWasmExec = [];
-      await flushWasmEvents(client, this.bufWasmEvents);
-      this.bufWasmEvents = [];
+      // 2. Modules (WASM & Gov)
+      await flushWasmExec(client, this.bufWasmExec); this.bufWasmExec = [];
+      await flushWasmEvents(client, this.bufWasmEvents); this.bufWasmEvents = [];
 
-      await flushGovDeposits(client, this.bufGovDeposits);
-      this.bufGovDeposits = [];
-      await flushGovVotes(client, this.bufGovVotes);
-      this.bufGovVotes = [];
-      await upsertGovProposals(client, this.bufGovProposals);
-      this.bufGovProposals = [];
+      // ✅ Flushing Gov Data
+      await flushGovVotes(client, this.bufGovVotes); this.bufGovVotes = [];
+      await flushGovDeposits(client, this.bufGovDeposits); this.bufGovDeposits = [];
+      await upsertGovProposals(client, this.bufGovProposals); this.bufGovProposals = [];
+
+      // ✅ Flushing Staking Data
+      await flushStakeDeleg(client, this.bufStakeDeleg); this.bufStakeDeleg = [];
+      await flushStakeDistr(client, this.bufStakeDistr); this.bufStakeDistr = [];
+
+      // ✅ Flushing Validator Data
+      await upsertValidators(client, this.bufValidators); this.bufValidators = [];
+
+      // ✅ Flushing IBC Data
+      await flushIbcPackets(client, this.bufIbcPackets); this.bufIbcPackets = [];
+
+      // 3. Zigchain
+      await flushZigchainData(client, {
+        factoryDenoms: this.bufFactoryDenoms,
+        dexPools: this.bufDexPools,
+        dexSwaps: this.bufDexSwaps,
+        dexLiquidity: this.bufDexLiquidity,
+        wrapperSettings: this.bufWrapperSettings
+      });
+      this.bufFactoryDenoms = [];
+      this.bufDexPools = [];
+      this.bufDexSwaps = [];
+      this.bufDexLiquidity = [];
+      this.bufWrapperSettings = [];
 
       await upsertProgress(client, this.cfg.pg?.progressId ?? 'default', maxH);
-
       await client.query('COMMIT');
-      const tookMs = Date.now() - t0;
-      log.info('flushed', {
-        span: `[${minH}, ${maxH}]`,
-        rows: snapshotCounts,
-        tookMs,
-      });
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;
@@ -776,4 +682,7 @@ export class PostgresSink implements Sink {
       client.release();
     }
   }
+
+  // Atomic mode stub
+  private async persistBlockAtomic(blockLine: BlockLine): Promise<void> { return; }
 }

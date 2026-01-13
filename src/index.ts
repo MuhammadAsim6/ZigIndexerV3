@@ -12,6 +12,7 @@ import { createTxDecodePool } from './decode/txPool.ts';
 import { createSink } from './sink/index.ts';
 import { closePgPool, createPgPool } from './db/pg.ts';
 import { getProgress } from './db/progress.ts';
+import { upsertValidators } from './sink/pg/flushers/validators.ts';
 import { getLogger } from './utils/logger.ts';
 import { syncRange } from './runner/syncRange.ts';
 import { followLoop } from './runner/follow.ts';
@@ -85,6 +86,35 @@ async function main() {
   });
   await sink.init();
 
+  // 🛡️ INITIAL SYNC: Fetch validators on startup
+  if (cfg.sinkKind === 'postgres') {
+    try {
+      log.info('[start] syncing active validators from RPC…');
+      const startPool = createPgPool(cfg.pg!);
+      const client = await startPool.connect();
+      try {
+        const valSet = await rpc.getJson('/validators');
+        const vals = valSet?.result?.validators || valSet?.validators || [];
+        if (vals.length > 0) {
+          const rows = vals.map((v: any) => ({
+            operator_address: v.address, // Consensus address as fallback
+            moniker: v.moniker || `Validator ${v.address.slice(0, 8)}`,
+            status: 'BOND_STATUS_BONDED',
+            updated_at_height: startFrom,
+            updated_at_time: new Date()
+          }));
+          await upsertValidators(client, rows);
+          log.info(`[start] synced ${vals.length} validators (Consensus ADDRs)`);
+        }
+      } finally {
+        client.release();
+        // ❌ DO NOT call startPool.end() here as it is a singleton shared by the sink!
+      }
+    } catch (err) {
+      log.warn('[start] validator sync failed (non-critical):', err instanceof Error ? err.message : String(err));
+    }
+  }
+
   const backfill = await syncRange(rpc, decodePool, sink, {
     from: startFrom,
     to: endHeight,
@@ -95,8 +125,7 @@ async function main() {
   });
 
   log.info(
-    `[done-range] processed ${backfill.processed} blocks in [${startFrom}, ${endHeight}] — switching mode: ${
-      cfg.follow === false ? 'exit' : 'follow'
+    `[done-range] processed ${backfill.processed} blocks in [${startFrom}, ${endHeight}] — switching mode: ${cfg.follow === false ? 'exit' : 'follow'
     }`,
   );
 
@@ -108,25 +137,46 @@ async function main() {
       concurrency: cfg.concurrency,
       caseMode: cfg.caseMode,
     });
-  }
 
-  await decodePool.close();
-  await sink.flush?.();
-  await sink.close();
+    await shutdown(decodePool, sink);
+  } else {
+    await shutdown(decodePool, sink);
+  }
+}
+
+/**
+ * Cleanup function to flush and close all connections.
+ */
+async function shutdown(decodePool: any, sink: any) {
+  log.info('Graceful shutdown initiated…');
+  try {
+    if (decodePool) await decodePool.close();
+    if (sink) {
+      await sink.flush?.();
+      await sink.close?.();
+    }
+    log.info('Shutdown complete.');
+  } catch (err) {
+    log.error('Error during shutdown:', err);
+  }
 }
 
 /**
  * Handle SIGINT signal to gracefully shut down the indexer.
  */
 process.on('SIGINT', async () => {
-  log.warn('SIGINT received, shutting down…');
+  log.warn('SIGINT received');
+  // We cannot easily pass decodePool/sink here without globalizing them, 
+  // but the followLoop/syncRange usually throw on termination or can be awaited.
+  // For now, we allow the main catch block or natural exit to handle it if possible.
+  // Alternatively, we use process.exit(0) but ideally we'd want a global state.
   process.exit(0);
 });
 /**
  * Handle SIGTERM signal to gracefully shut down the indexer.
  */
 process.on('SIGTERM', async () => {
-  log.warn('SIGTERM received, shutting down…');
+  log.warn('SIGTERM received');
   process.exit(0);
 });
 

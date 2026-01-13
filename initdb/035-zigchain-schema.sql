@@ -1,0 +1,109 @@
+-- initdb/035-zigchain-schema.sql
+-- ZIGCHAIN MODULES: Factory, DEX (Swaps + Liquidity), TokenWrapper.
+-- REVISED: Fixed Primary Keys for Partitioning (Added block_height to PKs)
+
+CREATE SCHEMA IF NOT EXISTS zigchain;
+
+-- ============================================================================
+-- 1. FACTORY MODULE (Token Creation)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS zigchain.factory_denoms (
+    denom             TEXT PRIMARY KEY,
+    creator_address   TEXT NOT NULL,
+    sub_denom         TEXT,
+    minting_cap       TEXT, 
+    uri               TEXT,
+    uri_hash          TEXT,
+    description       TEXT,
+    creation_tx_hash  TEXT NOT NULL,
+    block_height      BIGINT NOT NULL,
+    created_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_factory_creator ON zigchain.factory_denoms(creator_address);
+CREATE INDEX IF NOT EXISTS idx_factory_height ON zigchain.factory_denoms(block_height);
+
+
+-- ============================================================================
+-- 2. DEX POOLS (Market Structure)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS zigchain.dex_pools (
+    pool_id           TEXT PRIMARY KEY,
+    creator_address   TEXT NOT NULL,
+    pair_id           TEXT,            
+    base_denom        TEXT NOT NULL,
+    quote_denom       TEXT NOT NULL,
+    lp_token_denom    TEXT,
+    base_reserve      TEXT DEFAULT '0', 
+    quote_reserve     TEXT DEFAULT '0',
+    block_height      BIGINT NOT NULL,
+    tx_hash           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_dex_pools_creator ON zigchain.dex_pools(creator_address);
+CREATE INDEX IF NOT EXISTS idx_dex_pools_assets ON zigchain.dex_pools(base_denom, quote_denom);
+
+
+-- ============================================================================
+-- 3. DEX SWAPS (Trading Volume)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
+    id                SERIAL, -- Removed PRIMARY KEY from here
+    tx_hash           TEXT NOT NULL,
+    msg_index         INT NOT NULL,
+    pool_id           TEXT NOT NULL REFERENCES zigchain.dex_pools(pool_id),
+    sender_address    TEXT NOT NULL,
+    token_in_denom    TEXT,
+    token_in_amount   TEXT, 
+    token_out_denom   TEXT,
+    token_out_amount  TEXT, 
+    price_impact      TEXT, 
+    block_height      BIGINT NOT NULL,
+    timestamp         TIMESTAMPTZ DEFAULT NOW(),
+    -- 👇 Composite Primary Key (Required for Partitioning)
+    PRIMARY KEY (id, block_height) 
+) PARTITION BY RANGE (block_height);
+
+-- Auto-Partition: 0 to 1M Blocks
+CREATE TABLE IF NOT EXISTS zigchain.dex_swaps_p0 PARTITION OF zigchain.dex_swaps FOR VALUES FROM (0) TO (1000000);
+
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_pool ON zigchain.dex_swaps(pool_id);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_sender ON zigchain.dex_swaps(sender_address);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_height ON zigchain.dex_swaps(block_height DESC);
+
+
+-- ============================================================================
+-- 4. DEX LIQUIDITY (Add/Remove Events)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity (
+    id                SERIAL, -- Removed PRIMARY KEY from here
+    tx_hash           TEXT NOT NULL,
+    msg_index         INT NOT NULL,
+    pool_id           TEXT NOT NULL REFERENCES zigchain.dex_pools(pool_id),
+    sender_address    TEXT NOT NULL,
+    action_type       TEXT NOT NULL, 
+    amount_0          TEXT,         
+    amount_1          TEXT,          
+    shares_minted_burned TEXT,       
+    block_height      BIGINT NOT NULL,
+    timestamp         TIMESTAMPTZ DEFAULT NOW(),
+    -- 👇 Composite Primary Key (Required for Partitioning)
+    PRIMARY KEY (id, block_height)
+) PARTITION BY RANGE (block_height);
+
+CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity_p0 PARTITION OF zigchain.dex_liquidity FOR VALUES FROM (0) TO (1000000);
+
+CREATE INDEX IF NOT EXISTS idx_dex_liq_pool ON zigchain.dex_liquidity(pool_id);
+CREATE INDEX IF NOT EXISTS idx_dex_liq_sender ON zigchain.dex_liquidity(sender_address);
+
+
+-- ============================================================================
+-- 5. TOKEN WRAPPER (Bridge/Wrap)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS zigchain.wrapper_settings (
+    denom              TEXT PRIMARY KEY,
+    native_client_id   TEXT,
+    native_channel     TEXT,
+    decimal_difference INT,
+    updated_at_height  BIGINT
+);

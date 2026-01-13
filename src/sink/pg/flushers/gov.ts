@@ -94,9 +94,16 @@ export async function upsertGovProposals(
 ) {
   if (!rows.length) return;
 
+  // 🛡️ PRE-MERGE: Prevent "ON CONFLICT DO UPDATE command cannot affect row a second time"
+  const mergedMap = new Map<string, any>();
+  for (const row of rows) {
+    mergedMap.set(row.proposal_id.toString(), row); // Keep latest
+  }
+  const finalRows = Array.from(mergedMap.values());
+
   const columns = ['proposal_id', 'submitter', 'title', 'summary', 'proposal_type', 'status', 'submit_time'] as const;
 
-  const shaped = rows.map((r) => ({
+  const shaped = finalRows.map((r) => ({
     proposal_id: r.proposal_id.toString(),
     submitter: r.submitter,
     title: r.title,

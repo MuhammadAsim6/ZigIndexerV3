@@ -1,4 +1,5 @@
 // src/sink/pg/parsing.ts
+import { Buffer } from 'node:buffer';
 
 /**
  * Normalized representation of a tx log entry used by the sink.
@@ -170,4 +171,64 @@ export function parseCoin(amt: string | null | undefined): { denom: string; amou
 export function findAttr(attrs: Array<{ key: string; value: string | null }>, key: string): string | null {
   const a = attrs.find((x) => x.key === key);
   return a ? (a.value ?? null) : null;
+}
+/**
+ * Parses a Cosmos SDK "Dec" string (18 decimal places, no point) into a decimal string for Postgres.
+ * e.g. "100000000000000000" -> "0.1"
+ * @param {any} val - Value to parse.
+ * @returns {string|null} Decimal string or null.
+ */
+export function parseDec(val: any): string | null {
+  if (val === undefined || val === null || val === '') return null;
+  const s = String(val);
+  if (s.includes('.')) return s; // Already decimal
+  if (s.length <= 18) {
+    const padded = s.padStart(19, '0');
+    const integerPart = padded.slice(0, padded.length - 18);
+    const fractionalPart = padded.slice(padded.length - 18);
+    return `${integerPart}.${fractionalPart}`.replace(/\.?0+$/, '');
+  } else {
+    const integerPart = s.slice(0, s.length - 18);
+    const fractionalPart = s.slice(s.length - 18);
+    return `${integerPart}.${fractionalPart}`.replace(/\.?0+$/, '');
+  }
+}
+
+/**
+ * Tries to parse a value which could be a base64-encoded JSON or already an object.
+ * Useful for WASM contract messages.
+ * @param val - The value to parse.
+ * @returns Normalized object or the original value if parsing fails.
+ */
+export function tryParseJson(val: any): any {
+  if (!val) return val;
+  if (typeof val !== 'string') return val;
+
+  // Try direct parse first
+  try {
+    return JSON.parse(val);
+  } catch {
+    // Try base64 decode then parse
+    if (/^[A-Za-z0-9+/]*={0,2}$/.test(val)) {
+      try {
+        const decoded = Buffer.from(val, 'base64').toString('utf8');
+        if (decoded.trim().startsWith('{') || decoded.trim().startsWith('[')) {
+          return JSON.parse(decoded);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return val;
+}/**
+ * Ensures a string value is purely numeric for BigInt columns.
+ * Removes any non-digit characters. Returns "0" if empty or invalid.
+ * @param val - The value to sanitize.
+ * @returns Numeric string safely parsable by Postgres BIGINT.
+ */
+export function toBigIntStr(val: any): string {
+  if (val === undefined || val === null) return '0';
+  const s = String(val).replace(/\D/g, '');
+  return s.length > 0 ? s : '0';
 }
