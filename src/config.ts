@@ -96,6 +96,12 @@ export function getConfig(): Config {
     'follow-interval-ms',
     (args['follow-interval-ms'] as string) ?? process.env.FOLLOW_INTERVAL_MS ?? 5000,
   );
+  const missingRetryIntervalRaw = (args['missing-retry-interval-ms'] as string) ?? process.env.MISSING_RETRY_INTERVAL_MS;
+  const missingRetryIntervalMs =
+    missingRetryIntervalRaw !== undefined ? Number(missingRetryIntervalRaw) : 600_000;
+  if (!Number.isFinite(missingRetryIntervalMs) || missingRetryIntervalMs < 0) {
+    throw new Error(`missing-retry-interval-ms must be >= 0, got ${missingRetryIntervalRaw}`);
+  }
 
   const raw = {
     rpcUrl,
@@ -121,6 +127,7 @@ export function getConfig(): Config {
     firstBlock,
     follow,
     followIntervalMs,
+    missingRetryIntervalMs,
     pg: {
       host: (args['pg-host'] as string | undefined) ?? process.env.PG_HOST,
       port: args['pg-port'] ? Number(args['pg-port']) : Number(process.env.PG_PORT ?? 5432),

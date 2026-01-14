@@ -45,6 +45,7 @@ BEGIN
         UNION ALL SELECT 'zigchain.dex_swaps'::regclass     
         UNION ALL SELECT 'zigchain.dex_liquidity'::regclass 
         UNION ALL SELECT 'wasm.executions'::regclass        
+        UNION ALL SELECT 'wasm.event_attrs'::regclass
     LOOP
         -- Apply settings to all partitions created above
         FOR q IN

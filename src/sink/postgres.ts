@@ -7,6 +7,7 @@ import { Sink, SinkConfig } from './types.js';
 import { createPgPool, getPgPool, closePgPool } from '../db/pg.js';
 import { ensureCorePartitions } from '../db/partitions.js';
 import { upsertProgress } from '../db/progress.js';
+import { recordMissingBlock, resolveMissingBlock } from '../db/missing_blocks.js';
 import { getLogger } from '../utils/logger.js';
 import {
   pickMessages,
@@ -35,6 +36,7 @@ import { flushStakeDeleg } from './pg/flushers/stake_deleg.js';
 import { flushStakeDistr } from './pg/flushers/stake_distr.js';
 import { flushWasmExec } from './pg/flushers/wasm_exec.js';
 import { flushWasmEvents } from './pg/flushers/wasm_events.js';
+import { flushWasmEventAttrs } from './pg/flushers/wasm_event_attrs.js';
 // ✅ ADDED: Gov Flushers
 import { flushGovDeposits, flushGovVotes, upsertGovProposals } from './pg/flushers/gov.js';
 // ✅ ADDED: Validator Flusher
@@ -93,6 +95,7 @@ export class PostgresSink implements Sink {
   private bufStakeDistr: any[] = [];
   private bufWasmExec: any[] = [];
   private bufWasmEvents: any[] = [];
+  private bufWasmEventAttrs: any[] = [];
 
   // ✅ Gov Buffers (Now Used)
   private bufGovDeposits: any[] = [];
@@ -130,6 +133,7 @@ export class PostgresSink implements Sink {
     stakeDistr: 5000,
     wasmExec: 5000,
     wasmEvents: 5000,
+    wasmEventAttrs: 5000,
     govDeposits: 5000,
     govVotes: 5000,
     govProposals: 1000,
@@ -179,6 +183,26 @@ export class PostgresSink implements Sink {
     await closePgPool();
   }
 
+  async recordMissingBlock(height: number, error: string | null): Promise<void> {
+    const pool = getPgPool();
+    const client = await pool.connect();
+    try {
+      await recordMissingBlock(client, height, error);
+    } finally {
+      client.release();
+    }
+  }
+
+  async resolveMissingBlock(height: number): Promise<void> {
+    const pool = getPgPool();
+    const client = await pool.connect();
+    try {
+      await resolveMissingBlock(client, height);
+    } finally {
+      client.release();
+    }
+  }
+
   private extractRows(blockLine: BlockLine) {
     const height = Number(blockLine?.meta?.height);
     const time = new Date(blockLine?.meta?.time);
@@ -214,6 +238,7 @@ export class PostgresSink implements Sink {
     // WASM
     const wasmExecRows: any[] = [];
     const wasmEventsRows: any[] = [];
+    const wasmEventAttrsRows: any[] = [];
 
     // ✅ Gov
     const govVotesRows: any[] = [];
@@ -608,8 +633,19 @@ export class PostgresSink implements Sink {
             const contract = findAttr(attrsPairs, 'contract_address') || findAttr(attrsPairs, '_contract_address');
             if (contract) {
               wasmEventsRows.push({
-                contract, height, tx_hash, msg_index, event_type, attributes: attrsPairs
+                contract, height, tx_hash, msg_index, event_index: ei, event_type, attributes: attrsPairs
               });
+              for (const { key, value } of attrsPairs) {
+                wasmEventAttrsRows.push({
+                  contract,
+                  height,
+                  tx_hash,
+                  msg_index,
+                  event_index: ei,
+                  key,
+                  value
+                });
+              }
             }
           }
 
@@ -741,6 +777,7 @@ export class PostgresSink implements Sink {
       ibcPacketsRows, // 👈 Returning IBC Data
       factoryDenomsRows, dexPoolsRows, dexSwapsRows, dexLiquidityRows, wrapperSettingsRows,
       balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, networkParamsRows,
+      wasmEventAttrsRows,
       height
     };
   }
@@ -765,6 +802,7 @@ export class PostgresSink implements Sink {
     // WASM
     this.bufWasmExec.push(...data.wasmExecRows);
     this.bufWasmEvents.push(...data.wasmEventsRows);
+    this.bufWasmEventAttrs.push(...data.wasmEventAttrsRows);
 
     // ✅ Gov (Pushing to Buffers)
     this.bufGovVotes.push(...data.govVotesRows);
@@ -827,6 +865,7 @@ export class PostgresSink implements Sink {
       // 2. Modules (WASM & Gov)
       await flushWasmExec(client, this.bufWasmExec); this.bufWasmExec = [];
       await flushWasmEvents(client, this.bufWasmEvents); this.bufWasmEvents = [];
+      await flushWasmEventAttrs(client, this.bufWasmEventAttrs); this.bufWasmEventAttrs = [];
 
       // ✅ Flushing Gov Data
       await flushGovVotes(client, this.bufGovVotes); this.bufGovVotes = [];

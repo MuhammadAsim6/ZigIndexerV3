@@ -15,6 +15,7 @@ import { getProgress } from './db/progress.ts';
 import { upsertValidators } from './sink/pg/flushers/validators.ts';
 import { getLogger } from './utils/logger.ts';
 import { syncRange } from './runner/syncRange.ts';
+import { retryMissingBlocks } from './runner/retryMissing.ts';
 import { followLoop } from './runner/follow.ts';
 
 EventEmitter.defaultMaxListeners = 0;
@@ -132,6 +133,13 @@ async function main() {
     }`,
   );
 
+  if (cfg.sinkKind === 'postgres') {
+    await retryMissingBlocks(rpc, decodePool, sink, {
+      concurrency: Math.max(1, Math.min(cfg.concurrency ?? 8, 8)),
+      caseMode: cfg.caseMode,
+    });
+  }
+
   if (cfg.follow !== false) {
     const pollMs = cfg.followIntervalMs ?? 1500;
     await followLoop(rpc, decodePool, sink, {
@@ -139,6 +147,7 @@ async function main() {
       pollMs,
       concurrency: cfg.concurrency,
       caseMode: cfg.caseMode,
+      missingRetryIntervalMs: cfg.missingRetryIntervalMs,
     });
 
     await shutdown(decodePool, sink);

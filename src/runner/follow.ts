@@ -8,6 +8,7 @@ import { createRpcClientFromConfig } from '../rpc/client.ts';
 import { createTxDecodePool } from '../decode/txPool.ts';
 import { createSink } from '../sink/index.ts';
 import { syncRange, CaseMode } from './syncRange.ts';
+import { retryMissingBlocks } from './retryMissing.ts';
 import { sleep } from '../utils/sleep.ts';
 
 const log = getLogger('follow');
@@ -25,6 +26,7 @@ export interface FollowOptions {
   pollMs: number;
   concurrency: number;
   caseMode: CaseMode;
+  missingRetryIntervalMs?: number;
 }
 
 /**
@@ -44,6 +46,8 @@ export async function followLoop(
   opts: FollowOptions,
 ): Promise<void> {
   let next = opts.startNext;
+  let lastMissingRetryAt = 0;
+  const retryIntervalMs = opts.missingRetryIntervalMs ?? 600_000;
   log.info(`[follow] entering live mode from height ${next}, poll=${opts.pollMs}ms`);
   for (;;) {
     const st = await rpc.fetchStatus();
@@ -65,6 +69,15 @@ export async function followLoop(
     } else {
       const jitter = 0.8 + Math.random() * 0.4;
       await sleep(Math.floor(opts.pollMs * jitter));
+    }
+    if (retryIntervalMs > 0 && Date.now() - lastMissingRetryAt >= retryIntervalMs) {
+      if (typeof (sink as any).recordMissingBlock === 'function') {
+        await retryMissingBlocks(rpc, decodePool, sink, {
+          concurrency: Math.max(1, Math.min(opts.concurrency, 8)),
+          caseMode: opts.caseMode,
+        });
+      }
+      lastMissingRetryAt = Date.now();
     }
   }
 }

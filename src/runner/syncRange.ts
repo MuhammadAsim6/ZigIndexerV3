@@ -154,6 +154,9 @@ export async function syncRange(
         typeof obj === 'object' &&
         (obj.__skip === true || Object.prototype.hasOwnProperty.call(obj, 'error'))
       ) {
+        if (typeof (sink as any).recordMissingBlock === 'function') {
+          await (sink as any).recordMissingBlock(nextToFlush, obj?.error ?? null);
+        }
         nextToFlush++;
         flushed++;
         processed++;

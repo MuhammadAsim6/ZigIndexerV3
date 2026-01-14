@@ -55,6 +55,8 @@ export type Config = {
   follow?: boolean;
   /** Polling interval in milliseconds for follow mode. */
   followIntervalMs?: number;
+  /** Interval in milliseconds to retry missing blocks in follow mode (0 disables). */
+  missingRetryIntervalMs?: number;
 
   /** Postgres connection and batching settings (present only for postgres sink). */
   pg?: {

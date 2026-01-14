@@ -33,7 +33,7 @@ export async function upsertProgress(client: PoolClient, id: string, lastHeight:
     INSERT INTO core.indexer_progress (id, last_height)
     VALUES ($1, $2)
     ON CONFLICT (id)
-    DO UPDATE SET last_height = EXCLUDED.last_height, updated_at = now()
+    DO UPDATE SET last_height = GREATEST(core.indexer_progress.last_height, EXCLUDED.last_height), updated_at = now()
   `;
   await client.query(sql, [id, lastHeight]);
 }

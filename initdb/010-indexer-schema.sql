@@ -128,6 +128,20 @@ CREATE TABLE core.event_attrs (
     PRIMARY KEY (height, tx_hash, msg_index, event_index, key)
 ) PARTITION BY RANGE (height);
 
+-- Tracks heights that failed RPC fetch/processing after retries.
+CREATE TABLE IF NOT EXISTS core.missing_blocks (
+    height      BIGINT PRIMARY KEY,
+    first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    attempts    INT NOT NULL DEFAULT 1,
+    last_error  TEXT NULL,
+    status      TEXT NOT NULL DEFAULT 'missing',
+    resolved_at TIMESTAMPTZ NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_missing_blocks_status ON core.missing_blocks(status);
+CREATE INDEX IF NOT EXISTS idx_missing_blocks_last_seen ON core.missing_blocks(last_seen DESC);
+
 -- ============================================================================
 -- 3) BANK & STAKE
 -- ============================================================================
@@ -319,11 +333,24 @@ CREATE TABLE IF NOT EXISTS wasm.events (
     height      BIGINT NOT NULL,
     tx_hash     TEXT NOT NULL,
     msg_index   INT NOT NULL,
+    event_index INT NOT NULL,
     event_type  TEXT NOT NULL,
     attributes  JSONB NOT NULL,
-    PRIMARY KEY (height, tx_hash, msg_index, event_type)
+    PRIMARY KEY (height, tx_hash, msg_index, event_index)
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS wasm.events_p0 PARTITION OF wasm.events FOR VALUES FROM (0) TO (1000000);
+
+CREATE TABLE IF NOT EXISTS wasm.event_attrs (
+    contract    TEXT NOT NULL,
+    height      BIGINT NOT NULL,
+    tx_hash     TEXT NOT NULL,
+    msg_index   INT NOT NULL,
+    event_index INT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NULL,
+    PRIMARY KEY (height, tx_hash, msg_index, event_index, key)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS wasm.event_attrs_p0 PARTITION OF wasm.event_attrs FOR VALUES FROM (0) TO (1000000);
 
 CREATE TABLE wasm.state_kv (
     contract   TEXT   NOT NULL,
@@ -363,6 +390,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_signer ON core.messages (signer, height 
 -- WASM by contract (dApp queries)
 CREATE INDEX IF NOT EXISTS idx_wasm_exec_contract ON wasm.executions (contract, height DESC);
 CREATE INDEX IF NOT EXISTS idx_wasm_events_contract ON wasm.events (contract, height DESC);
+CREATE INDEX IF NOT EXISTS idx_wasm_event_attrs_contract ON wasm.event_attrs (contract, height DESC);
 
 -- IBC by channel (relayer/bridge queries)
 CREATE INDEX IF NOT EXISTS idx_ibc_channel ON ibc.packets (channel_id_src, status);

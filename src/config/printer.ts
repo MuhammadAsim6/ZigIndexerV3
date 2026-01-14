@@ -15,6 +15,7 @@ export function printConfig(cfg: Config): void {
       to: cfg.resolveLatestTo ? 'latest' : (cfg.to ?? '(latest)'),
       follow: cfg.follow ?? false,
       followIntervalMs: cfg.followIntervalMs ?? 5000,
+      missingRetryIntervalMs: cfg.missingRetryIntervalMs ?? 600000,
     },
     parallel: {
       shards: `${cfg.shardId + 1}/${cfg.shards}`,
