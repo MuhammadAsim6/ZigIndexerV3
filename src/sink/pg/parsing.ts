@@ -218,6 +218,19 @@ export function parseDec(val: any): string | null {
  */
 export function tryParseJson(val: any): any {
   if (!val) return val;
+  const bytes = toByteArray(val);
+  if (bytes) {
+    const decoded = Buffer.from(bytes).toString('utf8');
+    const trimmed = decoded.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return decoded;
+      }
+    }
+    return decoded;
+  }
   if (typeof val !== 'string') return val;
 
   // Try direct parse first
@@ -237,7 +250,33 @@ export function tryParseJson(val: any): any {
     }
   }
   return val;
-}/**
+}
+
+function toByteArray(val: any): Uint8Array | null {
+  if (val instanceof Uint8Array) return val;
+  if (Buffer.isBuffer(val)) return new Uint8Array(val);
+  if (Array.isArray(val) && val.every((v) => Number.isInteger(v) && v >= 0 && v <= 255)) {
+    return new Uint8Array(val);
+  }
+  if (val && typeof val === 'object') {
+    const keys = Object.keys(val);
+    if (!keys.length) return null;
+    const numericKeys = keys.filter((k) => String(Number(k)) === k);
+    if (numericKeys.length !== keys.length) return null;
+    const max = Math.max(...numericKeys.map((k) => Number(k)));
+    const out = new Uint8Array(max + 1);
+    for (const k of numericKeys) {
+      const idx = Number(k);
+      const v = val[k];
+      if (!Number.isInteger(v) || v < 0 || v > 255) return null;
+      out[idx] = v;
+    }
+    return out;
+  }
+  return null;
+}
+
+/**
  * Ensures a string value is purely numeric for BigInt columns.
  * Removes any non-digit characters. Returns "0" if empty or invalid.
  * @param val - The value to sanitize.
