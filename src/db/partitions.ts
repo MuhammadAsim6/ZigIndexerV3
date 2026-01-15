@@ -21,7 +21,7 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     ['bank', 'transfers'], ['bank', 'balance_deltas'],
     ['stake', 'delegation_events'], ['stake', 'distribution_events'],
     ['gov', 'deposits'], ['gov', 'votes'],
-    ['wasm', 'executions'], ['wasm', 'events'], ['wasm', 'state_kv'], ['wasm', 'contract_migrations'],
+    ['wasm', 'executions'], ['wasm', 'events'], ['wasm', 'event_attrs'], ['wasm', 'state_kv'], ['wasm', 'contract_migrations'],
     ['ibc', 'packets'], // Note: Uses sequence, but handled by height proxy here for simplicity
 
     // Zigchain
