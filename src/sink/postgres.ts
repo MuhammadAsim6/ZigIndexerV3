@@ -48,6 +48,7 @@ import { flushIbcTransfers } from './pg/flushers/ibc_transfers.js';
 import { flushIbcChannels } from './pg/flushers/ibc_channels.js';
 import { flushAuthzGrants } from './pg/flushers/authz_grants.js';
 import { flushFeeGrants } from './pg/flushers/fee_grants.js';
+import { flushCw20Transfers } from './pg/flushers/cw20_transfers.js';
 
 // ✅ ADDED: Bank & Params Flushers
 import { flushBalanceDeltas } from './pg/flushers/bank.js';
@@ -139,6 +140,7 @@ export class PostgresSink implements Sink {
   private bufDexSwaps: any[] = [];
   private bufDexLiquidity: any[] = [];
   private bufWrapperSettings: any[] = [];
+  private bufCw20Transfers: any[] = [];
 
   private batchSizes = {
     blocks: 1000,
@@ -159,7 +161,8 @@ export class PostgresSink implements Sink {
     ibcPackets: 2000,
     ibcChannels: 500,
     ibcTransfers: 2000,
-    zigchain: 2000
+    zigchain: 2000,
+    cw20Transfers: 5000
   };
 
   constructor(cfg: PostgresSinkConfig) {
@@ -276,6 +279,9 @@ export class PostgresSink implements Sink {
     // ✅ Authz / Feegrant
     const authzGrantsRows: any[] = [];
     const feeGrantsRows: any[] = [];
+
+    // ✅ Tokens (CW20)
+    const cw20TransfersRows: any[] = [];
 
     // ✅ Staking & Distribution
     const stakeDelegRows: any[] = [];
@@ -742,6 +748,31 @@ export class PostgresSink implements Sink {
                   value
                 });
               }
+
+              const action = findAttr(attrsPairs, 'action');
+              if (action === 'transfer' || action === 'send') {
+                const fromAddr =
+                  findAttr(attrsPairs, 'sender') ||
+                  findAttr(attrsPairs, 'from') ||
+                  findAttr(attrsPairs, 'from_address');
+                const toAddr =
+                  findAttr(attrsPairs, 'recipient') ||
+                  findAttr(attrsPairs, 'to') ||
+                  findAttr(attrsPairs, 'to_address');
+                const amtRaw = findAttr(attrsPairs, 'amount');
+                const amtCoin = amtRaw && parseCoin(amtRaw);
+                const amount = amtRaw && /^\d+$/.test(amtRaw) ? amtRaw : amtCoin?.amount ?? null;
+                if (fromAddr && toAddr && amount) {
+                  cw20TransfersRows.push({
+                    contract,
+                    from_addr: fromAddr,
+                    to_addr: toAddr,
+                    amount,
+                    height,
+                    tx_hash
+                  });
+                }
+              }
             }
           }
 
@@ -935,6 +966,7 @@ export class PostgresSink implements Sink {
       ibcTransfersRows,
       authzGrantsRows,
       feeGrantsRows,
+      cw20TransfersRows,
       factoryDenomsRows, dexPoolsRows, dexSwapsRows, dexLiquidityRows, wrapperSettingsRows,
       balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, networkParamsRows,
       wasmEventAttrsRows,
@@ -992,6 +1024,9 @@ export class PostgresSink implements Sink {
     this.bufAuthzGrants.push(...data.authzGrantsRows);
     this.bufFeeGrants.push(...data.feeGrantsRows);
 
+    // ✅ Tokens (CW20) (Pushing to Buffer)
+    this.bufCw20Transfers.push(...data.cw20TransfersRows);
+
     const zCount = this.bufFactoryDenoms.length + this.bufDexPools.length + this.bufDexSwaps.length + this.bufDexLiquidity.length;
     const gCount = this.bufGovVotes.length + this.bufGovDeposits.length;
 
@@ -1041,6 +1076,9 @@ export class PostgresSink implements Sink {
       // ✅ Flushing Authz/Feegrant Data
       await flushAuthzGrants(client, this.bufAuthzGrants); this.bufAuthzGrants = [];
       await flushFeeGrants(client, this.bufFeeGrants); this.bufFeeGrants = [];
+
+      // ✅ Flushing CW20 Data
+      await flushCw20Transfers(client, this.bufCw20Transfers); this.bufCw20Transfers = [];
 
       // ✅ Flushing Staking Data
       await flushStakeDeleg(client, this.bufStakeDeleg); this.bufStakeDeleg = [];

@@ -414,7 +414,34 @@ CREATE INDEX IF NOT EXISTS idx_authz_grants_grantee ON authz_feegrant.authz_gran
 CREATE INDEX IF NOT EXISTS idx_fee_grants_grantee ON authz_feegrant.fee_grants (grantee, height DESC);
 
 -- ============================================================================
--- 8) NETWORK PARAMS
+-- 8) TOKENS (CW20)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS tokens.cw20_transfers (
+    contract  TEXT           NOT NULL,
+    from_addr TEXT           NOT NULL,
+    to_addr   TEXT           NOT NULL,
+    amount    NUMERIC(80, 0) NOT NULL,
+    height    BIGINT         NOT NULL,
+    tx_hash   TEXT           NOT NULL,
+    PRIMARY KEY (height, tx_hash, contract, from_addr, to_addr)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS tokens.cw20_transfers_p0 PARTITION OF tokens.cw20_transfers FOR VALUES FROM (0) TO (1000000);
+
+CREATE INDEX IF NOT EXISTS idx_cw20_from ON tokens.cw20_transfers (contract, from_addr, height DESC);
+CREATE INDEX IF NOT EXISTS idx_cw20_to ON tokens.cw20_transfers (contract, to_addr, height DESC);
+CREATE INDEX IF NOT EXISTS idx_cw20_brin ON tokens.cw20_transfers USING BRIN (height);
+CREATE INDEX IF NOT EXISTS idx_cw20_tx ON tokens.cw20_transfers (tx_hash);
+
+-- Optional snapshots: maintain via periodic job
+CREATE TABLE IF NOT EXISTS tokens.cw20_balances_current (
+    contract TEXT           NOT NULL,
+    account  TEXT           NOT NULL,
+    balance  NUMERIC(80, 0) NOT NULL,
+    PRIMARY KEY (contract, account)
+);
+
+-- ============================================================================
+-- 9) NETWORK PARAMS
 -- ============================================================================
 CREATE TABLE core.network_params (
     height    BIGINT PRIMARY KEY,
@@ -426,7 +453,7 @@ CREATE TABLE core.network_params (
 ) PARTITION BY RANGE (height);
 
 -- ============================================================================
--- 9) QUERY-PATTERN INDEXES (For 5.4M+ scale)
+-- 10) QUERY-PATTERN INDEXES (For 5.4M+ scale)
 -- ============================================================================
 -- Transfers by address (common API query)
 CREATE INDEX IF NOT EXISTS idx_transfers_from ON bank.transfers (from_addr, height DESC);
