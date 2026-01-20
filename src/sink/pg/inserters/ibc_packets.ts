@@ -2,59 +2,71 @@ import type { PoolClient } from 'pg';
 import { makeMultiInsert } from '../batch.js';
 
 /**
- * Inserts IBC Packets safely (converting BigInts to Strings).
- * Includes 'sequence' as TEXT to prevent numeric overflow crashes.
+ * Inserts/Updates IBC Packets with lifecycle merging.
+ * PK is (port_id_src, channel_id_src, sequence) to allow one row per packet.
  */
 export async function insertIbcPackets(client: PoolClient, rows: any[]): Promise<void> {
   if (!rows?.length) return;
 
-  // 🛡️ PRE-MERGE: Prevent "ON CONFLICT DO UPDATE command cannot affect row a second time"
-  // If the same packet has multiple updates in one batch, merge them in-memory.
+  // Pre-merge in-memory to avoid "cannot affect row twice" errors
   const mergedMap = new Map<string, any>();
   for (const row of rows) {
-    const key = `${row.channel_id_src}:${row.port_id_src}:${row.sequence}`;
+    const key = `${row.port_id_src}:${row.channel_id_src}:${row.sequence}`;
     const existing = mergedMap.get(key);
     if (!existing) {
       mergedMap.set(key, { ...row });
     } else {
-      // Merge logic: keep non-null fields, prefer latest status
-      if (row.status) existing.status = row.status;
-      if (row.tx_hash_send) existing.tx_hash_send = row.tx_hash_send;
-      if (row.height_send) existing.height_send = row.height_send;
-      if (row.tx_hash_recv) existing.tx_hash_recv = row.tx_hash_recv;
-      if (row.height_recv) existing.height_recv = row.height_recv;
-      if (row.tx_hash_ack) existing.tx_hash_ack = row.tx_hash_ack;
-      if (row.height_ack) existing.height_ack = row.height_ack;
-      if (row.relayer) existing.relayer = row.relayer;
-      if (row.denom) existing.denom = row.denom;
-      if (row.amount) existing.amount = row.amount;
-      if (row.memo) existing.memo = row.memo;
+      // Merge all non-null fields
+      for (const [k, v] of Object.entries(row)) {
+        if (v !== null && v !== undefined) existing[k] = v;
+      }
     }
   }
   const finalRows = Array.from(mergedMap.values());
 
   const cols = [
-    'port_id_src', 'channel_id_src', 'sequence', 'port_id_dst', 'channel_id_dst',
-    'timeout_height', 'timeout_ts', 'status',
-    'tx_hash_send', 'height_send',
-    'tx_hash_recv', 'height_recv',
-    'tx_hash_ack', 'height_ack',
-    'relayer', 'denom', 'amount', 'memo'
+    'port_id_src', 'channel_id_src', 'sequence',
+    'port_id_dst', 'channel_id_dst', 'timeout_height', 'timeout_ts', 'status',
+    'tx_hash_send', 'height_send', 'time_send',
+    'tx_hash_recv', 'height_recv', 'time_recv',
+    'tx_hash_ack', 'height_ack', 'time_ack', 'ack_success', 'ack_error',
+    'tx_hash_timeout', 'height_timeout', 'time_timeout',
+    'relayer_send', 'relayer_recv', 'relayer_ack',
+    'denom', 'amount', 'sender', 'receiver', 'memo'
   ];
 
-  // Note: IBC Packets are partitioned by SEQUENCE, not HEIGHT in our schema.
-  // But we store heights as text columns (height_send, etc.)
   const { text, values } = makeMultiInsert(
     'ibc.packets',
     cols,
     finalRows,
-    `ON CONFLICT (channel_id_src, port_id_src, sequence) DO UPDATE SET
+    `ON CONFLICT (port_id_src, channel_id_src, sequence) DO UPDATE SET
+       port_id_dst = COALESCE(EXCLUDED.port_id_dst, ibc.packets.port_id_dst),
+       channel_id_dst = COALESCE(EXCLUDED.channel_id_dst, ibc.packets.channel_id_dst),
+       timeout_height = COALESCE(EXCLUDED.timeout_height, ibc.packets.timeout_height),
+       timeout_ts = COALESCE(EXCLUDED.timeout_ts, ibc.packets.timeout_ts),
        status = EXCLUDED.status,
-       tx_hash_recv = COALESCE(ibc.packets.tx_hash_recv, EXCLUDED.tx_hash_recv),
-       height_recv = COALESCE(ibc.packets.height_recv, EXCLUDED.height_recv),
-       tx_hash_ack = COALESCE(ibc.packets.tx_hash_ack, EXCLUDED.tx_hash_ack),
-       height_ack = COALESCE(ibc.packets.height_ack, EXCLUDED.height_ack),
-       relayer = COALESCE(ibc.packets.relayer, EXCLUDED.relayer)
+       tx_hash_send = COALESCE(EXCLUDED.tx_hash_send, ibc.packets.tx_hash_send),
+       height_send = COALESCE(EXCLUDED.height_send, ibc.packets.height_send),
+       time_send = COALESCE(EXCLUDED.time_send, ibc.packets.time_send),
+       tx_hash_recv = COALESCE(EXCLUDED.tx_hash_recv, ibc.packets.tx_hash_recv),
+       height_recv = COALESCE(EXCLUDED.height_recv, ibc.packets.height_recv),
+       time_recv = COALESCE(EXCLUDED.time_recv, ibc.packets.time_recv),
+       tx_hash_ack = COALESCE(EXCLUDED.tx_hash_ack, ibc.packets.tx_hash_ack),
+       height_ack = COALESCE(EXCLUDED.height_ack, ibc.packets.height_ack),
+       time_ack = COALESCE(EXCLUDED.time_ack, ibc.packets.time_ack),
+       ack_success = COALESCE(EXCLUDED.ack_success, ibc.packets.ack_success),
+       ack_error = COALESCE(EXCLUDED.ack_error, ibc.packets.ack_error),
+       tx_hash_timeout = COALESCE(EXCLUDED.tx_hash_timeout, ibc.packets.tx_hash_timeout),
+       height_timeout = COALESCE(EXCLUDED.height_timeout, ibc.packets.height_timeout),
+       time_timeout = COALESCE(EXCLUDED.time_timeout, ibc.packets.time_timeout),
+       relayer_send = COALESCE(EXCLUDED.relayer_send, ibc.packets.relayer_send),
+       relayer_recv = COALESCE(EXCLUDED.relayer_recv, ibc.packets.relayer_recv),
+       relayer_ack = COALESCE(EXCLUDED.relayer_ack, ibc.packets.relayer_ack),
+       denom = COALESCE(EXCLUDED.denom, ibc.packets.denom),
+       amount = COALESCE(EXCLUDED.amount, ibc.packets.amount),
+       sender = COALESCE(EXCLUDED.sender, ibc.packets.sender),
+       receiver = COALESCE(EXCLUDED.receiver, ibc.packets.receiver),
+       memo = COALESCE(EXCLUDED.memo, ibc.packets.memo)
     `
   );
   await client.query(text, values);

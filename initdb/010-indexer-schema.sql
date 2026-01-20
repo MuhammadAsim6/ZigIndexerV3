@@ -258,28 +258,117 @@ CREATE TABLE ibc.channels (
     PRIMARY KEY (port_id, channel_id)
 );
 
+CREATE TABLE ibc.clients (
+    client_id        TEXT PRIMARY KEY,
+    chain_id         TEXT NULL,
+    client_type      TEXT NULL,
+    updated_at_height BIGINT NULL,
+    updated_at_time   TIMESTAMPTZ NULL
+);
+
+CREATE TABLE ibc.denoms (
+    hash             TEXT PRIMARY KEY, -- e.g. ibc/6490A7...
+    full_path        TEXT NOT NULL,    -- e.g. transfer/channel-3/uusdc
+    base_denom       TEXT NOT NULL     -- e.g. uusdc
+);
+
 CREATE TABLE ibc.packets (
     port_id_src      TEXT NOT NULL,
     channel_id_src   TEXT NOT NULL,
-    sequence         BIGINT NOT NULL, 
+    sequence         BIGINT NOT NULL,
     port_id_dst      TEXT NULL,
     channel_id_dst   TEXT NULL,
     timeout_height   TEXT NULL,
     timeout_ts       TEXT NULL,
-    status           ibc_packet_status NOT NULL,
+    status           ibc_packet_status NOT NULL DEFAULT 'sent',
+    -- Send info
     tx_hash_send     TEXT NULL,
     height_send      BIGINT NULL,
+    time_send        TIMESTAMPTZ NULL,
+    -- Recv info
     tx_hash_recv     TEXT NULL,
     height_recv      BIGINT NULL,
+    time_recv        TIMESTAMPTZ NULL,
+    -- Ack info
     tx_hash_ack      TEXT NULL,
     height_ack       BIGINT NULL,
-    relayer          TEXT NULL,
+    time_ack         TIMESTAMPTZ NULL,
+    ack_success      BOOLEAN NULL,
+    ack_error        TEXT NULL,
+    -- Timeout info
+    tx_hash_timeout  TEXT NULL,
+    height_timeout   BIGINT NULL,
+    time_timeout     TIMESTAMPTZ NULL,
+    -- Metadata
+    relayer_send     TEXT NULL,
+    relayer_recv     TEXT NULL,
+    relayer_ack      TEXT NULL,
+    denom            TEXT NULL,
+    amount           NUMERIC(80, 0) NULL,
+    sender           TEXT NULL,
+    receiver         TEXT NULL,
+    memo             TEXT NULL,
+    PRIMARY KEY (port_id_src, channel_id_src, sequence)
+);
+
+CREATE TABLE ibc.transfers (
+    port_id_src      TEXT NOT NULL,
+    channel_id_src   TEXT NOT NULL,
+    sequence         BIGINT NOT NULL,
+    port_id_dst      TEXT NULL,
+    channel_id_dst   TEXT NULL,
+    sender           TEXT NULL,
+    receiver         TEXT NULL,
     denom            TEXT NULL,
     amount           NUMERIC(80, 0) NULL,
     memo             TEXT NULL,
-    PRIMARY KEY (channel_id_src, port_id_src, sequence)
-) PARTITION BY RANGE (sequence);
-CREATE TABLE IF NOT EXISTS ibc.packets_p0 PARTITION OF ibc.packets FOR VALUES FROM (0) TO (1000000);
+    timeout_height   TEXT NULL,
+    timeout_ts       TEXT NULL,
+    status           ibc_packet_status NOT NULL DEFAULT 'sent',
+    -- Send info
+    tx_hash_send     TEXT NULL,
+    height_send      BIGINT NULL,
+    time_send        TIMESTAMPTZ NULL,
+    -- Recv info
+    tx_hash_recv     TEXT NULL,
+    height_recv      BIGINT NULL,
+    time_recv        TIMESTAMPTZ NULL,
+    -- Ack info
+    tx_hash_ack      TEXT NULL,
+    height_ack       BIGINT NULL,
+    time_ack         TIMESTAMPTZ NULL,
+    ack_success      BOOLEAN NULL,
+    ack_error        TEXT NULL,
+    -- Timeout info
+    tx_hash_timeout  TEXT NULL,
+    height_timeout   BIGINT NULL,
+    time_timeout     TIMESTAMPTZ NULL,
+    -- Relayers
+    relayer_send     TEXT NULL,
+    relayer_recv     TEXT NULL,
+    relayer_ack      TEXT NULL,
+    PRIMARY KEY (port_id_src, channel_id_src, sequence)
+);
+
+-- IBC Connections (Channel → Client mapping)
+CREATE TABLE ibc.connections (
+    connection_id              TEXT PRIMARY KEY,
+    client_id                  TEXT NOT NULL,
+    counterparty_connection_id TEXT NULL,
+    counterparty_client_id     TEXT NULL,
+    state                      TEXT NULL
+);
+
+-- ============================================================================
+-- IBC INDEXES (Performance)
+-- ============================================================================
+CREATE INDEX idx_ibc_packets_status ON ibc.packets(status);
+CREATE INDEX idx_ibc_packets_channel ON ibc.packets(channel_id_src);
+CREATE INDEX idx_ibc_transfers_sender ON ibc.transfers(sender);
+CREATE INDEX idx_ibc_transfers_receiver ON ibc.transfers(receiver);
+CREATE INDEX idx_ibc_transfers_status ON ibc.transfers(status);
+CREATE INDEX idx_ibc_transfers_channel ON ibc.transfers(channel_id_src);
+CREATE INDEX idx_ibc_transfers_denom ON ibc.transfers(denom);
 
 -- ============================================================================
 -- 6) WASM
@@ -361,7 +450,62 @@ CREATE TABLE wasm.state_kv (
 ) PARTITION BY RANGE (height);
 
 -- ============================================================================
--- 7) NETWORK PARAMS
+-- 7) AUTHZ / FEEGRANT
+-- ============================================================================
+CREATE TABLE authz_feegrant.authz_grants (
+    granter      TEXT        NOT NULL,
+    grantee      TEXT        NOT NULL,
+    msg_type_url TEXT        NOT NULL,
+    expiration   TIMESTAMPTZ NULL,
+    height       BIGINT      NOT NULL,
+    revoked      BOOLEAN     NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (granter, grantee, msg_type_url, height)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS authz_feegrant.authz_grants_p0 PARTITION OF authz_feegrant.authz_grants FOR VALUES FROM (0) TO (1000000);
+
+CREATE TABLE authz_feegrant.fee_grants (
+    granter    TEXT        NOT NULL,
+    grantee    TEXT        NOT NULL,
+    allowance  JSONB       NULL,
+    expiration TIMESTAMPTZ NULL,
+    height     BIGINT      NOT NULL,
+    revoked    BOOLEAN     NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (granter, grantee, height)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS authz_feegrant.fee_grants_p0 PARTITION OF authz_feegrant.fee_grants FOR VALUES FROM (0) TO (1000000);
+
+CREATE INDEX IF NOT EXISTS idx_authz_grants_grantee ON authz_feegrant.authz_grants (grantee, height DESC);
+CREATE INDEX IF NOT EXISTS idx_fee_grants_grantee ON authz_feegrant.fee_grants (grantee, height DESC);
+
+-- ============================================================================
+-- 8) TOKENS (CW20)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS tokens.cw20_transfers (
+    contract  TEXT           NOT NULL,
+    from_addr TEXT           NOT NULL,
+    to_addr   TEXT           NOT NULL,
+    amount    NUMERIC(80, 0) NOT NULL,
+    height    BIGINT         NOT NULL,
+    tx_hash   TEXT           NOT NULL,
+    PRIMARY KEY (height, tx_hash, contract, from_addr, to_addr)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS tokens.cw20_transfers_p0 PARTITION OF tokens.cw20_transfers FOR VALUES FROM (0) TO (1000000);
+
+CREATE INDEX IF NOT EXISTS idx_cw20_from ON tokens.cw20_transfers (contract, from_addr, height DESC);
+CREATE INDEX IF NOT EXISTS idx_cw20_to ON tokens.cw20_transfers (contract, to_addr, height DESC);
+CREATE INDEX IF NOT EXISTS idx_cw20_brin ON tokens.cw20_transfers USING BRIN (height);
+CREATE INDEX IF NOT EXISTS idx_cw20_tx ON tokens.cw20_transfers (tx_hash);
+
+-- Optional snapshots: maintain via periodic job
+CREATE TABLE IF NOT EXISTS tokens.cw20_balances_current (
+    contract TEXT           NOT NULL,
+    account  TEXT           NOT NULL,
+    balance  NUMERIC(80, 0) NOT NULL,
+    PRIMARY KEY (contract, account)
+);
+
+-- ============================================================================
+-- 9) NETWORK PARAMS
 -- ============================================================================
 CREATE TABLE core.network_params (
     height    BIGINT PRIMARY KEY,
@@ -373,7 +517,7 @@ CREATE TABLE core.network_params (
 ) PARTITION BY RANGE (height);
 
 -- ============================================================================
--- 8) QUERY-PATTERN INDEXES (For 5.4M+ scale)
+-- 10) QUERY-PATTERN INDEXES (For 5.4M+ scale)
 -- ============================================================================
 -- Transfers by address (common API query)
 CREATE INDEX IF NOT EXISTS idx_transfers_from ON bank.transfers (from_addr, height DESC);
@@ -394,6 +538,9 @@ CREATE INDEX IF NOT EXISTS idx_wasm_event_attrs_contract ON wasm.event_attrs (co
 
 -- IBC by channel (relayer/bridge queries)
 CREATE INDEX IF NOT EXISTS idx_ibc_channel ON ibc.packets (channel_id_src, status);
+CREATE INDEX IF NOT EXISTS idx_ibc_transfers_sender ON ibc.transfers (sender, sequence DESC);
+CREATE INDEX IF NOT EXISTS idx_ibc_transfers_receiver ON ibc.transfers (receiver, sequence DESC);
+CREATE INDEX IF NOT EXISTS idx_ibc_transfers_denom ON ibc.transfers (denom, sequence DESC);
 
 -- Gov by proposal (governance dashboard)
 CREATE INDEX IF NOT EXISTS idx_gov_votes_proposal ON gov.votes (proposal_id, height DESC);

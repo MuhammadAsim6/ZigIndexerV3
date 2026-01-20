@@ -18,9 +18,11 @@ INSERT INTO util.height_part_ranges (schema_name, table_name, range_size) VALUES
  ('bank', 'transfers', 1000000), ('bank', 'balance_deltas', 1000000),
  ('stake', 'delegation_events', 1000000), ('stake', 'distribution_events', 1000000),
  ('gov', 'deposits', 1000000), ('gov', 'votes', 1000000),
+ ('authz_feegrant', 'authz_grants', 1000000), ('authz_feegrant', 'fee_grants', 1000000),
+ ('tokens', 'cw20_transfers', 1000000),
  ('wasm', 'executions', 1000000), ('wasm', 'events', 1000000),
  ('wasm', 'event_attrs', 1000000), ('wasm', 'state_kv', 1000000), ('wasm', 'contract_migrations', 1000000),
- ('ibc', 'packets', 1000000),
+ -- IBC: No longer partitioned (lifecycle merging requires simple PK)
  ('zigchain', 'dex_swaps', 1000000), ('zigchain', 'dex_liquidity', 1000000)
 ON CONFLICT (schema_name, table_name) DO UPDATE SET range_size = EXCLUDED.range_size;
 
@@ -33,9 +35,10 @@ WHERE (schema_name, table_name) NOT IN (
     ('bank', 'transfers'), ('bank', 'balance_deltas'),
     ('stake', 'delegation_events'), ('stake', 'distribution_events'),
     ('gov', 'deposits'), ('gov', 'votes'),
+    ('authz_feegrant', 'authz_grants'), ('authz_feegrant', 'fee_grants'),
+    ('tokens', 'cw20_transfers'),
     ('wasm', 'executions'), ('wasm', 'events'), ('wasm', 'event_attrs'),
     ('wasm', 'state_kv'), ('wasm', 'contract_migrations'),
-    ('ibc', 'packets'),
     ('zigchain', 'dex_swaps'), ('zigchain', 'dex_liquidity')
 );
 

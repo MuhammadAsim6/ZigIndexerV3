@@ -21,8 +21,13 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     ['bank', 'transfers'], ['bank', 'balance_deltas'],
     ['stake', 'delegation_events'], ['stake', 'distribution_events'],
     ['gov', 'deposits'], ['gov', 'votes'],
+    ['authz_feegrant', 'authz_grants'], ['authz_feegrant', 'fee_grants'],
+    ['tokens', 'cw20_transfers'],
     ['wasm', 'executions'], ['wasm', 'events'], ['wasm', 'event_attrs'], ['wasm', 'state_kv'], ['wasm', 'contract_migrations'],
-    ['ibc', 'packets'], // Note: Uses sequence, but handled by height proxy here for simplicity
+
+    // IBC - No longer partitioned (simple PK: port, channel, sequence)
+    // ['ibc', 'packets'],
+    // ['ibc', 'transfers'],
 
     // Zigchain
     ['zigchain', 'dex_swaps'], ['zigchain', 'dex_liquidity']
@@ -59,6 +64,12 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     // 🔓 Unlock
     await client.query(`SELECT pg_advisory_unlock($1)`, [PARTITION_LOCK_ID]);
   }
+}
+
+export async function ensureIbcPartitions(client: PoolClient, minSeq: number, maxSeq: number): Promise<void> {
+  // IBC packets and transfers are now partitioned by height in ensureCorePartitions.
+  // Keeping this function as a stub to avoid breaking callers, but it does nothing.
+  return;
 }
 
 /**

@@ -17,7 +17,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_INITDB_ARGS: ${PG_INITDB_ARGS}
     ports:
-      - "${PG_PORT:-5432}:5432"
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
     volumes:
       - pgdata_cosmosindexer:/var/lib/postgresql/data
     shm_size: 4gb  # ✅ Increased from 1gb for 5.4M+ scale
@@ -37,6 +37,8 @@ services:
       - "maintenance_work_mem=1GB"  # ✅ Added for faster VACUUM/INDEX
       - "-c"
       - "effective_cache_size=8GB"  # ✅ Added for query planning
+      - "-c"
+      - "archive_mode=off"          # ✅ STOPS THE LOG WARNINGS/spamming
 
   indexer:
     build:
@@ -62,7 +64,7 @@ services:
       # Optional: override RPC_URL if you want the indexer to target a remote node
       RPC_URL: ${RPC_URL}
       # Node memory default (can be overridden at compose run time)
-      NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=24576}
+      NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=16384}
     # In production, do not bind-mount the host project directory — that can overwrite
     # container-installed node_modules (causing esbuild platform mismatch). The image
     # already contains the app and dependencies.

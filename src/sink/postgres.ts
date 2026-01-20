@@ -5,7 +5,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Sink, SinkConfig } from './types.js';
 import { createPgPool, getPgPool, closePgPool } from '../db/pg.js';
-import { ensureCorePartitions } from '../db/partitions.js';
+import { ensureCorePartitions, ensureIbcPartitions } from '../db/partitions.js';
 import { upsertProgress } from '../db/progress.js';
 import { recordMissingBlock, resolveMissingBlock } from '../db/missing_blocks.js';
 import { getLogger } from '../utils/logger.js';
@@ -22,7 +22,9 @@ import {
   normArray,
   parseDec,
   tryParseJson,
-  toBigIntStr
+  toBigIntStr,
+  toDateFromTimestamp,
+  decodeHexToJson // ✅ ADDED: For IBC packet_data_hex decoding
 } from './pg/parsing.js';
 
 // Standard Flushers
@@ -43,6 +45,14 @@ import { flushGovDeposits, flushGovVotes, upsertGovProposals } from './pg/flushe
 import { upsertValidators } from './pg/flushers/validators.js';
 // ✅ ADDED: IBC Flusher
 import { flushIbcPackets } from './pg/flushers/ibc_packets.js';
+import { flushIbcTransfers } from './pg/flushers/ibc_transfers.js';
+import { flushIbcChannels } from './pg/flushers/ibc_channels.js';
+import { flushIbcClients } from './pg/flushers/ibc_clients.js';
+import { flushIbcDenoms } from './pg/flushers/ibc_denoms.js';
+import { flushIbcConnections } from './pg/flushers/ibc_connections.js';
+import { flushAuthzGrants } from './pg/flushers/authz_grants.js';
+import { flushFeeGrants } from './pg/flushers/fee_grants.js';
+import { flushCw20Transfers } from './pg/flushers/cw20_transfers.js';
 
 // ✅ ADDED: Bank & Params Flushers
 import { flushBalanceDeltas } from './pg/flushers/bank.js';
@@ -56,6 +66,13 @@ import { flushZigchainData } from './pg/flushers/zigchain.js';
 const log = getLogger('sink/postgres');
 
 export type PostgresMode = 'block-atomic' | 'batch-insert';
+
+function extractExpiration(val: any): Date | null {
+  const direct = toDateFromTimestamp(val);
+  if (direct) return direct;
+  const nested = val?.expiration ?? val?.basic?.expiration ?? val?.periodic?.expiration ?? val?.allowance?.expiration;
+  return toDateFromTimestamp(nested);
+}
 
 export interface PostgresSinkConfig extends SinkConfig {
   pg: {
@@ -107,6 +124,15 @@ export class PostgresSink implements Sink {
 
   // ✅ IBC Buffer
   private bufIbcPackets: any[] = [];
+  private bufIbcChannels: any[] = [];
+  private bufIbcTransfers: any[] = [];
+  private bufIbcClients: any[] = [];
+  private bufIbcDenoms: any[] = [];
+  private bufIbcConnections: any[] = [];
+
+  // ✅ Authz/Feegrant Buffer
+  private bufAuthzGrants: any[] = [];
+  private bufFeeGrants: any[] = [];
 
   // ✅ ADDED: Missing Buffers
   private bufBalanceDeltas: any[] = [];
@@ -121,6 +147,7 @@ export class PostgresSink implements Sink {
   private bufDexSwaps: any[] = [];
   private bufDexLiquidity: any[] = [];
   private bufWrapperSettings: any[] = [];
+  private bufCw20Transfers: any[] = [];
 
   private batchSizes = {
     blocks: 1000,
@@ -139,7 +166,10 @@ export class PostgresSink implements Sink {
     govProposals: 1000,
     validators: 500,
     ibcPackets: 2000,
-    zigchain: 2000
+    ibcChannels: 500,
+    ibcTransfers: 2000,
+    zigchain: 2000,
+    cw20Transfers: 5000
   };
 
   constructor(cfg: PostgresSinkConfig) {
@@ -250,6 +280,18 @@ export class PostgresSink implements Sink {
 
     // ✅ IBC
     const ibcPacketsRows: any[] = [];
+    const ibcChannelsRows: any[] = [];
+    const ibcTransfersRows: any[] = [];
+    const ibcClientsRows: any[] = [];
+    const ibcDenomsRows: any[] = [];
+    const ibcConnectionsRows: any[] = [];
+
+    // ✅ Authz / Feegrant
+    const authzGrantsRows: any[] = [];
+    const feeGrantsRows: any[] = [];
+
+    // ✅ Tokens (CW20)
+    const cw20TransfersRows: any[] = [];
 
     // ✅ Staking & Distribution
     const stakeDelegRows: any[] = [];
@@ -266,6 +308,7 @@ export class PostgresSink implements Sink {
 
     for (const tx of txs) {
       const tx_hash = tx.hash ?? tx.txhash ?? tx.tx_hash ?? null;
+      const txIbcIntents: any[] = [];
       const tx_index = Number(tx.index ?? tx.tx_index ?? tx?.tx_response?.index ?? 0);
       const code = Number(tx.code ?? tx?.tx_response?.code ?? 0);
       const gas_wanted = toNum(tx.gas_wanted ?? tx?.tx_response?.gas_wanted);
@@ -373,6 +416,76 @@ export class PostgresSink implements Sink {
               proposal_type: proposalType,
               submit_time: time,
               status: 'deposit_period',
+            });
+          }
+        }
+
+        // 🟢 AUTHZ / FEEGRANT (SUCCESS ONLY) 🟢
+        if (
+          code === 0 &&
+          (type === '/cosmos.authz.v1beta1.MsgGrant' || type === '/cosmos.authz.v1.MsgGrant')
+        ) {
+          const grant = m?.grant ?? {};
+          const auth = grant?.authorization ?? m?.authorization ?? null;
+          const msgTypeUrl = auth?.msg ?? auth?.msg_type_url ?? auth?.['@type'] ?? auth?.type_url ?? null;
+          if (m?.granter && m?.grantee && msgTypeUrl) {
+            authzGrantsRows.push({
+              granter: m.granter,
+              grantee: m.grantee,
+              msg_type_url: msgTypeUrl,
+              expiration: extractExpiration(grant),
+              height,
+              revoked: false,
+            });
+          }
+        }
+
+        if (
+          code === 0 &&
+          (type === '/cosmos.authz.v1beta1.MsgRevoke' || type === '/cosmos.authz.v1.MsgRevoke')
+        ) {
+          if (m?.granter && m?.grantee && m?.msg_type_url) {
+            authzGrantsRows.push({
+              granter: m.granter,
+              grantee: m.grantee,
+              msg_type_url: m.msg_type_url,
+              expiration: null,
+              height,
+              revoked: true,
+            });
+          }
+        }
+
+        if (
+          code === 0 &&
+          (type === '/cosmos.feegrant.v1beta1.MsgGrantAllowance' || type === '/cosmos.feegrant.v1.MsgGrantAllowance')
+        ) {
+          const allowance = m?.allowance ?? null;
+          if (m?.granter && m?.grantee) {
+            feeGrantsRows.push({
+              granter: m.granter,
+              grantee: m.grantee,
+              allowance,
+              expiration: extractExpiration(allowance),
+              height,
+              revoked: false,
+            });
+          }
+        }
+
+        if (
+          code === 0 &&
+          (type === '/cosmos.feegrant.v1beta1.MsgRevokeAllowance' ||
+            type === '/cosmos.feegrant.v1.MsgRevokeAllowance')
+        ) {
+          if (m?.granter && m?.grantee) {
+            feeGrantsRows.push({
+              granter: m.granter,
+              grantee: m.grantee,
+              allowance: null,
+              expiration: null,
+              height,
+              revoked: true,
             });
           }
         }
@@ -612,12 +725,38 @@ export class PostgresSink implements Sink {
             validator_address: null, denom: null, amount: null
           });
         }
+
+        // 🟢 IBC MSG_TRANSFER INTENT (OUTGOING) 🟢
+        if (type === '/ibc.applications.transfer.v1.MsgTransfer') {
+          txIbcIntents.push({
+            msg_index: i,
+            port: m.source_port,
+            channel: m.source_channel,
+            sender: m.sender,
+            receiver: m.receiver,
+            denom: m.token?.denom,
+            amount: m.token?.amount,
+            memo: m.memo ?? null
+          });
+        }
       }
 
       // --- PROCESS LOGS (Events) ---
       for (const log of logs) {
         const msg_index = Number(log?.msg_index ?? -1);
         const events = normArray<any>(log?.events);
+
+        // 🔄 Pre-scan message events for IBC metadata
+        let msgIbcMeta: any = {};
+        for (const ev of events) {
+          if (ev.type === 'fungible_token_packet') {
+            const ap = attrsToPairs(ev.attributes);
+            msgIbcMeta.sender = findAttr(ap, 'sender');
+            msgIbcMeta.receiver = findAttr(ap, 'receiver');
+            msgIbcMeta.amount = findAttr(ap, 'amount');
+            msgIbcMeta.denom = findAttr(ap, 'denom');
+          }
+        }
 
         for (let ei = 0; ei < events.length; ei++) {
           const ev = events[ei];
@@ -646,6 +785,31 @@ export class PostgresSink implements Sink {
                   value
                 });
               }
+
+              const action = findAttr(attrsPairs, 'action');
+              if (action === 'transfer' || action === 'send') {
+                const fromAddr =
+                  findAttr(attrsPairs, 'sender') ||
+                  findAttr(attrsPairs, 'from') ||
+                  findAttr(attrsPairs, 'from_address');
+                const toAddr =
+                  findAttr(attrsPairs, 'recipient') ||
+                  findAttr(attrsPairs, 'to') ||
+                  findAttr(attrsPairs, 'to_address');
+                const amtRaw = findAttr(attrsPairs, 'amount');
+                const amtCoin = amtRaw ? parseCoin(amtRaw) : null;
+                const amount = (amtRaw && /^\d+$/.test(amtRaw)) ? amtRaw : amtCoin?.amount ?? null;
+                if (fromAddr && toAddr && amount) {
+                  cw20TransfersRows.push({
+                    contract,
+                    from_addr: fromAddr,
+                    to_addr: toAddr,
+                    amount,
+                    height,
+                    tx_hash
+                  });
+                }
+              }
             }
           }
 
@@ -665,6 +829,9 @@ export class PostgresSink implements Sink {
           // 🟢 IBC LOGIC 🟢
           if (['send_packet', 'recv_packet', 'acknowledge_packet', 'timeout_packet'].includes(event_type)) {
             const sequenceStr = findAttr(attrsPairs, 'packet_sequence');
+            if (!sequenceStr || !/^\d+$/.test(sequenceStr)) {
+              continue;
+            }
             const sequence = toBigIntStr(sequenceStr);
             const srcPort = findAttr(attrsPairs, 'packet_src_port');
             const srcChan = findAttr(attrsPairs, 'packet_src_channel');
@@ -676,7 +843,9 @@ export class PostgresSink implements Sink {
             const timeoutTsStr = findAttr(attrsPairs, 'packet_timeout_timestamp');
 
             if (sequence && srcChan) {
+              // ✅ FIX: Try packet_data first, then packet_data_hex (hex-encoded)
               const dataJson = findAttr(attrsPairs, 'packet_data');
+              const dataHex = findAttr(attrsPairs, 'packet_data_hex');
               let amount: string | null = null;
               let denom: string | null = null;
               let relayer: string | null = null;
@@ -685,19 +854,45 @@ export class PostgresSink implements Sink {
               let receiver: string | null = null;
 
               try {
-                if (dataJson) {
-                  const d = JSON.parse(dataJson);
-                  amount = d.amount ?? null;
-                  denom = d.denom ?? null;
-                  sender = d.sender ?? null;
-                  receiver = d.receiver ?? null;
+                // Try packet_data first (plain JSON), then packet_data_hex (hex-encoded)
+                const d = dataJson ? tryParseJson(dataJson) : (dataHex ? decodeHexToJson(dataHex) : null);
+                if (d) {
+                  amount = d.amount ?? d.amt ?? msgIbcMeta.amount ?? null;
+                  denom = d.denom ?? d.den ?? msgIbcMeta.denom ?? null;
+                  sender = d.sender ?? d.snd ?? msgIbcMeta.sender ?? null;
+                  receiver = d.receiver ?? d.rcv ?? msgIbcMeta.receiver ?? null;
                   memo = d.memo ?? null;
-                  // Relayer is typically the sender for send_packet, receiver for recv_packet
-                  relayer = event_type === 'send_packet' ? sender :
-                    event_type === 'recv_packet' ? receiver :
-                      findAttr(attrsPairs, 'packet_ack_relayer') ?? sender;
                 }
               } catch { /* ignore parse error */ }
+
+              // Fallback to fungible_token_packet event data if not extracted
+              if (!sender) sender = msgIbcMeta.sender ?? null;
+              if (!receiver) receiver = msgIbcMeta.receiver ?? null;
+              if (!amount) amount = msgIbcMeta.amount ?? null;
+              if (!denom) denom = msgIbcMeta.denom ?? null;
+
+              // 🛡️ ENHANCEMENT: Link with MsgTransfer intents if fields are missing (Outgoing)
+              if (event_type === 'send_packet') {
+                const intent = txIbcIntents.find((it: any) => it.port === srcPort && it.channel === srcChan && !it.linked);
+                if (intent) {
+                  intent.linked = true; // Avoid double-link for multi-msg tx
+                  amount = amount || intent.amount;
+                  denom = denom || intent.denom;
+                  sender = sender || intent.sender;
+                  receiver = receiver || intent.receiver;
+                  memo = memo || intent.memo;
+                }
+              }
+
+              if (!relayer) {
+                const ackRelayer = findAttr(attrsPairs, 'packet_ack_relayer') || findAttr(attrsPairs, 'relayer');
+                if (event_type === 'send_packet') {
+                  relayer = sender || findAttr(attrsPairs, 'packet_sender') || findAttr(attrsPairs, 'sender');
+                } else {
+                  // For recv, ack, timeout: the transaction signer is the relayer
+                  relayer = firstSigner || ackRelayer;
+                }
+              }
 
               const statusMap: Record<string, string> = {
                 send_packet: 'sent',
@@ -705,26 +900,200 @@ export class PostgresSink implements Sink {
                 acknowledge_packet: 'acknowledged',
                 timeout_packet: 'timeout'
               };
+              const status = statusMap[event_type] || 'failed';
 
-              ibcPacketsRows.push({
+              let ackSuccess: boolean | null = null;
+              let ackError: string | null = null;
+              if (event_type === 'acknowledge_packet') {
+                const ackHex = findAttr(attrsPairs, 'packet_ack');
+                if (ackHex) {
+                  try {
+                    const ackJson = tryParseJson(ackHex);
+                    ackSuccess = !!ackJson.result;
+                    ackError = ackJson.error || null;
+                  } catch { /* ignore hex/binary parse errors for now */ }
+                }
+              }
+
+              // Build packet row with event-specific columns
+              const packetRow: any = {
                 port_id_src: srcPort,
                 channel_id_src: srcChan,
-                sequence: sequence,
+                sequence: Number(sequence), // Ensure numeric for BIGINT
                 port_id_dst: dstPort,
                 channel_id_dst: dstChan,
                 timeout_height: timeoutHeightStr ?? null,
                 timeout_ts: timeoutTsStr ?? null,
-                status: statusMap[event_type] || 'failed',
-                tx_hash_send: event_type === 'send_packet' ? tx_hash : null,
-                height_send: event_type === 'send_packet' ? height : null,
-                tx_hash_recv: event_type === 'recv_packet' ? tx_hash : null,
-                height_recv: event_type === 'recv_packet' ? height : null,
-                tx_hash_ack: event_type === 'acknowledge_packet' ? tx_hash : null,
-                height_ack: event_type === 'acknowledge_packet' ? height : null,
-                relayer,
+                status,
                 denom,
                 amount,
-                memo
+                sender,
+                receiver,
+                memo,
+                // Event-specific fields
+                tx_hash_send: null, height_send: null, time_send: null, relayer_send: null,
+                tx_hash_recv: null, height_recv: null, time_recv: null, relayer_recv: null,
+                tx_hash_ack: null, height_ack: null, time_ack: null, relayer_ack: null, ack_success: null, ack_error: null,
+                tx_hash_timeout: null, height_timeout: null, time_timeout: null
+              };
+
+              // Populate event-specific fields
+              if (event_type === 'send_packet') {
+                packetRow.tx_hash_send = tx_hash;
+                packetRow.height_send = height;
+                packetRow.time_send = time;
+                packetRow.relayer_send = relayer;
+              } else if (event_type === 'recv_packet') {
+                packetRow.tx_hash_recv = tx_hash;
+                packetRow.height_recv = height;
+                packetRow.time_recv = time;
+                packetRow.relayer_recv = relayer;
+              } else if (event_type === 'acknowledge_packet') {
+                packetRow.tx_hash_ack = tx_hash;
+                packetRow.height_ack = height;
+                packetRow.time_ack = time;
+                packetRow.relayer_ack = relayer;
+                packetRow.ack_success = ackSuccess;
+                packetRow.ack_error = ackError;
+              } else if (event_type === 'timeout_packet') {
+                packetRow.tx_hash_timeout = tx_hash;
+                packetRow.height_timeout = height;
+                packetRow.time_timeout = time;
+              }
+
+              ibcPacketsRows.push(packetRow);
+
+              // ✅ FIX: Always record transfers for ALL lifecycle events (not just when denom/amount present)
+              // This ensures ack/timeout statuses are properly recorded
+              const transferRow: any = {
+                port_id_src: srcPort,
+                channel_id_src: srcChan,
+                sequence: Number(sequence),
+                port_id_dst: dstPort,
+                channel_id_dst: dstChan,
+                sender,
+                receiver,
+                denom,
+                amount,
+                memo,
+                timeout_height: timeoutHeightStr ?? null,
+                timeout_ts: timeoutTsStr ?? null,
+                status,
+                tx_hash_send: null, height_send: null, time_send: null, relayer_send: null,
+                tx_hash_recv: null, height_recv: null, time_recv: null, relayer_recv: null,
+                tx_hash_ack: null, height_ack: null, time_ack: null, relayer_ack: null, ack_success: null, ack_error: null,
+                tx_hash_timeout: null, height_timeout: null, time_timeout: null
+              };
+
+              if (event_type === 'send_packet') {
+                transferRow.tx_hash_send = tx_hash;
+                transferRow.height_send = height;
+                transferRow.time_send = time;
+                transferRow.relayer_send = relayer;
+              } else if (event_type === 'recv_packet') {
+                transferRow.tx_hash_recv = tx_hash;
+                transferRow.height_recv = height;
+                transferRow.time_recv = time;
+                transferRow.relayer_recv = relayer;
+              } else if (event_type === 'acknowledge_packet') {
+                transferRow.tx_hash_ack = tx_hash;
+                transferRow.height_ack = height;
+                transferRow.time_ack = time;
+                transferRow.relayer_ack = relayer;
+                transferRow.ack_success = ackSuccess;
+                transferRow.ack_error = ackError;
+              } else if (event_type === 'timeout_packet') {
+                transferRow.tx_hash_timeout = tx_hash;
+                transferRow.height_timeout = height;
+                transferRow.time_timeout = time;
+              }
+
+              ibcTransfersRows.push(transferRow);
+            }
+          }
+
+          if (event_type.startsWith('channel_open_') || event_type.startsWith('channel_close_')) {
+            const portId = findAttr(attrsPairs, 'port_id') || findAttr(attrsPairs, 'packet_src_port');
+            const channelId = findAttr(attrsPairs, 'channel_id') || findAttr(attrsPairs, 'packet_src_channel');
+            if (portId && channelId) {
+              const connectionId = findAttr(attrsPairs, 'connection_id');
+              ibcChannelsRows.push({
+                port_id: portId,
+                channel_id: channelId,
+                state: event_type,
+                ordering: findAttr(attrsPairs, 'channel_ordering') || findAttr(attrsPairs, 'ordering'),
+                connection_hops: connectionId ? [connectionId] : null,
+                counterparty_port: findAttr(attrsPairs, 'counterparty_port_id') || findAttr(attrsPairs, 'counterparty_port'),
+                counterparty_channel: findAttr(attrsPairs, 'counterparty_channel_id') || findAttr(attrsPairs, 'counterparty_channel'),
+                version: findAttr(attrsPairs, 'version')
+              });
+            }
+          }
+
+          // 🟢 IBC CONNECTIONS 🟢
+          if (event_type.startsWith('connection_open_')) {
+            const connId = findAttr(attrsPairs, 'connection_id');
+            const clientId = findAttr(attrsPairs, 'client_id');
+            if (connId && clientId) {
+              ibcConnectionsRows.push({
+                connection_id: connId,
+                client_id: clientId,
+                counterparty_connection_id: findAttr(attrsPairs, 'counterparty_connection_id'),
+                counterparty_client_id: findAttr(attrsPairs, 'counterparty_client_id'),
+                state: event_type
+              });
+            }
+          }
+
+
+          // 🟢 IBC DISCOVERY (CLIENTS & DENOMS) 🟢
+          // ✅ FIX: Handle both denom_trace and denomination events
+          if (event_type === 'denom_trace' || event_type === 'denomination') {
+            // Try denom_trace format first (hash + denom_trace path)
+            let hash = findAttr(attrsPairs, 'hash') || findAttr(attrsPairs, 'denom_hash');
+            let fullPath: string | null = null;
+            let baseDenom: string | null = null;
+
+            const denomTraceAttr = findAttr(attrsPairs, 'denom_trace');
+            const denomAttr = findAttr(attrsPairs, 'denom');
+
+            if (denomTraceAttr) {
+              // Old format: denom_trace = "transfer/channel-0/uatom"
+              fullPath = denomTraceAttr;
+              baseDenom = denomTraceAttr.split('/').pop() || denomTraceAttr;
+            } else if (denomAttr) {
+              // New format: denom = {"base":"uaxl","trace":[{"port_id":"transfer","channel_id":"channel-0"}]}
+              try {
+                const d = tryParseJson(denomAttr);
+                if (d && d.base) {
+                  baseDenom = d.base;
+                  // Reconstruct full path from trace array
+                  if (Array.isArray(d.trace) && d.trace.length > 0) {
+                    const tracePath = d.trace.map((t: any) => `${t.port_id}/${t.channel_id}`).join('/');
+                    fullPath = `${tracePath}/${d.base}`;
+                  } else {
+                    fullPath = d.base;
+                  }
+                }
+              } catch { /* ignore parse error */ }
+            }
+
+            if (hash && fullPath && baseDenom) {
+              // Prepend ibc/ to hash if not already present
+              const ibcHash = hash.startsWith('ibc/') ? hash : `ibc/${hash}`;
+              ibcDenomsRows.push({ hash: ibcHash, full_path: fullPath, base_denom: baseDenom });
+            }
+          }
+
+          if (event_type === 'create_client' || event_type === 'update_client') {
+            const clientId = findAttr(attrsPairs, 'client_id');
+            if (clientId) {
+              ibcClientsRows.push({
+                client_id: clientId,
+                chain_id: findAttr(attrsPairs, 'chain_id'),
+                client_type: findAttr(attrsPairs, 'client_type'),
+                updated_at_height: height,
+                updated_at_time: time
               });
             }
           }
@@ -766,6 +1135,30 @@ export class PostgresSink implements Sink {
           }
         }
       }
+
+      // 🛡️ ENHANCEMENT: Final Flush for any unlinked IBC Intents in this TX
+      // This ensures we capture MsgTransfer rows even if the send_packet event is missing or malformed.
+      for (const intent of txIbcIntents) {
+        if (!intent.linked) {
+          ibcTransfersRows.push({
+            height,
+            tx_hash,
+            msg_index: intent.msg_index,
+            port_id_src: intent.port,
+            channel_id_src: intent.channel,
+            sequence: '0',
+            sender: intent.sender,
+            receiver: intent.receiver,
+            denom: intent.denom,
+            amount: intent.amount,
+            memo: intent.memo,
+            status: 'sent',
+            tx_hash_send: tx_hash,
+            height_send: height,
+            time
+          });
+        }
+      }
     }
 
     return {
@@ -775,6 +1168,14 @@ export class PostgresSink implements Sink {
       stakeDelegRows, stakeDistrRows, // 👈 Returning Staking Data
       validatorsRows, // 👈 Returning Validator Data
       ibcPacketsRows, // 👈 Returning IBC Data
+      ibcChannelsRows,
+      ibcTransfersRows,
+      ibcClientsRows,
+      ibcDenomsRows,
+      ibcConnectionsRows,
+      authzGrantsRows,
+      feeGrantsRows,
+      cw20TransfersRows,
       factoryDenomsRows, dexPoolsRows, dexSwapsRows, dexLiquidityRows, wrapperSettingsRows,
       balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, networkParamsRows,
       wasmEventAttrsRows,
@@ -825,6 +1226,18 @@ export class PostgresSink implements Sink {
 
     // ✅ IBC (Pushing to Buffer)
     this.bufIbcPackets.push(...data.ibcPacketsRows);
+    this.bufIbcChannels.push(...data.ibcChannelsRows);
+    this.bufIbcTransfers.push(...data.ibcTransfersRows);
+    this.bufIbcClients.push(...data.ibcClientsRows);
+    this.bufIbcDenoms.push(...data.ibcDenomsRows);
+    this.bufIbcConnections.push(...data.ibcConnectionsRows);
+
+    // ✅ Authz / Feegrant (Pushing to Buffer)
+    this.bufAuthzGrants.push(...data.authzGrantsRows);
+    this.bufFeeGrants.push(...data.feeGrantsRows);
+
+    // ✅ Tokens (CW20) (Pushing to Buffer)
+    this.bufCw20Transfers.push(...data.cw20TransfersRows);
 
     const zCount = this.bufFactoryDenoms.length + this.bufDexPools.length + this.bufDexSwaps.length + this.bufDexLiquidity.length;
     const gCount = this.bufGovVotes.length + this.bufGovDeposits.length;
@@ -872,6 +1285,13 @@ export class PostgresSink implements Sink {
       await flushGovDeposits(client, this.bufGovDeposits); this.bufGovDeposits = [];
       await upsertGovProposals(client, this.bufGovProposals); this.bufGovProposals = [];
 
+      // ✅ Flushing Authz/Feegrant Data
+      await flushAuthzGrants(client, this.bufAuthzGrants); this.bufAuthzGrants = [];
+      await flushFeeGrants(client, this.bufFeeGrants); this.bufFeeGrants = [];
+
+      // ✅ Flushing CW20 Data
+      await flushCw20Transfers(client, this.bufCw20Transfers); this.bufCw20Transfers = [];
+
       // ✅ Flushing Staking Data
       await flushStakeDeleg(client, this.bufStakeDeleg); this.bufStakeDeleg = [];
       await flushStakeDistr(client, this.bufStakeDistr); this.bufStakeDistr = [];
@@ -880,7 +1300,22 @@ export class PostgresSink implements Sink {
       await upsertValidators(client, this.bufValidators); this.bufValidators = [];
 
       // ✅ Flushing IBC Data
+      if (this.bufIbcPackets.length > 0) {
+        const seqs = [...this.bufIbcPackets, ...this.bufIbcTransfers]
+          .map((r: any) => Number(r.sequence))
+          .filter((n: number) => Number.isFinite(n));
+        if (seqs.length > 0) {
+          const minSeq = Math.min(...seqs);
+          const maxSeq = Math.max(...seqs);
+          await ensureIbcPartitions(client, minSeq, maxSeq);
+        }
+      }
       await flushIbcPackets(client, this.bufIbcPackets); this.bufIbcPackets = [];
+      await flushIbcChannels(client, this.bufIbcChannels); this.bufIbcChannels = [];
+      await flushIbcTransfers(client, this.bufIbcTransfers); this.bufIbcTransfers = [];
+      await flushIbcClients(client, this.bufIbcClients); this.bufIbcClients = [];
+      await flushIbcDenoms(client, this.bufIbcDenoms); this.bufIbcDenoms = [];
+      await flushIbcConnections(client, this.bufIbcConnections); this.bufIbcConnections = [];
 
       // ✅ ADDED: New Flushers
       if (this.bufBalanceDeltas.length > 0) {
