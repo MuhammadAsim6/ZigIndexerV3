@@ -435,11 +435,25 @@ CREATE TABLE IF NOT EXISTS wasm.event_attrs (
     tx_hash     TEXT NOT NULL,
     msg_index   INT NOT NULL,
     event_index INT NOT NULL,
+    attr_index  INT NOT NULL,
     key         TEXT NOT NULL,
     value       TEXT NULL,
-    PRIMARY KEY (height, tx_hash, msg_index, event_index, key)
+    PRIMARY KEY (height, tx_hash, msg_index, event_index, attr_index)
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS wasm.event_attrs_p0 PARTITION OF wasm.event_attrs FOR VALUES FROM (0) TO (1000000);
+
+-- Track admin changes for security auditing
+CREATE TABLE IF NOT EXISTS wasm.admin_changes (
+    contract    TEXT NOT NULL,
+    height      BIGINT NOT NULL,
+    tx_hash     TEXT NOT NULL,
+    msg_index   INT NOT NULL,
+    old_admin   TEXT NULL,
+    new_admin   TEXT NULL,
+    action      TEXT NOT NULL,  -- 'update' or 'clear'
+    PRIMARY KEY (height, tx_hash, msg_index)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS wasm.admin_changes_p0 PARTITION OF wasm.admin_changes FOR VALUES FROM (0) TO (1000000);
 
 CREATE TABLE wasm.state_kv (
     contract   TEXT   NOT NULL,

@@ -59,6 +59,7 @@ import { flushBalanceDeltas } from './pg/flushers/bank.js';
 import { flushNetworkParams } from './pg/flushers/params.js';
 // ✅ ADDED: WASM Registry Flusher
 import { flushWasmRegistry } from './pg/flushers/wasm.js';
+import { flushWasmAdminChanges } from './pg/flushers/wasm_admin_changes.js';
 
 // ✅ Zigchain Flusher
 import { flushZigchainData } from './pg/flushers/zigchain.js';
@@ -139,6 +140,7 @@ export class PostgresSink implements Sink {
   private bufWasmCodes: any[] = [];
   private bufWasmContracts: any[] = [];
   private bufWasmMigrations: any[] = [];
+  private bufWasmAdminChanges: any[] = [];
   private bufNetworkParams: any[] = [];
 
   // Zigchain Buffers
@@ -302,6 +304,7 @@ export class PostgresSink implements Sink {
     const wasmCodesRows: any[] = [];
     const wasmContractsRows: any[] = [];
     const wasmMigrationsRows: any[] = [];
+    const wasmAdminChangesRows: any[] = [];
     const networkParamsRows: any[] = [];
 
     const txs = Array.isArray(blockLine?.txs) ? blockLine.txs : [];
@@ -650,11 +653,36 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 WASM LOGIC 🟢
-        if (type.endsWith('.MsgExecuteContract')) {
+        if (type === '/cosmwasm.wasm.v1.MsgExecuteContract') {
           wasmExecRows.push({
             tx_hash, msg_index: i, contract: m?.contract ?? m?.contract_address, caller: m?.sender,
             funds: m?.funds, msg: tryParseJson(m?.msg), success: code === 0, error: code === 0 ? null : (log_summary),
             gas_used, height
+          });
+        }
+
+        // 🟢 WASM ADMIN CHANGES (Security Auditing) 🟢
+        if (type === '/cosmwasm.wasm.v1.MsgUpdateAdmin' && code === 0) {
+          wasmAdminChangesRows.push({
+            contract: m.contract,
+            height,
+            tx_hash,
+            msg_index: i,
+            old_admin: null, // Would need state query to get old admin
+            new_admin: m.new_admin,
+            action: 'update'
+          });
+        }
+
+        if (type === '/cosmwasm.wasm.v1.MsgClearAdmin' && code === 0) {
+          wasmAdminChangesRows.push({
+            contract: m.contract,
+            height,
+            tx_hash,
+            msg_index: i,
+            old_admin: null, // Would need state query to get old admin
+            new_admin: null,
+            action: 'clear'
           });
         }
 
@@ -774,15 +802,18 @@ export class PostgresSink implements Sink {
               wasmEventsRows.push({
                 contract, height, tx_hash, msg_index, event_index: ei, event_type, attributes: attrsPairs
               });
-              for (const { key, value } of attrsPairs) {
+              for (let ai = 0; ai < attrsPairs.length; ai++) {
+                const attr = attrsPairs[ai];
+                if (!attr) continue;
                 wasmEventAttrsRows.push({
                   contract,
                   height,
                   tx_hash,
                   msg_index,
                   event_index: ei,
-                  key,
-                  value
+                  attr_index: ai,
+                  key: attr.key,
+                  value: attr.value
                 });
               }
 
@@ -1177,7 +1208,7 @@ export class PostgresSink implements Sink {
       feeGrantsRows,
       cw20TransfersRows,
       factoryDenomsRows, dexPoolsRows, dexSwapsRows, dexLiquidityRows, wrapperSettingsRows,
-      balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, networkParamsRows,
+      balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, wasmAdminChangesRows, networkParamsRows,
       wasmEventAttrsRows,
       height
     };
@@ -1219,6 +1250,7 @@ export class PostgresSink implements Sink {
     this.bufWasmCodes.push(...data.wasmCodesRows);
     this.bufWasmContracts.push(...data.wasmContractsRows);
     this.bufWasmMigrations.push(...data.wasmMigrationsRows);
+    this.bufWasmAdminChanges.push(...data.wasmAdminChangesRows);
     this.bufNetworkParams.push(...data.networkParamsRows);
 
     // ✅ Validator (Pushing to Buffer)
@@ -1328,6 +1360,9 @@ export class PostgresSink implements Sink {
           migrations: this.bufWasmMigrations
         });
         this.bufWasmCodes = []; this.bufWasmContracts = []; this.bufWasmMigrations = [];
+      }
+      if (this.bufWasmAdminChanges.length > 0) {
+        await flushWasmAdminChanges(client, this.bufWasmAdminChanges); this.bufWasmAdminChanges = [];
       }
       if (this.bufNetworkParams.length > 0) {
         await flushNetworkParams(client, this.bufNetworkParams); this.bufNetworkParams = [];
