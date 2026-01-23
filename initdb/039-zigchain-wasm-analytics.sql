@@ -21,9 +21,15 @@ CREATE TABLE IF NOT EXISTS wasm.dex_swaps (
     maker_fee_amount  TEXT,
     fee_share_amount  TEXT,
     reserves          TEXT,             -- Pool reserves after swap
+    -- NEW: Analytics columns
+    pair_id           TEXT,             -- Sorted pair identifier (e.g., "uzig-stzig")
+    effective_price   NUMERIC(40,18),   -- return_amount / offer_amount
+    price_impact      NUMERIC(20,10),   -- (spread_amount / offer_amount) * 100
+    total_fee         TEXT,             -- commission + maker_fee + fee_share
     block_height      BIGINT NOT NULL,
     timestamp         TIMESTAMPTZ,
     PRIMARY KEY (tx_hash, msg_index, event_index, block_height)
+
 ) PARTITION BY RANGE (block_height);
 
 CREATE TABLE IF NOT EXISTS wasm.dex_swaps_p0 PARTITION OF wasm.dex_swaps 
@@ -36,6 +42,9 @@ CREATE INDEX IF NOT EXISTS idx_wasm_swaps_sender ON wasm.dex_swaps (sender, bloc
 CREATE INDEX IF NOT EXISTS idx_wasm_swaps_offer ON wasm.dex_swaps (offer_asset, block_height DESC);
 CREATE INDEX IF NOT EXISTS idx_wasm_swaps_ask ON wasm.dex_swaps (ask_asset, block_height DESC);
 CREATE INDEX IF NOT EXISTS idx_wasm_swaps_height ON wasm.dex_swaps USING BRIN (block_height);
+CREATE INDEX IF NOT EXISTS idx_wasm_swaps_pair ON wasm.dex_swaps (pair_id, block_height DESC);
+CREATE INDEX IF NOT EXISTS idx_wasm_swaps_timestamp ON wasm.dex_swaps (timestamp DESC);
+
 
 -- ============================================================================
 -- 2. FACTORY TOKENS (Track coin.zigXXX tokens)

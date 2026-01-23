@@ -96,8 +96,18 @@ export function typeUrlToFullName(typeUrl: string): string {
  */
 export function decodeAnyWithRoot(typeUrl: string, value: Uint8Array, root: protobuf.Root): Record<string, unknown> {
   const fullName = typeUrlToFullName(typeUrl);
-  const Type = root.lookupType(fullName);
-  if (!Type) throw new Error(`Type not found in proto root: ${fullName}`);
+  let Type: protobuf.Type | null = null;
+  try {
+    Type = root.lookupType(fullName);
+  } catch {
+    // Type not found - will be handled below
+  }
+
+  // Graceful fallback for unknown types - return raw data instead of crashing
+  if (!Type) {
+    log.warn(`Unknown proto type (returning raw): ${fullName}`);
+    return { '@type': typeUrl, _raw: Buffer.from(value).toString('base64') };
+  }
   const msg = Type.decode(value);
   const obj = Type.toObject(msg, {
     longs: String,

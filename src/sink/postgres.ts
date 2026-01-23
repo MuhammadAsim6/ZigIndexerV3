@@ -67,6 +67,9 @@ import { flushZigchainData } from './pg/flushers/zigchain.js';
 // ✅ WASM DEX Swap Analytics
 import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js';
 
+// ✅ Unknown Messages Quarantine
+import { flushUnknownMessages } from './pg/flushers/unknown_msgs.js';
+
 const log = getLogger('sink/postgres');
 
 export type PostgresMode = 'block-atomic' | 'batch-insert';
@@ -157,6 +160,9 @@ export class PostgresSink implements Sink {
   // ✅ WASM DEX Swap Analytics
   private bufWasmSwaps: any[] = [];
   private bufFactoryTokens: any[] = [];
+
+  // ✅ Unknown Messages Quarantine
+  private bufUnknownMsgs: any[] = [];
 
   private batchSizes = {
     blocks: 1000,
@@ -318,6 +324,9 @@ export class PostgresSink implements Sink {
     const wasmSwapsRows: any[] = [];
     const factoryTokensRows: any[] = [];
 
+    // ✅ Unknown Messages Quarantine
+    const unknownMsgsRows: any[] = [];
+
     const txs = Array.isArray(blockLine?.txs) ? blockLine.txs : [];
 
     for (const tx of txs) {
@@ -355,6 +364,21 @@ export class PostgresSink implements Sink {
       for (let i = 0; i < msgs.length; i++) {
         const m = msgs[i];
         const type = m?.['@type'] ?? m?.type_url ?? '';
+
+        // ✅ Detect unknown/undecoded messages (quarantine)
+        const isUnknown = m?.['_raw'] || m?.['value_b64'];
+        if (isUnknown) {
+          unknownMsgsRows.push({
+            tx_hash,
+            msg_index: i,
+            height,
+            type_url: type,
+            raw_value: m?.['_raw'] || m?.['value_b64'],
+            signer: null  // Can't decode signer from unknown msg
+          });
+          log.warn(`[quarantine] Unknown message type: ${type} at height ${height}`);
+          continue;  // Skip domain table processing for this message
+        }
 
         msgRows.push({
           tx_hash, msg_index: i, height, type_url: type, value: m,
@@ -882,6 +906,35 @@ export class PostgresSink implements Sink {
                 const reserves = findAttr(attrsPairs, 'reserves');
 
                 if (sender && offerAmount) {
+                  // ✅ Compute analytics columns with NaN validation
+                  const offerNum = parseFloat(offerAmount || '0');
+                  const returnNum = parseFloat(returnAmount || '0');
+                  const spreadNum = parseFloat(spreadAmount || '0');
+                  const commissionNum = parseFloat(commissionAmount || '0');
+                  const makerFeeNum = parseFloat(makerFeeAmount || '0');
+                  const feeShareNum = parseFloat(feeShareAmount || '0');
+
+                  // Generate sorted pair_id for consistent pair identification
+                  const pairId = offerAsset && askAsset
+                    ? [offerAsset, askAsset].sort().join('-')
+                    : null;
+
+                  // Effective price: return_amount / offer_amount (with NaN check)
+                  const effectivePrice = offerNum > 0 && !isNaN(returnNum)
+                    ? returnNum / offerNum
+                    : null;
+
+                  // Price impact (slippage %): (spread_amount / offer_amount) * 100 (with NaN check)
+                  const priceImpact = offerNum > 0 && !isNaN(spreadNum)
+                    ? (spreadNum / offerNum) * 100
+                    : null;
+
+                  // Total fee: sum of all fees (with NaN check)
+                  const feeSum = (isNaN(commissionNum) ? 0 : commissionNum) +
+                    (isNaN(makerFeeNum) ? 0 : makerFeeNum) +
+                    (isNaN(feeShareNum) ? 0 : feeShareNum);
+                  const totalFee = feeSum > 0 ? feeSum.toString() : '0';
+
                   wasmSwapsRows.push({
                     tx_hash,
                     msg_index,
@@ -898,9 +951,15 @@ export class PostgresSink implements Sink {
                     maker_fee_amount: makerFeeAmount,
                     fee_share_amount: feeShareAmount,
                     reserves,
+                    // Analytics columns
+                    pair_id: pairId,
+                    effective_price: effectivePrice,
+                    price_impact: priceImpact,
+                    total_fee: totalFee,
                     block_height: height,
                     timestamp: time
                   });
+
 
                   // ✅ Track factory tokens discovered in swaps
                   for (const denom of [offerAsset, askAsset]) {
@@ -923,6 +982,7 @@ export class PostgresSink implements Sink {
                   }
                 }
               }
+
             }
           }
 
@@ -1293,6 +1353,7 @@ export class PostgresSink implements Sink {
       balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, wasmAdminChangesRows, networkParamsRows,
       wasmEventAttrsRows,
       wasmSwapsRows, factoryTokensRows, // ✅ WASM DEX Swaps Analytics
+      unknownMsgsRows, // ✅ Unknown Messages Quarantine
       height
     };
   }
@@ -1357,6 +1418,9 @@ export class PostgresSink implements Sink {
     // ✅ WASM DEX Swaps Analytics (Pushing to Buffer)
     this.bufWasmSwaps.push(...data.wasmSwapsRows);
     this.bufFactoryTokens.push(...data.factoryTokensRows);
+
+    // ✅ Unknown Messages Quarantine (Pushing to Buffer)
+    this.bufUnknownMsgs.push(...data.unknownMsgsRows);
 
     const zCount = this.bufFactoryDenoms.length + this.bufDexPools.length + this.bufDexSwaps.length + this.bufDexLiquidity.length;
     const gCount = this.bufGovVotes.length + this.bufGovDeposits.length;
@@ -1461,6 +1525,11 @@ export class PostgresSink implements Sink {
       }
       if (this.bufFactoryTokens.length > 0) {
         await flushFactoryTokens(client, this.bufFactoryTokens); this.bufFactoryTokens = [];
+      }
+
+      // ✅ Unknown Messages Quarantine
+      if (this.bufUnknownMsgs.length > 0) {
+        await flushUnknownMessages(client, this.bufUnknownMsgs); this.bufUnknownMsgs = [];
       }
 
       // 3. Zigchain

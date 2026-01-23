@@ -24,6 +24,7 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     ['authz_feegrant', 'authz_grants'], ['authz_feegrant', 'fee_grants'],
     ['tokens', 'cw20_transfers'],
     ['wasm', 'executions'], ['wasm', 'events'], ['wasm', 'event_attrs'], ['wasm', 'state_kv'], ['wasm', 'contract_migrations'],
+    ['wasm', 'dex_swaps'], ['wasm', 'admin_changes'],
 
     // IBC - No longer partitioned (simple PK: port, channel, sequence)
     // ['ibc', 'packets'],

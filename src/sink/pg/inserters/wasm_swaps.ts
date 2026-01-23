@@ -24,9 +24,15 @@ export async function insertWasmSwaps(client: PoolClient, rows: any[]): Promise<
         'maker_fee_amount',
         'fee_share_amount',
         'reserves',
+        'pair_id',
+        'effective_price',
+        'price_impact',
+        'total_fee',
         'block_height',
         'timestamp'
     ];
+
+
 
     const { text, values } = makeMultiInsert(
         'wasm.dex_swaps',
