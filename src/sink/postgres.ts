@@ -274,7 +274,6 @@ export class PostgresSink implements Sink {
       time,
       proposer_address: b?.block?.header?.proposer_address ?? null,
       tx_count: Array.isArray(blockLine?.txs) ? blockLine.txs.length : 0,
-      size_bytes: b?.block_size ?? b?.block?.size ?? null,
       last_commit_hash: b?.block?.header?.last_commit_hash ?? b?.block?.last_commit?.block_id?.hash ?? null,
       data_hash: b?.block?.header?.data_hash ?? null,
       evidence_count: Array.isArray(b?.block?.evidence?.evidence) ? b.block.evidence.evidence.length : 0,

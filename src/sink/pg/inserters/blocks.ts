@@ -16,7 +16,6 @@ export async function insertBlocks(client: PoolClient, rows: any[]): Promise<voi
     'time',
     'proposer_address',
     'tx_count',
-    'size_bytes',
     'last_commit_hash',
     'data_hash',
     'evidence_count',

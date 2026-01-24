@@ -17,7 +17,6 @@ export async function flushBlocks(client: PoolClient, rows: any[]): Promise<void
     'time',
     'proposer_address',
     'tx_count',
-    'size_bytes',
     'last_commit_hash',
     'data_hash',
     'evidence_count',

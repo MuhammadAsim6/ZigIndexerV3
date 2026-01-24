@@ -33,7 +33,6 @@ CREATE TABLE core.blocks (
     time         TIMESTAMPTZ NOT NULL,
     proposer_address TEXT,
     tx_count     INT NOT NULL,
-    size_bytes   INT NULL,
     last_commit_hash TEXT NULL,
     data_hash    TEXT NULL,
     evidence_count INT DEFAULT 0,
