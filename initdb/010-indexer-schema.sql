@@ -521,12 +521,13 @@ CREATE TABLE IF NOT EXISTS tokens.cw20_balances_current (
 -- 9) NETWORK PARAMS
 -- ============================================================================
 CREATE TABLE core.network_params (
-    height    BIGINT PRIMARY KEY,
+    height    BIGINT      NOT NULL,
     time      TIMESTAMPTZ NOT NULL,
     module    TEXT        NOT NULL,
     param_key TEXT        NOT NULL,
     old_value JSONB       NULL,
-    new_value JSONB       NOT NULL
+    new_value JSONB       NOT NULL,
+    PRIMARY KEY (height, module, param_key)
 ) PARTITION BY RANGE (height);
 
 -- ============================================================================

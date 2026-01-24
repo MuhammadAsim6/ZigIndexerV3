@@ -117,6 +117,61 @@ async function main() {
     } catch (err) {
       log.warn('[start] validator sync failed (non-critical):', err instanceof Error ? err.message : String(err));
     }
+
+    // 🛡️ INITIAL SYNC: Fetch network parameters on startup via RPC
+    try {
+      log.info('[start] syncing network parameters from RPC (Port 26657)…');
+      const startPool = createPgPool(cfg.pg!);
+      const client = await startPool.connect();
+      try {
+        const modules = [
+          { name: 'auth', path: '/cosmos.auth.v1beta1.Query/Params', resp: 'cosmos.auth.v1beta1.QueryParamsResponse' },
+          { name: 'bank', path: '/cosmos.bank.v1beta1.Query/Params', resp: 'cosmos.bank.v1beta1.QueryParamsResponse' },
+          { name: 'staking', path: '/cosmos.staking.v1beta1.Query/Params', resp: 'cosmos.staking.v1beta1.QueryParamsResponse' },
+          { name: 'distribution', path: '/cosmos.distribution.v1beta1.Query/Params', resp: 'cosmos.distribution.v1beta1.QueryParamsResponse' },
+          { name: 'mint', path: '/cosmos.mint.v1beta1.Query/Params', resp: 'cosmos.mint.v1beta1.QueryParamsResponse' },
+          { name: 'slashing', path: '/cosmos.slashing.v1beta1.Query/Params', resp: 'cosmos.slashing.v1beta1.QueryParamsResponse' },
+          { name: 'factory', path: '/zigchain.factory.Query/Params', resp: 'zigchain.factory.QueryParamsResponse' },
+          // Gov v1 (Newer SDKs)
+          { name: 'gov', path: '/cosmos.gov.v1.Query/Params', resp: 'cosmos.gov.v1.QueryParamsResponse' },
+        ];
+
+        const rows = [];
+        for (const mod of modules) {
+          try {
+            const abci = await rpc.queryAbci(mod.path);
+            if (abci?.value) {
+              const decoded = await decodePool.decodeGeneric(mod.resp, abci.value);
+              const params = decoded.params || decoded.voting_params || decoded.tally_params || decoded.deposit_params || decoded;
+              if (params) {
+                rows.push({
+                  height: startFrom,
+                  time: new Date(),
+                  module: mod.name,
+                  param_key: '_all',
+                  old_value: null,
+                  new_value: params
+                });
+              }
+            }
+          } catch (e) {
+            log.debug(`[start] skip module ${mod.name}: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+
+        if (rows.length > 0) {
+          const { flushNetworkParams } = await import('./sink/pg/flushers/params.js');
+          await client.query('BEGIN');
+          await flushNetworkParams(client, rows);
+          await client.query('COMMIT');
+          log.info(`[start] synced parameters for ${rows.length} modules using RPC`);
+        }
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      log.warn('[start] network params sync failed (non-critical):', err instanceof Error ? err.message : String(err));
+    }
   }
 
   const backfill = await syncRange(rpc, decodePool, sink, {

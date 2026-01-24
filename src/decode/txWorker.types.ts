@@ -11,7 +11,14 @@ export type DecodeMsg = {
   txBase64: string;
 };
 
-export type InMsg = InitMsg | DecodeMsg;
+export type DecodeGenericMsg = {
+  type: 'decode-generic';
+  id: number;
+  typeUrl: string;
+  base64: string;
+};
+
+export type InMsg = InitMsg | DecodeMsg | DecodeGenericMsg;
 
 export type ProgressMsg = {
   type: 'progress';

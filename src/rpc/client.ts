@@ -49,6 +49,7 @@ export type RpcClient = {
   fetchBlock: (height: number) => Promise<any>;
   fetchBlockResults: (height: number) => Promise<any>;
   fetchStatus: () => Promise<any>;
+  queryAbci: (path: string, data?: string, height?: number) => Promise<any>;
 };
 
 const log = getLogger('rpc/client');
@@ -165,7 +166,17 @@ export function createRpcClient(opts: RpcClientOptions): RpcClient {
     return j.result ?? j;
   }
 
-  return { getJson, fetchBlock, fetchBlockResults, fetchStatus };
+  async function queryAbci(path: string, data?: string, height?: number): Promise<any> {
+    // Tendermint GET RPC requires string parameters to be quoted
+    // to avoid misparsing paths starting with /
+    const params: any = { path: `"${path}"` };
+    if (data) params.data = `"${data}"`;
+    if (height) params.height = String(height);
+    const j = await getJson<any>('/abci_query', params);
+    return j.result?.response ?? j;
+  }
+
+  return { getJson, fetchBlock, fetchBlockResults, fetchStatus, queryAbci };
 }
 
 /**

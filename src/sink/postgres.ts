@@ -902,6 +902,22 @@ export class PostgresSink implements Sink {
             memo: m.memo ?? null
           });
         }
+
+        // 🟢 MSG_UPDATE_PARAMS (GENERIC) 🟢
+        if (type.endsWith('.MsgUpdateParams') && code === 0) {
+          const moduleMatch = type.match(/^\/([^.]+)\./);
+          const module = moduleMatch ? moduleMatch[1] : 'unknown';
+          const params = m.params || {};
+
+          networkParamsRows.push({
+            height,
+            time,
+            module,
+            param_key: '_all', // Modern SDK updates usually replace the whole params object
+            old_value: null,
+            new_value: params
+          });
+        }
       }
 
       // --- PROCESS LOGS (Events) ---

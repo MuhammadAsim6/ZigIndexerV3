@@ -28,6 +28,7 @@ type AnyOut = ProgressMsg | ReadyMsg | OkMsg | ErrMsg;
  */
 export type TxDecodePool = {
   submit: (txBase64: string) => Promise<any>;
+  decodeGeneric: (typeUrl: string, base64: string) => Promise<any>;
   close: () => Promise<void>;
 };
 
@@ -163,9 +164,24 @@ export function createTxDecodePool(size: number, opts?: { protoDir?: string }): 
     return prom;
   }
 
+  async function decodeGeneric(typeUrl: string, base64: string): Promise<any> {
+    await waitAllReady();
+    while (idle.length === 0) await new Promise((r) => setTimeout(r, 0));
+    const wid = idle.shift()!;
+    const w = workers[wid];
+
+    const id = (Math.random() * 2 ** 31) | 0;
+    const prom = new Promise<any>((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+    });
+
+    w?.postMessage({ type: 'decode-generic', id, typeUrl, base64 });
+    return prom;
+  }
+
   async function close() {
     await Promise.all(workers.map((w) => w.terminate()));
   }
 
-  return { submit, close };
+  return { submit, decodeGeneric, close };
 }

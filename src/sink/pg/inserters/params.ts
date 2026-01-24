@@ -11,7 +11,7 @@ export async function insertNetworkParams(client: PoolClient, rows: any[]): Prom
         'core.network_params',
         cols,
         rows,
-        'ON CONFLICT (height) DO NOTHING',
+        'ON CONFLICT (height, module, param_key) DO NOTHING',
         { old_value: 'jsonb', new_value: 'jsonb' }
     );
     await client.query(text, values);
