@@ -40,6 +40,9 @@ service Msg {
   rpc UpdateDenomMintingCap(MsgUpdateDenomMintingCap)
       returns (MsgUpdateDenomMintingCapResponse);
 
+  rpc UpdateDenomMaxSupply(MsgUpdateDenomMaxSupply)
+      returns (MsgUpdateDenomMaxSupplyResponse);
+
   // UpdateDenomMetadataAuth updates the metadata admin of a denom, needed for
   // case when bank admin is disabled
   rpc UpdateDenomMetadataAuth(MsgUpdateDenomMetadataAuth)
@@ -169,6 +172,30 @@ message MsgUpdateDenomMintingCap {
     (amino.dont_omitempty) = true
   ];
   bool can_change_minting_cap = 4;
+}
+
+message MsgUpdateDenomMaxSupply {
+  option (cosmos.msg.v1.signer) = "signer";
+  string signer = 1;
+  string denom = 2;
+  string max_supply = 3 [
+    (cosmos_proto.scalar) = "cosmos.Uint",
+    (gogoproto.customtype) = "cosmossdk.io/math.Uint",
+    (gogoproto.nullable) = false,
+    (amino.dont_omitempty) = true
+  ];
+  bool can_change_max_supply = 4;
+}
+
+message MsgUpdateDenomMaxSupplyResponse {
+  string denom = 1;
+  string max_supply = 2 [
+    (cosmos_proto.scalar) = "cosmos.Int",
+    (gogoproto.customtype) = "cosmossdk.io/math.Uint",
+    (gogoproto.nullable) = false,
+    (amino.dont_omitempty) = true
+  ];
+  bool can_change_max_supply = 3;
 }
 
 // MsgUpdateDenomMintingCapResponse is conformation on updated metadata.

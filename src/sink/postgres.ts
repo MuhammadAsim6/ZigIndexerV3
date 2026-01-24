@@ -1417,14 +1417,18 @@ export class PostgresSink implements Sink {
             }
           }
 
-          if (event_type === 'wasm-token_minted' || event_type === 'wasm-token_burned') {
+          if (event_type === 'wasm-token_minted' || event_type === 'wasm-token_burned' || event_type === 'wasm-token_transferred') {
             const contract = findAttr(attrsPairs, 'contract') || findAttr(attrsPairs, '_contract_address');
-            const amount = findAttr(attrsPairs, 'amount');
-            if (contract && amount) {
+            const amountAttr = findAttr(attrsPairs, 'amount');
+            if (contract && amountAttr) {
+              let action = 'transfer';
+              if (event_type.includes('mint')) action = 'mint';
+              else if (event_type.includes('burn')) action = 'burn';
+
               wasmTokenEventsRows.push({
                 height, tx_hash, msg_index, contract,
-                action: event_type.includes('mint') ? 'mint' : 'burn',
-                amount,
+                action,
+                amount: toBigIntStr(amountAttr),
                 recipient: findAttr(attrsPairs, 'recipient'),
                 sender: findAttr(attrsPairs, 'sender')
               });
