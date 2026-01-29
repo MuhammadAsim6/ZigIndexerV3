@@ -39,6 +39,10 @@ export interface SinkConfig {
    */
   table?: string;
   /**
+   * RPC URL for reconciliation or query needs.
+   */
+  rpcUrl?: string;
+  /**
    * Batch size configuration for various data types.
    */
   batchSizes?: {

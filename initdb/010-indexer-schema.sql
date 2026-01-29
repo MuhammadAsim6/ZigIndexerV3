@@ -13,6 +13,7 @@ CREATE SCHEMA IF NOT EXISTS authz_feegrant;
 CREATE SCHEMA IF NOT EXISTS groups;
 CREATE SCHEMA IF NOT EXISTS tokens;
 CREATE SCHEMA IF NOT EXISTS analytics;
+CREATE SCHEMA IF NOT EXISTS zigchain;
 
 -- Enums
 DO $$ BEGIN
@@ -164,6 +165,15 @@ CREATE TABLE bank.balance_deltas (
     PRIMARY KEY (height, account, denom)
 ) PARTITION BY RANGE (height);
 
+-- ✅ FIXED: Added missing initial partition
+CREATE TABLE IF NOT EXISTS bank.balance_deltas_p0 PARTITION OF bank.balance_deltas FOR VALUES FROM (0) TO (1000000);
+
+-- ✅ FIXED: Added missing progress tracking table
+CREATE TABLE IF NOT EXISTS core.indexer_progress (
+    id          TEXT PRIMARY KEY,
+    last_height BIGINT NOT NULL DEFAULT 0,
+    updated_at  TIMESTAMPTZ DEFAULT now()
+);
 CREATE TABLE bank.balances_current (
     account  TEXT PRIMARY KEY,
     balances JSONB NOT NULL
@@ -428,6 +438,43 @@ CREATE TABLE IF NOT EXISTS wasm.events (
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS wasm.events_p0 PARTITION OF wasm.events FOR VALUES FROM (0) TO (1000000);
 
+-- ✅ FIXED: Added missing DEX Swaps table
+CREATE TABLE IF NOT EXISTS wasm.dex_swaps (
+    tx_hash           TEXT NOT NULL,
+    msg_index         INT NOT NULL,
+    event_index       INT NOT NULL,
+    contract          TEXT NOT NULL,
+    sender            TEXT NULL,
+    receiver          TEXT NULL,
+    offer_asset       TEXT NULL,
+    ask_asset         TEXT NULL,
+    offer_amount      NUMERIC(80, 0) NULL,
+    return_amount     NUMERIC(80, 0) NULL,
+    spread_amount     NUMERIC(80, 0) NULL,
+    commission_amount NUMERIC(80, 0) NULL,
+    maker_fee_amount  NUMERIC(80, 0) NULL,
+    fee_share_amount  NUMERIC(80, 0) NULL,
+    reserves          JSONB NULL,
+    pair_id           TEXT NULL,
+    effective_price   NUMERIC(40, 18) NULL,
+    price_impact      NUMERIC(40, 18) NULL,
+    total_fee         NUMERIC(80, 0) NULL,
+    block_height      BIGINT NOT NULL,
+    timestamp         TIMESTAMPTZ NULL,
+    PRIMARY KEY (block_height, tx_hash, msg_index, event_index)
+) PARTITION BY RANGE (block_height);
+CREATE TABLE IF NOT EXISTS wasm.dex_swaps_p0 PARTITION OF wasm.dex_swaps FOR VALUES FROM (0) TO (1000000);
+
+-- ✅ FIXED: Added missing Factory Tokens table (no partitioning needed usually, but safe to keep unpartitioned for small cardinality)
+CREATE TABLE IF NOT EXISTS tokens.factory_tokens (
+    denom             TEXT PRIMARY KEY,
+    base_denom        TEXT NULL,
+    creator           TEXT NULL,
+    symbol            TEXT NULL,
+    first_seen_height BIGINT NULL,
+    first_seen_tx     TEXT NULL
+);
+
 CREATE TABLE IF NOT EXISTS wasm.event_attrs (
     contract    TEXT NOT NULL,
     height      BIGINT NOT NULL,
@@ -559,4 +606,121 @@ CREATE INDEX IF NOT EXISTS idx_ibc_transfers_denom ON ibc.transfers (denom, sequ
 
 -- Gov by proposal (governance dashboard)
 CREATE INDEX IF NOT EXISTS idx_gov_votes_proposal ON gov.votes (proposal_id, height DESC);
-CREATE INDEX IF NOT EXISTS idx_gov_deposits_proposal ON gov.deposits (proposal_id, height DESC);
+-- ============================================================================
+-- 11) ZIGCHAIN & ANALYTICS EXTENSIONS (Auto-Added by Recovery)
+-- ============================================================================
+
+-- Zigchain DEX Pools
+CREATE TABLE IF NOT EXISTS zigchain.dex_pools (
+    pool_id          TEXT PRIMARY KEY,
+    creator_address  TEXT NULL,
+    pair_id          TEXT NULL,
+    base_denom       TEXT NULL,
+    quote_denom      TEXT NULL,
+    lp_token_denom   TEXT NULL,
+    base_reserve     NUMERIC(80, 0) NULL,
+    quote_reserve    NUMERIC(80, 0) NULL,
+    block_height     BIGINT NOT NULL,
+    tx_hash          TEXT NULL
+);
+
+-- Zigchain DEX Swaps
+CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
+    tx_hash          TEXT NOT NULL,
+    msg_index        INT NOT NULL,
+    pool_id          TEXT NOT NULL,
+    sender_address   TEXT NULL,
+    token_in_denom   TEXT NULL,
+    token_in_amount  NUMERIC(80, 0) NULL,
+    token_out_denom  TEXT NULL,
+    token_out_amount NUMERIC(80, 0) NULL,
+    price_impact     NUMERIC(40, 18) NULL,
+    block_height     BIGINT NOT NULL,
+    PRIMARY KEY (block_height, tx_hash, msg_index)
+) PARTITION BY RANGE (block_height);
+CREATE TABLE IF NOT EXISTS zigchain.dex_swaps_p0 PARTITION OF zigchain.dex_swaps FOR VALUES FROM (0) TO (1000000);
+
+-- Zigchain DEX Liquidity
+CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity (
+    tx_hash              TEXT NOT NULL,
+    msg_index            INT NOT NULL,
+    pool_id              TEXT NOT NULL,
+    sender_address       TEXT NULL,
+    action_type          TEXT NOT NULL, -- 'mint' or 'burn'
+    amount_0             NUMERIC(80, 0) NULL,
+    amount_1             NUMERIC(80, 0) NULL,
+    shares_minted_burned NUMERIC(80, 0) NULL,
+    block_height         BIGINT NOT NULL,
+
+    PRIMARY KEY (block_height, tx_hash, msg_index)
+) PARTITION BY RANGE (block_height);
+CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity_p0 PARTITION OF zigchain.dex_liquidity FOR VALUES FROM (0) TO (1000000);
+
+-- Zigchain Wrapper Settings
+CREATE TABLE IF NOT EXISTS zigchain.wrapper_settings (
+    denom                  TEXT PRIMARY KEY,
+    native_client_id       TEXT NULL,
+    counterparty_client_id TEXT NULL,
+    native_port            TEXT NULL,
+    counterparty_port      TEXT NULL,
+    native_channel         TEXT NULL,
+    counterparty_channel   TEXT NULL,
+    decimal_difference     INT NULL,
+    updated_at_height      BIGINT NULL
+);
+
+-- Zigchain Wrapper Events
+CREATE TABLE IF NOT EXISTS zigchain.wrapper_events (
+    height    BIGINT NOT NULL,
+    tx_hash   TEXT NOT NULL,
+    msg_index INT NOT NULL,
+    sender    TEXT NULL,
+    action    TEXT NOT NULL,
+    amount    NUMERIC(80, 0) NULL,
+    denom     TEXT NULL,
+    metadata  JSONB NULL,
+    PRIMARY KEY (height, tx_hash, msg_index, action)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS zigchain.wrapper_events_p0 PARTITION OF zigchain.wrapper_events FOR VALUES FROM (0) TO (1000000);
+
+-- Tokens Factory Supply Events
+CREATE TABLE IF NOT EXISTS tokens.factory_supply_events (
+    height    BIGINT NOT NULL,
+    tx_hash   TEXT NOT NULL,
+    msg_index INT NOT NULL,
+    denom     TEXT NOT NULL,
+    action    TEXT NOT NULL,
+    amount    NUMERIC(80, 0) NULL,
+    sender    TEXT NULL,
+    recipient TEXT NULL,
+    metadata  JSONB NULL,
+    PRIMARY KEY (height, tx_hash, msg_index, denom, action)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS tokens.factory_supply_events_p0 PARTITION OF tokens.factory_supply_events FOR VALUES FROM (0) TO (1000000);
+
+-- WASM Oracle Updates
+CREATE TABLE IF NOT EXISTS wasm.oracle_updates (
+    height    BIGINT NOT NULL,
+    tx_hash   TEXT NOT NULL,
+    msg_index INT NOT NULL,
+    contract  TEXT NOT NULL,
+    key       TEXT NOT NULL,
+    value     TEXT NULL,
+    PRIMARY KEY (height, tx_hash, msg_index, contract, key)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS wasm.oracle_updates_p0 PARTITION OF wasm.oracle_updates FOR VALUES FROM (0) TO (1000000);
+
+-- WASM Token Events
+CREATE TABLE IF NOT EXISTS wasm.token_events (
+    height    BIGINT NOT NULL,
+    tx_hash   TEXT NOT NULL,
+    msg_index INT NOT NULL,
+    contract  TEXT NOT NULL,
+    action    TEXT NOT NULL,
+    amount    NUMERIC(80, 0) NULL,
+    sender    TEXT NULL,
+    recipient TEXT NULL,
+    PRIMARY KEY (height, tx_hash, msg_index, contract, action)
+) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS wasm.token_events_p0 PARTITION OF wasm.token_events FOR VALUES FROM (0) TO (1000000);
+

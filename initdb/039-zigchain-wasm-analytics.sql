@@ -14,18 +14,18 @@ CREATE TABLE IF NOT EXISTS wasm.dex_swaps (
     receiver          TEXT,
     offer_asset       TEXT,             -- e.g., "uzig"
     ask_asset         TEXT,             -- e.g., "coin.zig109f7g2...stzig"
-    offer_amount      TEXT,             -- Changed: Event attrs are strings
-    return_amount     TEXT,
-    spread_amount     TEXT,
-    commission_amount TEXT,
-    maker_fee_amount  TEXT,
-    fee_share_amount  TEXT,
-    reserves          TEXT,             -- Pool reserves after swap
+    offer_amount      NUMERIC(80,0),    -- Changed: Use NUMERIC for analytics
+    return_amount     NUMERIC(80,0),
+    spread_amount     NUMERIC(80,0),
+    commission_amount NUMERIC(80,0),
+    maker_fee_amount  NUMERIC(80,0),
+    fee_share_amount  NUMERIC(80,0),
+    reserves          JSONB,            -- Pool reserves after swap (JSON)
     -- NEW: Analytics columns
     pair_id           TEXT,             -- Sorted pair identifier (e.g., "uzig-stzig")
     effective_price   NUMERIC(40,18),   -- return_amount / offer_amount
-    price_impact      NUMERIC(20,10),   -- (spread_amount / offer_amount) * 100
-    total_fee         TEXT,             -- commission + maker_fee + fee_share
+    price_impact      NUMERIC(40,18),   -- (spread_amount / offer_amount) * 100
+    total_fee         NUMERIC(80,0),    -- commission + maker_fee + fee_share
     block_height      BIGINT NOT NULL,
     timestamp         TIMESTAMPTZ,
     PRIMARY KEY (tx_hash, msg_index, event_index, block_height)

@@ -53,15 +53,30 @@ async function updateCw20Balances(client: PoolClient, transfers: any[]): Promise
   }
 
   // Batch upsert balance changes
+  if (deltas.size === 0) return;
+
+  // Build single batched UPSERT
+  const values: any[] = [];
+  const valueParts: string[] = [];
+  let paramIdx = 1;
+
   for (const [key, delta] of deltas) {
     if (delta === 0n) continue;
     const [contract, account] = key.split('|');
 
-    await client.query(`
-      INSERT INTO tokens.cw20_balances_current (contract, account, balance)
-      VALUES ($1, $2, $3::numeric)
-      ON CONFLICT (contract, account) 
-      DO UPDATE SET balance = tokens.cw20_balances_current.balance + EXCLUDED.balance
-    `, [contract, account, delta.toString()]);
+    valueParts.push(`($${paramIdx}, $${paramIdx + 1}, $${paramIdx + 2})`);
+    values.push(contract, account, delta.toString());
+    paramIdx += 3;
   }
+
+  if (valueParts.length === 0) return;
+
+  const query = `
+    INSERT INTO tokens.cw20_balances_current AS t (contract, account, balance)
+    SELECT * FROM (VALUES ${valueParts.join(', ')}) AS v(contract, account, delta)
+    ON CONFLICT (contract, account)
+    DO UPDATE SET balance = t.balance + v.delta::numeric
+  `;
+
+  await client.query(query, values);
 }

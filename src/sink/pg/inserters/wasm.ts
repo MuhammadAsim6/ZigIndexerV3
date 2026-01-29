@@ -37,3 +37,14 @@ export async function insertWasmMigrations(client: PoolClient, rows: any[]): Pro
     );
     await client.query(text, values);
 }
+
+export async function updateWasmInstantiateConfig(client: PoolClient, rows: any[]): Promise<void> {
+    if (!rows?.length) return;
+    for (const row of rows) {
+        // Individual updates for permissions as it's a rare/low-volume operation
+        await client.query(
+            `UPDATE wasm.codes SET instantiate_permission = $1 WHERE code_id = $2`,
+            [row.instantiate_permission, row.code_id]
+        );
+    }
+}

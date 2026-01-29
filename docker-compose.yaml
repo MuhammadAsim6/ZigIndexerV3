@@ -22,24 +22,26 @@ services:
       # ✅ STORAGE CONFIG: Changed to "../indexer-data" to keep data OUTSIDE the project folder.
       # This fixes the Docker build error by preventing Docker from scanning the locked database files.
       - ../indexer-data:/var/lib/postgresql
+      # ✅ INIT SCRIPTS: Auto-run SQL files in ./initdb on fresh start
+      - ./initdb:/docker-entrypoint-initdb.d:ro
       
     shm_size: 8gb  # ✅ Increased from 1gb for 5.4M+ scale
     command: 
       - "postgres"
       - "-c"
-      - "max_wal_size=16GB"  # ✅ Increased from 4GB
+      - "max_wal_size=8GB"  # ✅ Increased from 4GB
       - "-c"
       - "min_wal_size=2GB"  # ✅ Increased from 1GB
       - "-c"
       - "checkpoint_timeout=15min"  # ✅ Increased from 10min
       - "-c"
-      - "shared_buffers=16GB"  # ✅ Increased from 1024MB
+      - "shared_buffers=8GB"  # ✅ Increased from 1024MB
       - "-c"
       - "work_mem=512MB"  # ✅ Increased from 64MB
       - "-c"
       - "maintenance_work_mem=1GB"  # ✅ Added for faster VACUUM/INDEX
       - "-c"
-      - "effective_cache_size=16GB"  # ✅ Added for query planning
+      - "effective_cache_size=8GB"  # ✅ Added for query planning
       - "-c"
       - "archive_mode=off"  # ✅ STOPS THE LOG WARNINGS/spamming
       # ✅ Autovacuum throttling (prevents crash during high ingestion)
@@ -88,6 +90,9 @@ services:
     # For development you can create a separate docker-compose.override.dev.yml that
     # mounts the source and sets up an anonymous volume for /usr/src/app/node_modules.
     working_dir: /usr/src/app
+    volumes:
+      - "../indexer-data:/usr/src/app/indexer-data"
+      - "./genesis.json:/usr/src/app/genesis.json:ro"
 
 
 # volumes:

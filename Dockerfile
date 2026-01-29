@@ -37,6 +37,15 @@ RUN npx esbuild src/decode/txWorker.ts \
     --outfile=dist/txWorker.js \
     --target=node22
 
+# ✅ FIX 4: Build the Genesis Bootstrap Script
+RUN npx esbuild src/scripts/genesis-bootstrap.ts \
+    --bundle \
+    --platform=node \
+    --packages=external \
+    --format=esm \
+    --outfile=dist/genesis-bootstrap.js \
+    --target=node22
+
 # ✅ FIX 3: Trick the runtime
 # Your code asks for "./txWorker.ts", but we have compiled it to JS.
 # We create a copy named .ts so the runtime finds it immediately without changing source code.
@@ -54,6 +63,7 @@ ENV NODE_ENV=production
 # Install basic OS libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy package files

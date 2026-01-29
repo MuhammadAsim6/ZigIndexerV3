@@ -210,22 +210,73 @@ function scanForAddresses(obj: any, depth = 0): string[] {
  */
 export function parseCoin(amt: string | null | undefined): { denom: string; amount: string } | null {
   if (!amt) return null;
-  const parts = String(amt).split(',');
+  const str = String(amt).trim();
+  if (!str) return null;
+
+  // 1. Try JSON Array/Object parsing first
+  // e.g. [{"denom":"uzig","amount":"100"}] or {"amount":"100","denom":"uzig"}
+  if (str.startsWith('[') || str.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(str);
+      const obj = Array.isArray(parsed) ? parsed[0] : parsed;
+      if (obj && obj.amount && obj.denom) {
+        return { amount: String(obj.amount), denom: String(obj.denom) };
+      }
+    } catch {
+      // Ignore JSON parse errors, fall through to string parsing
+    }
+  }
+
+  // 2. Comma-separated (take first)
+  const parts = str.split(',');
   const first = (parts[0] || '').trim();
   if (!first) return null;
-  const m = first.match(/^(\d+)([a-zA-Z/][\w/:-]*)$/);
-  if (!m || m.length < 3) return null;
-  return { amount: m[1]!, denom: m[2]! };
+
+  // 3. Regex Parsing
+  // Matches: "100uzig", "100 uzig" (space support!), "100.5uzig" (legacy), "100" (no denom?)
+  // Pattern:
+  // ^(\d+)         -> Amount (digits)
+  // \s*            -> Optional whitespace
+  // ([a-zA-Z/][\w/:\-.]*)? -> Denom (Optional? No, must have denom for valid coin)
+  //
+  // Revised Pattern for robustness:
+  // ^(\d+)\s*([a-zA-Z/][\w/:\-.]*)$
+  const m = first.match(/^(\d+)\s*([a-zA-Z/][\w/:\-.]*)$/);
+
+  if (m && m.length >= 3) {
+    return { amount: m[1]!, denom: m[2]! };
+  }
+
+  return null;
 }
 
 /**
  * Parses a multi-coin string (e.g., "100uatom,200usdt") into an array of coin objects.
+ * Handles mixed formats: "100uatom, 200usdt", JSON arrays, etc.
  * @param {(string|null|undefined)} amt - Multi-coin string to parse.
  * @returns {{ denom: string, amount: string }[]} Array of parsed coins.
  */
 export function parseCoins(amt: string | null | undefined): { denom: string; amount: string }[] {
   if (!amt) return [];
-  return String(amt)
+  const str = String(amt).trim();
+  if (!str) return [];
+
+  // 1. JSON Array
+  if (str.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map(p => ({ amount: String(p?.amount), denom: String(p?.denom) }))
+          .filter(c => c.amount && c.denom && /^\d+$/.test(c.amount)); // Validate numeric amount
+      }
+    } catch {
+      // Fallback
+    }
+  }
+
+  // 2. Comma-Separated String
+  return str
     .split(',')
     .map((s) => parseCoin(s.trim()))
     .filter((c): c is { denom: string; amount: string } => c !== null);

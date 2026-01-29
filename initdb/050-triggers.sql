@@ -19,7 +19,15 @@ BEGIN
         jsonb_build_object(
             NEW.denom, 
             (COALESCE((bank.balances_current.balances->>NEW.denom)::NUMERIC(80,0), 0) + NEW.delta::NUMERIC(80,0))::TEXT
-        );
+        )
+    WHERE (COALESCE((bank.balances_current.balances->>NEW.denom)::NUMERIC(80,0), 0) + NEW.delta::NUMERIC(80,0)) > 0;
+
+    -- If the resulting balance is <= 0, we remove the key to keep the JSON clean
+    -- and prevent negative values in the view.
+    UPDATE bank.balances_current
+    SET balances = balances - NEW.denom
+    WHERE account = NEW.account
+      AND (COALESCE((balances->>NEW.denom)::NUMERIC(80,0), 0) + NEW.delta::NUMERIC(80,0)) <= 0;
     
     RETURN NEW;
 END;

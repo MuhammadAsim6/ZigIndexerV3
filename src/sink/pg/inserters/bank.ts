@@ -10,15 +10,40 @@ export async function insertBalanceDeltas(client: PoolClient, rows: any[]): Prom
 
     // ✅ Aggregator to avoid "ON CONFLICT DO UPDATE command cannot affect row a second time"
     const aggregated = new Map<string, any>();
+    const seenEvents = new Set<string>(); // ✅ NEW: Deduplicate specific events
 
     for (const row of rows) {
+        // 1. Deduplication Check (Intra-Block)
+        // If we have event identifiers, ensure we don't process the same event twice.
+        // Format: height:tx_hash:msg_index:event_index:account:denom
+        const eventId = `${row.height}:${row.tx_hash}:${row.msg_index}:${row.event_index}:${row.account}:${row.denom}`;
+
+        if (seenEvents.has(eventId)) {
+            continue; // Skip duplicate event
+        }
+        seenEvents.add(eventId);
+
+        // 2. Aggregation (Summation for final DB row)
         const key = `${row.height}:${row.account}:${row.denom}`;
         const existing = aggregated.get(key);
+
+        const safeBigInt = (v: any) => {
+            if (v == null) return 0n;
+            const s = String(v).trim().replace(/\s/g, '');
+            try {
+                return BigInt(s);
+            } catch (err) {
+                console.error(`[bank/inserter] Failed to convert "${v}" to BigInt:`, err);
+                return 0n;
+            }
+        };
+
         if (existing) {
-            // Add BigInts (handling strings/numbers)
-            existing.delta = (BigInt(existing.delta) + BigInt(row.delta)).toString();
+            existing.delta = (safeBigInt(existing.delta) + safeBigInt(row.delta)).toString();
         } else {
-            aggregated.set(key, { ...row });
+            const copy = { ...row };
+            copy.delta = safeBigInt(row.delta).toString();
+            aggregated.set(key, copy);
         }
     }
 

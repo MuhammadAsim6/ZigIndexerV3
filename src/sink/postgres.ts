@@ -98,8 +98,13 @@ export interface PostgresSinkConfig extends SinkConfig {
     password?: string;
     database?: string;
     ssl?: boolean;
+    poolSize?: number;
     progressId?: string;
   };
+  /**
+   * RPC URL needed for Reconciliation Engine
+   */
+  rpcUrl: string;
   mode?: PostgresMode;
   batchSizes?: {
     blocks?: number;
@@ -157,6 +162,7 @@ export class PostgresSink implements Sink {
   private bufWasmContracts: any[] = [];
   private bufWasmMigrations: any[] = [];
   private bufWasmAdminChanges: any[] = [];
+  private bufWasmInstantiateConfigs: any[] = [];
   private bufNetworkParams: any[] = [];
 
   // Zigchain Buffers
@@ -200,10 +206,12 @@ export class PostgresSink implements Sink {
     validators: 500,
     ibcPackets: 2000,
     ibcChannels: 500,
+
     ibcTransfers: 2000,
     zigchain: 2000,
     cw20Transfers: 5000
   };
+
 
   constructor(cfg: PostgresSinkConfig) {
     this.cfg = cfg;
@@ -340,6 +348,7 @@ export class PostgresSink implements Sink {
     const wasmContractsRows: any[] = [];
     const wasmMigrationsRows: any[] = [];
     const wasmAdminChangesRows: any[] = [];
+    const wasmInstantiateConfigsRows: any[] = [];
     const networkParamsRows: any[] = [];
 
     // ✅ WASM DEX Swaps Analytics
@@ -352,6 +361,46 @@ export class PostgresSink implements Sink {
     const wrapperEventsRows: any[] = [];
     const wasmOracleUpdatesRows: any[] = [];
     const wasmTokenEventsRows: any[] = [];
+
+    // 🟢 BANK BALANCE DELTAS (Helper)
+    const extractBalanceDeltas = (evType: string, attrsPairs: { key: string, value: string | null }[], tx_hash?: string, msg_index?: number, event_index?: number) => {
+      // ✅ FIX: Support multiple attribute keys
+      const getReceiver = () =>
+        findAttr(attrsPairs, 'receiver') ||
+        findAttr(attrsPairs, 'recipient') ||
+        findAttr(attrsPairs, 'to_address') ||
+        findAttr(attrsPairs, 'to');
+
+      const getSpender = () =>
+        findAttr(attrsPairs, 'spender') ||
+        findAttr(attrsPairs, 'sender') ||
+        findAttr(attrsPairs, 'from_address') ||
+        findAttr(attrsPairs, 'from');
+
+      if (evType === 'coin_received' || evType === 'coin_spent') {
+        const acc = evType === 'coin_received' ? getReceiver() : getSpender();
+
+        // ✅ FIX: Strict Null Guard - Critical for preventing corrupt aggregates
+        if (!acc || acc.trim() === '') {
+          return;
+        }
+
+        const amountStr = findAttr(attrsPairs, 'amount');
+        const coins = parseCoins(amountStr);
+        for (const coin of coins) {
+          balanceDeltasRows.push({
+            height,
+            account: acc,
+            denom: coin.denom,
+            delta: evType === 'coin_received' ? coin.amount : `- ${coin.amount} `,
+            // ✅ ADDED: Unique Constraint Keys for Intra-Block Deduplication
+            tx_hash: (typeof tx_hash !== 'undefined') ? tx_hash : 'block_event',
+            msg_index: (typeof msg_index !== 'undefined') ? msg_index : -1,
+            event_index: (typeof event_index !== 'undefined') ? event_index : -1 // ✅ FIX: Use param, not 'ei'
+          });
+        }
+      }
+    };
 
     const vSet = blockLine.validator_set;
     if (vSet?.validators) {
@@ -402,7 +451,7 @@ export class PostgresSink implements Sink {
             operator_address: sig.validator_address,
             height: height - 1
           });
-          log.debug(`[uptime] missed block: ${sig.validator_address} at height ${height - 1}`);
+          log.debug(`[uptime] missed block: ${sig.validator_address} at height ${height - 1} `);
         }
       }
     }
@@ -457,7 +506,7 @@ export class PostgresSink implements Sink {
             raw_value: m?.['_raw'] || m?.['value_b64'],
             signer: null  // Can't decode signer from unknown msg
           });
-          log.warn(`[quarantine] Unknown message type: ${type} at height ${height}`);
+          log.warn(`[quarantine] Unknown message type: ${type} at height ${height} `);
           continue;  // Skip domain table processing for this message
         }
 
@@ -646,7 +695,9 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 WASM REGISTRY (STORE/INSTANTIATE) 🟢
-        if (type === '/cosmwasm.wasm.v1.MsgStoreCode') {
+        if (type === '/cosmwasm.wasm.v1.MsgStoreCode' ||
+          type === '/cosmwasm.wasm.v1.MsgStoreAndInstantiateContract' ||
+          type === '/cosmwasm.wasm.v1.MsgStoreAndMigrateContract') {
           const event = msgLog?.events.find((e: any) => e.type === 'store_code');
           const attrs = attrsToPairs(event?.attributes);
           const codeId = findAttr(attrs, 'code_id');
@@ -656,12 +707,41 @@ export class PostgresSink implements Sink {
             wasmCodesRows.push({
               code_id: codeId,
               checksum: checksum || '', // Ensure not null
-              creator: m.sender,
-              instantiate_permission: m.instantiate_permission,
+              creator: m.sender || m.authority || m.signer || firstSigner,
+              instantiate_permission: m.instantiate_permission || m.instantiatePermission || m.instantiate_config || m.instantiateConfig,
               store_tx_hash: tx_hash,
               store_height: height
             });
+            if (!m.instantiate_permission && !m.instantiatePermission) {
+              log.debug(`[wasm - store] instantiate_permission is missing in ${tx_hash}. Keys present: ${Object.keys(m).join(', ')} `);
+            }
           }
+
+          // If it's a "StoreAndInstantiate", we also capture the contract creation if it succeeded
+          if (type === '/cosmwasm.wasm.v1.MsgStoreAndInstantiateContract' && code === 0) {
+            const instEvent = msgLog?.events.find((e: any) => e.type === 'instantiate');
+            const addr = findAttr(attrsToPairs(instEvent?.attributes), '_contract_address') || findAttr(attrsToPairs(instEvent?.attributes), 'contract_address');
+            if (addr) {
+              wasmContractsRows.push({
+                address: addr,
+                code_id: codeId,
+                creator: m.authority || m.sender || firstSigner,
+                admin: m.admin,
+                label: m.label,
+                created_height: height,
+                created_tx_hash: tx_hash
+              });
+            }
+          }
+        }
+
+        if (type === '/cosmwasm.wasm.v1.MsgUpdateInstantiateConfig' && code === 0) {
+          wasmInstantiateConfigsRows.push({
+            code_id: m.code_id,
+            instantiate_permission: m.new_instantiate_permission || m.newInstantiatePermission || m.instantiate_permission || m.instantiatePermission,
+            height,
+            tx_hash
+          });
         }
 
         if (type === '/cosmwasm.wasm.v1.MsgInstantiateContract' ||
@@ -694,7 +774,7 @@ export class PostgresSink implements Sink {
         // 🟢 ZIGCHAIN LOGIC 🟢
         if (type.endsWith('.MsgCreateDenom')) {
           const event = msgLog?.events.find((e: any) => e.type === 'create_denom');
-          let finalDenom = event ? findAttr(attrsToPairs(event.attributes), 'denom') : `factory/${m.creator}/${m.sub_denom}`;
+          let finalDenom = event ? findAttr(attrsToPairs(event.attributes), 'denom') : `factory / ${m.creator}/${m.sub_denom}`;
 
           factoryDenomsRows.push({
             denom: finalDenom,
@@ -1119,7 +1199,29 @@ export class PostgresSink implements Sink {
                 const commissionAmount = findAttr(attrsPairs, 'commission_amount');
                 const makerFeeAmount = findAttr(attrsPairs, 'maker_fee_amount');
                 const feeShareAmount = findAttr(attrsPairs, 'fee_share_amount');
-                const reserves = findAttr(attrsPairs, 'reserves');
+                const reservesRaw = findAttr(attrsPairs, 'reserves');
+                let reserves = null;
+                if (reservesRaw) {
+                  // Handle both "amountDenom" and "denom:amount" formats
+                  const obj: Record<string, string> = {};
+                  const parts = reservesRaw.split(',');
+                  for (const p of parts) {
+                    const trimmed = p.trim();
+                    if (!trimmed) continue;
+                    // Try denom:amount
+                    const colonIdx = trimmed.lastIndexOf(':');
+                    if (colonIdx > 0) {
+                      const d = trimmed.slice(0, colonIdx);
+                      const a = trimmed.slice(colonIdx + 1).replace(/\D/g, ''); // sanitize amount
+                      if (d && a) obj[d] = a;
+                    } else {
+                      // fallback to standard parseCoin
+                      const c = parseCoin(trimmed);
+                      if (c) obj[c.denom] = c.amount;
+                    }
+                  }
+                  reserves = Object.keys(obj).length > 0 ? JSON.stringify(obj) : JSON.stringify({ raw: reservesRaw });
+                }
 
                 if (sender && offerAmount) {
                   // ✅ Compute analytics columns with NaN validation
@@ -1160,12 +1262,12 @@ export class PostgresSink implements Sink {
                     receiver,
                     offer_asset: offerAsset,
                     ask_asset: askAsset,
-                    offer_amount: offerAmount,
-                    return_amount: returnAmount,
-                    spread_amount: spreadAmount,
-                    commission_amount: commissionAmount,
-                    maker_fee_amount: makerFeeAmount,
-                    fee_share_amount: feeShareAmount,
+                    offer_amount: toBigIntStr(offerAmount),
+                    return_amount: toBigIntStr(returnAmount),
+                    spread_amount: toBigIntStr(spreadAmount),
+                    commission_amount: toBigIntStr(commissionAmount),
+                    maker_fee_amount: toBigIntStr(makerFeeAmount),
+                    fee_share_amount: toBigIntStr(feeShareAmount),
                     reserves,
                     // Analytics columns
                     pair_id: pairId,
@@ -1487,20 +1589,10 @@ export class PostgresSink implements Sink {
             }
           }
 
+
           // 🟢 BANK BALANCE DELTAS 🟢
-          if (event_type === 'coin_received' || event_type === 'coin_spent') {
-            const acc = findAttr(attrsPairs, event_type === 'coin_received' ? 'receiver' : 'spender');
-            const amountStr = findAttr(attrsPairs, 'amount');
-            const coins = parseCoins(amountStr);
-            for (const coin of coins) {
-              balanceDeltasRows.push({
-                height,
-                account: acc,
-                denom: coin.denom,
-                delta: event_type === 'coin_received' ? coin.amount : `-${coin.amount}`
-              });
-            }
-          }
+          extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
+
 
           // 🟢 NETWORK PARAMS 🟢
           if (event_type === 'param_change') {
@@ -1581,6 +1673,19 @@ export class PostgresSink implements Sink {
       }
     }
 
+    // ✅ FIX: Process Begin/End Block Events for Balances (e.g. Gov Refunds, Minting)
+    const allBlockEvents = [
+      ...(blockLine.block_results?.begin_block_events ?? []),
+      ...(blockLine.block_results?.end_block_events ?? [])
+    ];
+
+    for (const ev of allBlockEvents) {
+      const evType = ev.type;
+      const attrsPairs = attrsToPairs(ev.attributes);
+      extractBalanceDeltas(evType, attrsPairs);
+    }
+
+
     return {
       blockRow, txRows, msgRows, evRows, attrRows,
       transfersRows, wasmExecRows, wasmEventsRows,
@@ -1604,6 +1709,7 @@ export class PostgresSink implements Sink {
       factorySupplyEventsRows,
       wasmOracleUpdatesRows,
       wasmTokenEventsRows,
+      wasmInstantiateConfigsRows,
       height
     };
   }
@@ -1648,6 +1754,7 @@ export class PostgresSink implements Sink {
     this.bufWasmContracts.push(...data.wasmContractsRows);
     this.bufWasmMigrations.push(...data.wasmMigrationsRows);
     this.bufWasmAdminChanges.push(...data.wasmAdminChangesRows);
+    this.bufWasmInstantiateConfigs.push(...data.wasmInstantiateConfigsRows);
     this.bufNetworkParams.push(...data.networkParamsRows);
 
     // ✅ Validator (Pushing to Buffer)
@@ -1727,6 +1834,7 @@ export class PostgresSink implements Sink {
       wasmContracts: this.bufWasmContracts,
       wasmMigrations: this.bufWasmMigrations,
       wasmAdminChanges: this.bufWasmAdminChanges,
+      wasmInstantiateConfigs: this.bufWasmInstantiateConfigs,
       networkParams: this.bufNetworkParams,
       validators: this.bufValidators,
       validatorSet: this.bufValidatorSet,
@@ -1754,7 +1862,7 @@ export class PostgresSink implements Sink {
     this.bufGovVotes = []; this.bufGovDeposits = []; this.bufGovProposals = [];
     this.bufStakeDeleg = []; this.bufStakeDistr = [];
     this.bufBalanceDeltas = []; this.bufWasmCodes = []; this.bufWasmContracts = []; this.bufWasmMigrations = [];
-    this.bufWasmAdminChanges = []; this.bufNetworkParams = [];
+    this.bufWasmAdminChanges = []; this.bufWasmInstantiateConfigs = []; this.bufNetworkParams = [];
     this.bufValidators = []; this.bufValidatorSet = []; this.bufMissedBlocks = [];
     this.bufIbcPackets = []; this.bufIbcChannels = []; this.bufIbcTransfers = [];
     this.bufIbcClients = []; this.bufIbcDenoms = []; this.bufIbcConnections = [];
@@ -1822,11 +1930,13 @@ export class PostgresSink implements Sink {
       if (snapshot.balanceDeltas.length > 0) {
         await flushBalanceDeltas(client, snapshot.balanceDeltas);
       }
-      if (snapshot.wasmCodes.length > 0 || snapshot.wasmContracts.length > 0 || snapshot.wasmMigrations.length > 0) {
+
+      if (snapshot.wasmCodes.length > 0 || snapshot.wasmContracts.length > 0 || snapshot.wasmMigrations.length > 0 || snapshot.wasmInstantiateConfigs.length > 0) {
         await flushWasmRegistry(client, {
           codes: snapshot.wasmCodes,
           contracts: snapshot.wasmContracts,
-          migrations: snapshot.wasmMigrations
+          migrations: snapshot.wasmMigrations,
+          configs: snapshot.wasmInstantiateConfigs
         });
       }
       if (snapshot.wasmAdminChanges.length > 0) {
@@ -1903,6 +2013,7 @@ export class PostgresSink implements Sink {
       this.bufWasmContracts = [...snapshot.wasmContracts, ...this.bufWasmContracts];
       this.bufWasmMigrations = [...snapshot.wasmMigrations, ...this.bufWasmMigrations];
       this.bufWasmAdminChanges = [...snapshot.wasmAdminChanges, ...this.bufWasmAdminChanges];
+      this.bufWasmInstantiateConfigs = [...snapshot.wasmInstantiateConfigs, ...this.bufWasmInstantiateConfigs];
       this.bufNetworkParams = [...snapshot.networkParams, ...this.bufNetworkParams];
       this.bufValidators = [...snapshot.validators, ...this.bufValidators];
       this.bufValidatorSet = [...snapshot.validatorSet, ...this.bufValidatorSet];

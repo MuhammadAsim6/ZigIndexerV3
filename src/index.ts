@@ -18,13 +18,26 @@ import { getLogger } from './utils/logger.ts';
 import { syncRange } from './runner/syncRange.ts';
 import { retryMissingBlocks } from './runner/retryMissing.ts';
 import { followLoop } from './runner/follow.ts';
+import { bootstrapGenesis } from './scripts/genesis-bootstrap.ts';
+import { reconcileNegativeBalances } from './sink/pg/reconcile.ts';
 
 EventEmitter.defaultMaxListeners = 0;
 const log = getLogger('index');
 
 async function main() {
   const cfg = getConfig();
+  log.info(`[start] Cosmos Indexer v1.1.0-reconcile-refactor starting...`);
   printConfig(cfg);
+
+  // 🛡️ INITIALIZE DB POOL EARLY
+  // We need the pool ready for genesis bootstrap and resume checks
+  if (cfg.sinkKind === 'postgres') {
+    createPgPool({ ...cfg.pg, applicationName: 'cosmos-indexer' });
+  }
+
+  // 🛡️ GENESIS BOOTSTRAP (Auto-run if genesis.json exists)
+  const genesisPath = process.env.GENESIS_PATH || '/usr/src/app/genesis.json';
+  await bootstrapGenesis(genesisPath);
 
   const rpc = createRpcClientFromConfig(cfg);
   const status = await rpc.fetchStatus();
@@ -35,7 +48,8 @@ async function main() {
 
   if (wantResume) {
     if (cfg.sinkKind === 'postgres') {
-      const pool = createPgPool({ ...cfg.pg, applicationName: 'cosmos-indexer-resolver' });
+      // Pool is already created above
+      const pool = getPgPool();
       try {
         const last = await getProgress(pool, cfg.pg?.progressId ?? 'default');
         const earliest = Number(status['sync_info']['earliest_block_height']);
@@ -76,6 +90,7 @@ async function main() {
       events: cfg.pg?.batchEvents,
       attrs: cfg.pg?.batchAttrs,
     },
+    rpcUrl: cfg.rpcUrl, // ✅ ADDED: Pass RPC URL to Sink
   });
   await sink.init();
 
@@ -198,6 +213,23 @@ async function main() {
     } catch (err) {
       log.warn('[start] validator sync failed:', err instanceof Error ? err.message : String(err));
     }
+  }
+
+  // 🛡️ RECONCILIATION LOOP: Periodically check for negative balances
+  if (cfg.sinkKind === 'postgres') {
+    setInterval(async () => {
+      try {
+        const pool = getPgPool();
+        const client = await pool.connect();
+        try {
+          await reconcileNegativeBalances(client, cfg.rpcUrl);
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
+      }
+    }, 5 * 60 * 1000);
   }
 
   // 🛡️ INITIAL SYNC: Fetch network parameters

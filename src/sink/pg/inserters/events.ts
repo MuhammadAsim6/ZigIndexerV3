@@ -4,11 +4,11 @@ import { execBatchedInsert } from '../batch.js';
 // ✅ Maximum size for individual attribute values (1MB - allows full contract data)
 export const MAX_ATTR_VALUE_SIZE = 1_000_000;
 
-// ✅ Maximum total size for the entire serialized attributes JSON (10MB - no truncation)
-export const MAX_TOTAL_JSON_SIZE = 10_000_000;
+// ✅ Maximum total size for the entire serialized attributes JSON (20MB - extensive safety margin)
+export const MAX_TOTAL_JSON_SIZE = 20_000_000;
 
-// ✅ Maximum number of attributes to keep (5000 - handles complex events)
-export const MAX_ATTR_COUNT = 5000;
+// ✅ Maximum number of attributes to keep (10000 - handles massive batched events)
+export const MAX_ATTR_COUNT = 10000;
 
 /**
  * Truncates large attribute values to prevent PostgreSQL index size errors.
