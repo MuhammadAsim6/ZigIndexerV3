@@ -1,23 +1,26 @@
-// src/sink/pg/reconcile.ts
 import { PoolClient } from 'pg';
 import { getLogger } from '../../utils/logger.js';
-const log = getLogger('sink/reconcile');
 import { insertBalanceDeltas } from './inserters/bank.js';
+import { RpcClient } from '../../rpc/client.js';
+import { Root } from 'protobufjs';
+import { decodeAnyWithRoot } from '../../decode/dynamicProto.js';
+
+const log = getLogger('sink/reconcile');
 
 /**
  * Reconciles negative balances by fetching the true state from RPC and inserting a correction delta.
  * @param client - Database client
- * @param rpcUrl - RPC URL for querying balances
+ * @param rpc - RPC Client for querying balances via ABCI
+ * @param protoRoot - Protobuf Root for encoding/decoding
  */
-export async function reconcileNegativeBalances(client: PoolClient, rpcUrl: string) {
+export async function reconcileNegativeBalances(client: PoolClient, rpc: RpcClient, protoRoot: Root) {
     log.info('[reconcile] Starting reconciliation of negative balances...');
 
     // 1. Identify Negative Accounts
     const res = await client.query(`
     SELECT account, key as denom, value as current_balance_str
     FROM bank.balances_current, jsonb_each_text(balances)
-    WHERE value LIKE '-%'
-    LIMIT 50;
+    WHERE (value::NUMERIC < 0);
   `);
 
     if (res.rowCount === 0) {
@@ -37,7 +40,7 @@ export async function reconcileNegativeBalances(client: PoolClient, rpcUrl: stri
         const { account, denom, current_balance_str } = row;
 
         try {
-            const trueBalance = await fetchAccountBalanceIds(rpcUrl, account, denom);
+            const trueBalance = await fetchBalanceViaAbci(rpc, protoRoot, account, denom);
             const currentDbBalance = BigInt(current_balance_str);
             const diff = trueBalance - currentDbBalance;
 
@@ -67,11 +70,44 @@ export async function reconcileNegativeBalances(client: PoolClient, rpcUrl: stri
     }
 }
 
-// Helper to fetch specific denom balance
-async function fetchAccountBalanceIds(rpcUrl: string, address: string, denom: string): Promise<bigint> {
-    const url = `${rpcUrl}/cosmos/bank/v1beta1/balances/${address}/by_denom?denom=${denom}`;
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`RPC ${resp.status}`);
-    const data = await resp.json() as any;
-    return BigInt(data?.balance?.amount || '0');
+// Helper to fetch specific denom balance using ABCI Query (works on Tendermint RPC port)
+async function fetchBalanceViaAbci(rpc: RpcClient, root: Root, address: string, denom: string): Promise<bigint> {
+    const ReqType = root.lookupType('cosmos.bank.v1beta1.QueryBalanceRequest');
+    const ResType = 'cosmos.bank.v1beta1.QueryBalanceResponse'; // String for decodeAnyWithRoot
+
+    // Encode request
+    const reqMsg = ReqType.create({ address, denom });
+    const reqBytes = ReqType.encode(reqMsg).finish();
+    // ✅ Fix: Tendermint RPC requires '0x' prefix for hex-encoded data arguments
+    const reqHex = '0x' + Buffer.from(reqBytes).toString('hex');
+
+    // Query ABCI
+    const path = '/cosmos.bank.v1beta1.Query/Balance';
+
+    // ✅ Final Fix: Send data WITHOUT extra quotes - certain Tendermint versions are picky
+    let response: any;
+    try {
+        const params = {
+            path: `"${path}"`,
+            data: reqHex
+        };
+        const j = await rpc.getJson('/abci_query', params);
+        response = j.result?.response ?? j;
+    } catch (err: any) {
+        // Fallback to quoted (standard) if raw fails (defensive)
+        response = await rpc.queryAbci(path, reqHex);
+    }
+
+    if (!response || (!response.value && response.code !== 0)) {
+        if (response && response.code !== 0) {
+            throw new Error(`ABCI Error ${response.code}: ${response.log}`);
+        }
+        return 0n;
+    }
+
+    // Decode response
+    const decoded = decodeAnyWithRoot(ResType, Buffer.from(response.value, 'base64'), root);
+    const balance = (decoded as any).balance;
+
+    return BigInt(balance?.amount || '0');
 }

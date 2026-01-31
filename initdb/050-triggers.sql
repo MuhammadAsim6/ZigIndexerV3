@@ -8,7 +8,7 @@
 CREATE OR REPLACE FUNCTION bank.update_balances_current()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Atomic Upsert: Calculate new balance and update/insert in one step
+    -- Atomic Upsert: Calculate new balance using cleaned input
     INSERT INTO bank.balances_current (account, balances)
     VALUES (
         NEW.account, 
@@ -18,16 +18,20 @@ BEGIN
     SET balances = bank.balances_current.balances || 
         jsonb_build_object(
             NEW.denom, 
-            (COALESCE((bank.balances_current.balances->>NEW.denom)::NUMERIC(80,0), 0) + NEW.delta::NUMERIC(80,0))::TEXT
-        )
-    WHERE (COALESCE((bank.balances_current.balances->>NEW.denom)::NUMERIC(80,0), 0) + NEW.delta::NUMERIC(80,0)) > 0;
+            (
+                COALESCE((bank.balances_current.balances->>NEW.denom)::NUMERIC(80,0), 0) + 
+                NEW.delta
+            )::TEXT
+        );
 
-    -- If the resulting balance is <= 0, we remove the key to keep the JSON clean
-    -- and prevent negative values in the view.
+    -- cleanup: Ensure 0 balances are stored explicitly as "0" to preserve audit trail
+    -- Replaces previous deletion logic
     UPDATE bank.balances_current
-    SET balances = balances - NEW.denom
+    SET balances = bank.balances_current.balances || jsonb_build_object(NEW.denom, '0')
     WHERE account = NEW.account
-      AND (COALESCE((balances->>NEW.denom)::NUMERIC(80,0), 0) + NEW.delta::NUMERIC(80,0)) <= 0;
+      AND (
+          COALESCE((balances->>NEW.denom)::NUMERIC(80,0), 0) = 0
+      );
     
     RETURN NEW;
 END;
@@ -142,7 +146,6 @@ BEGIN
         SELECT account, denom, SUM(delta::NUMERIC(80,0)) as total
         FROM bank.balance_deltas
         GROUP BY account, denom
-        HAVING SUM(delta::NUMERIC(80,0)) > 0
     ) aggregated
     GROUP BY account;
 END;

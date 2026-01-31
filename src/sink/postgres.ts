@@ -392,7 +392,7 @@ export class PostgresSink implements Sink {
             height,
             account: acc,
             denom: coin.denom,
-            delta: evType === 'coin_received' ? coin.amount : `- ${coin.amount} `,
+            delta: evType === 'coin_received' ? coin.amount : `-${coin.amount}`,
             // ✅ ADDED: Unique Constraint Keys for Intra-Block Deduplication
             tx_hash: (typeof tx_hash !== 'undefined') ? tx_hash : 'block_event',
             msg_index: (typeof msg_index !== 'undefined') ? msg_index : -1,

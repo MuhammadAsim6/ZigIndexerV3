@@ -222,7 +222,7 @@ async function main() {
         const pool = getPgPool();
         const client = await pool.connect();
         try {
-          await reconcileNegativeBalances(client, cfg.rpcUrl);
+          await reconcileNegativeBalances(client, rpc, await loadProtoRoot(protoDir));
         } finally {
           client.release();
         }
