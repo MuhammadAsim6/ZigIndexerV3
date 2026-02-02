@@ -32,12 +32,8 @@ export async function insertBalanceDeltas(client: PoolClient, rows: any[]): Prom
             const s = String(v).trim();
             // ✅ Validate format before parsing to catch malformed strings
             if (!/^-?\d+$/.test(s)) {
-                console.error(`[bank/inserter] Invalid delta format: "${v}" - expected integer, got "${s}"`);
-                return 0n; // Or throw, but for stability we log loud and return 0 (keeping existing behavior but logging it)
-                // User requested THROW but let's stick to safe fallback with clear ERROR log for now as per "recommendation priority".
-                // Actually the recommendation said "throw new Error" in Error 3 text.
-                // Correcting to throw as per explicit request details to ensure data integrity.
-                throw new Error(`Invalid delta format: "${v}" - expected integer`);
+                // ✅ FIX: Throw error for invalid delta formats to prevent silent data corruption
+                throw new Error(`[bank/inserter] Invalid delta format: "${v}" - expected integer, got "${s}"`);
             }
             return BigInt(s);
         };

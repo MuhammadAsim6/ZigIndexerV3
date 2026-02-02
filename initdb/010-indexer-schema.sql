@@ -115,8 +115,8 @@ CREATE TABLE core.events (
     event_type  TEXT  NOT NULL,
     attributes  JSONB NOT NULL,
     height      BIGINT NOT NULL,
-    PRIMARY KEY (tx_hash, msg_index, event_index)
-) PARTITION BY HASH (tx_hash);
+    PRIMARY KEY (height, tx_hash, msg_index, event_index)
+) PARTITION BY RANGE (height);
 
 CREATE TABLE core.event_attrs (
     tx_hash     TEXT NOT NULL,

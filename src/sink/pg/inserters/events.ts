@@ -98,12 +98,13 @@ export async function insertEvents(client: PoolClient, rows: any[]): Promise<voi
     }));
 
     // ✅ CRITICAL: Force small batch size to prevent PostgreSQL memory allocation errors
+    // ✅ FIX: ON CONFLICT must include `height` since PK is now (height, tx_hash, msg_index, event_index)
     await execBatchedInsert(
         client,
         'core.events',
         cols,
         safeRows,
-        'ON CONFLICT (tx_hash, msg_index, event_index) DO NOTHING',
+        'ON CONFLICT (height, tx_hash, msg_index, event_index) DO NOTHING',
         { attributes: 'jsonb' },
         { maxRows: 100, maxParams: 600 }  // 100 rows × 6 cols = 600 params
     );

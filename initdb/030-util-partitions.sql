@@ -10,9 +10,10 @@ CREATE TABLE IF NOT EXISTS util.height_part_ranges (
     PRIMARY KEY (schema_name, table_name)
 );
 
--- Configuration: 1 Million blocks per partition
+-- Configuration: Partition sizes (customized per table)
 INSERT INTO util.height_part_ranges (schema_name, table_name, range_size) VALUES
  ('core', 'blocks', 1000000), ('core', 'transactions', 1000000), ('core', 'messages', 1000000),
+ ('core', 'events', 100000),  -- ✅ 1 lakh blocks for easier archival
  ('core', 'validator_set', 1000000), ('core', 'validator_missed_blocks', 1000000),
  ('core', 'network_params', 1000000), ('core', 'event_attrs', 100000),
  ('bank', 'transfers', 1000000), ('bank', 'balance_deltas', 1000000),
@@ -30,7 +31,7 @@ ON CONFLICT (schema_name, table_name) DO UPDATE SET range_size = EXCLUDED.range_
 -- Remove unused entries
 DELETE FROM util.height_part_ranges
 WHERE (schema_name, table_name) NOT IN (
-    ('core', 'blocks'), ('core', 'transactions'), ('core', 'messages'),
+    ('core', 'blocks'), ('core', 'transactions'), ('core', 'messages'), ('core', 'events'),
     ('core', 'validator_set'), ('core', 'validator_missed_blocks'),
     ('core', 'network_params'), ('core', 'event_attrs'),
     ('bank', 'transfers'), ('bank', 'balance_deltas'),

@@ -98,10 +98,16 @@ async function fetchBalanceViaAbci(rpc: RpcClient, root: Root, address: string, 
         response = await rpc.queryAbci(path, reqHex);
     }
 
-    if (!response || (!response.value && response.code !== 0)) {
-        if (response && response.code !== 0) {
-            throw new Error(`ABCI Error ${response.code}: ${response.log}`);
-        }
+    // ✅ FIX: Simplified response validation logic
+    if (!response) {
+        log.warn(`[reconcile] Empty ABCI response for ${address}/${denom}`);
+        return 0n;
+    }
+    if (response.code !== 0) {
+        throw new Error(`ABCI Error ${response.code}: ${response.log}`);
+    }
+    if (!response.value) {
+        // Account exists but has 0 balance for this denom
         return 0n;
     }
 

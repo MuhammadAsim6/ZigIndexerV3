@@ -75,7 +75,7 @@ async function updateCw20Balances(client: PoolClient, transfers: any[]): Promise
     INSERT INTO tokens.cw20_balances_current AS t (contract, account, balance)
     SELECT * FROM (VALUES ${valueParts.join(', ')}) AS v(contract, account, delta)
     ON CONFLICT (contract, account)
-    DO UPDATE SET balance = t.balance + v.delta::numeric
+    DO UPDATE SET balance = t.balance + EXCLUDED.balance::numeric
   `;
 
   await client.query(query, values);
