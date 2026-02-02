@@ -117,16 +117,19 @@ CREATE TABLE core.events (
     height      BIGINT NOT NULL,
     PRIMARY KEY (height, tx_hash, msg_index, event_index)
 ) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS core.events_p0 PARTITION OF core.events FOR VALUES FROM (0) TO (100000);
 
 CREATE TABLE core.event_attrs (
     tx_hash     TEXT NOT NULL,
     msg_index   INT  NOT NULL,
     event_index INT  NOT NULL,
+    attr_index  INT  NOT NULL,
     key         TEXT NOT NULL,
     value       TEXT NULL,
     height      BIGINT NOT NULL,
-    PRIMARY KEY (height, tx_hash, msg_index, event_index, key)
+    PRIMARY KEY (height, tx_hash, msg_index, event_index, attr_index)
 ) PARTITION BY RANGE (height);
+CREATE TABLE IF NOT EXISTS core.event_attrs_p0 PARTITION OF core.event_attrs FOR VALUES FROM (0) TO (100000);
 
 -- Tracks heights that failed RPC fetch/processing after retries.
 CREATE TABLE IF NOT EXISTS core.missing_blocks (
@@ -501,13 +504,6 @@ CREATE TABLE IF NOT EXISTS wasm.admin_changes (
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS wasm.admin_changes_p0 PARTITION OF wasm.admin_changes FOR VALUES FROM (0) TO (1000000);
 
-CREATE TABLE wasm.state_kv (
-    contract   TEXT   NOT NULL,
-    key        BYTEA  NOT NULL,
-    height     BIGINT NOT NULL,
-    value      BYTEA  NOT NULL,
-    PRIMARY KEY (contract, key, height)
-) PARTITION BY RANGE (height);
 
 -- ============================================================================
 -- 7) AUTHZ / FEEGRANT

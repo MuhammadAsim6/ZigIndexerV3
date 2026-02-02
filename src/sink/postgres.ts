@@ -695,30 +695,44 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 WASM REGISTRY (STORE/INSTANTIATE) 🟢
-        if (type === '/cosmwasm.wasm.v1.MsgStoreCode' ||
-          type === '/cosmwasm.wasm.v1.MsgStoreAndInstantiateContract' ||
-          type === '/cosmwasm.wasm.v1.MsgStoreAndMigrateContract') {
+        if (type.endsWith('.MsgStoreCode') ||
+          type.endsWith('.MsgStoreAndInstantiateContract') ||
+          type.endsWith('.MsgStoreAndMigrateContract')) {
           const event = msgLog?.events.find((e: any) => e.type === 'store_code');
           const attrs = attrsToPairs(event?.attributes);
           const codeId = findAttr(attrs, 'code_id');
           const checksum = findAttr(attrs, 'code_checksum') || findAttr(attrs, 'checksum') || m.checksum;
 
           if (codeId) {
+            // Try to get instantiate_permission from message first, then fall back to event
+            let instantiatePermission = m.instantiate_permission || m.instantiatePermission ||
+              m.instantiate_config || m.instantiateConfig;
+
+            // Fallback: extract from store_code event if not in message
+            if (!instantiatePermission) {
+              const permissionStr = findAttr(attrs, 'instantiate_permission') ||
+                findAttr(attrs, 'access_config') ||
+                findAttr(attrs, 'instantiate_config');
+              if (permissionStr) {
+                instantiatePermission = tryParseJson(permissionStr);
+              }
+            }
+
             wasmCodesRows.push({
               code_id: codeId,
               checksum: checksum || '', // Ensure not null
               creator: m.sender || m.authority || m.signer || firstSigner,
-              instantiate_permission: m.instantiate_permission || m.instantiatePermission || m.instantiate_config || m.instantiateConfig,
+              instantiate_permission: instantiatePermission,
               store_tx_hash: tx_hash,
               store_height: height
             });
-            if (!m.instantiate_permission && !m.instantiatePermission) {
+            if (!instantiatePermission) {
               log.debug(`[wasm - store] instantiate_permission is missing in ${tx_hash}. Keys present: ${Object.keys(m).join(', ')} `);
             }
           }
 
           // If it's a "StoreAndInstantiate", we also capture the contract creation if it succeeded
-          if (type === '/cosmwasm.wasm.v1.MsgStoreAndInstantiateContract' && code === 0) {
+          if (type.endsWith('.MsgStoreAndInstantiateContract') && code === 0) {
             const instEvent = msgLog?.events.find((e: any) => e.type === 'instantiate');
             const addr = findAttr(attrsToPairs(instEvent?.attributes), '_contract_address') || findAttr(attrsToPairs(instEvent?.attributes), 'contract_address');
             if (addr) {
@@ -735,7 +749,7 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type === '/cosmwasm.wasm.v1.MsgUpdateInstantiateConfig' && code === 0) {
+        if (type.endsWith('.MsgUpdateInstantiateConfig') && code === 0) {
           wasmInstantiateConfigsRows.push({
             code_id: m.code_id,
             instantiate_permission: m.new_instantiate_permission || m.newInstantiatePermission || m.instantiate_permission || m.instantiatePermission,
@@ -744,8 +758,8 @@ export class PostgresSink implements Sink {
           });
         }
 
-        if (type === '/cosmwasm.wasm.v1.MsgInstantiateContract' ||
-          type === '/cosmwasm.wasm.v1.MsgInstantiateContract2') {
+        if (type.endsWith('.MsgInstantiateContract') ||
+          type.endsWith('.MsgInstantiateContract2')) {
           const event = msgLog?.events.find((e: any) => e.type === 'instantiate');
           const addr = findAttr(attrsToPairs(event?.attributes), '_contract_address') || findAttr(attrsToPairs(event?.attributes), 'contract_address');
           if (addr) {
@@ -761,10 +775,15 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type === '/cosmwasm.wasm.v1.MsgMigrateContract') {
+        if (type.endsWith('.MsgMigrateContract')) {
+          // Extract from_code_id from migrate event (contains old code_id)
+          const migrateEvent = msgLog?.events.find((e: any) => e.type === 'migrate');
+          const migrateAttrs = attrsToPairs(migrateEvent?.attributes);
+          const fromCodeId = findAttr(migrateAttrs, 'code_id') || findAttr(migrateAttrs, 'old_code_id');
+
           wasmMigrationsRows.push({
             contract: m.contract,
-            from_code_id: null, // Would need Query to find previous, but we track the 'to' here
+            from_code_id: fromCodeId ? toBigIntStr(fromCodeId) : null,
             to_code_id: m.code_id,
             height,
             tx_hash
@@ -968,7 +987,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 WASM LOGIC 🟢
-        if (type === '/cosmwasm.wasm.v1.MsgExecuteContract') {
+        if (type.endsWith('.MsgExecuteContract')) {
           wasmExecRows.push({
             tx_hash, msg_index: i, contract: m?.contract ?? m?.contract_address, caller: m?.sender,
             funds: m?.funds, msg: tryParseJson(m?.msg), success: code === 0, error: code === 0 ? null : (log_summary),
@@ -977,7 +996,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 WASM ADMIN CHANGES (Security Auditing) 🟢
-        if (type === '/cosmwasm.wasm.v1.MsgUpdateAdmin' && code === 0) {
+        if (type.endsWith('.MsgUpdateAdmin') && code === 0) {
           wasmAdminChangesRows.push({
             contract: m.contract,
             height,
@@ -989,7 +1008,7 @@ export class PostgresSink implements Sink {
           });
         }
 
-        if (type === '/cosmwasm.wasm.v1.MsgClearAdmin' && code === 0) {
+        if (type.endsWith('.MsgClearAdmin') && code === 0) {
           wasmAdminChangesRows.push({
             contract: m.contract,
             height,
@@ -998,6 +1017,17 @@ export class PostgresSink implements Sink {
             old_admin: null, // Would need state query to get old admin
             new_admin: null,
             action: 'clear'
+          });
+        }
+
+        // 🟢 WASM SUDO (Governance-initiated execution) 🟢
+        if (type.endsWith('.MsgSudoContract')) {
+          wasmExecRows.push({
+            tx_hash, msg_index: i, contract: m?.contract ?? m?.contract_address,
+            caller: 'governance', // Sudo is always governance-initiated
+            funds: null, msg: tryParseJson(m?.msg), success: code === 0,
+            error: code === 0 ? null : (log_summary),
+            gas_used, height
           });
         }
 
@@ -1301,6 +1331,22 @@ export class PostgresSink implements Sink {
                 }
               }
 
+            }
+          }
+
+          if (event_type === 'instantiate' || event_type === '_instantiate') {
+            const addr = findAttr(attrsPairs, '_contract_address') || findAttr(attrsPairs, 'contract_address');
+            const codeId = findAttr(attrsPairs, 'code_id');
+            if (addr && codeId) {
+              wasmContractsRows.push({
+                address: addr,
+                code_id: toBigIntStr(codeId),
+                creator: findAttr(attrsPairs, 'creator'),
+                admin: findAttr(attrsPairs, 'admin'),
+                label: findAttr(attrsPairs, 'label'),
+                created_height: height,
+                created_tx_hash: tx_hash
+              });
             }
           }
 
@@ -1642,8 +1688,11 @@ export class PostgresSink implements Sink {
             }
           }
 
-          for (const { key, value } of attrsPairs) {
-            attrRows.push({ tx_hash, msg_index, event_index: ei, key, value, height });
+          for (let ai = 0; ai < attrsPairs.length; ai++) {
+            const attr = attrsPairs[ai];
+            if (!attr) continue;
+            const { key, value } = attr;
+            attrRows.push({ tx_hash, msg_index, event_index: ei, attr_index: ai, key, value, height });
           }
         }
       }

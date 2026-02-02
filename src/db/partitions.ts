@@ -24,7 +24,7 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     ['gov', 'deposits'], ['gov', 'votes'],
     ['authz_feegrant', 'authz_grants'], ['authz_feegrant', 'fee_grants'],
     ['tokens', 'cw20_transfers'],
-    ['wasm', 'executions'], ['wasm', 'events'], ['wasm', 'event_attrs'], ['wasm', 'state_kv'], ['wasm', 'contract_migrations'],
+    ['wasm', 'executions'], ['wasm', 'events'], ['wasm', 'event_attrs'], ['wasm', 'contract_migrations'],
     ['wasm', 'dex_swaps'], ['wasm', 'admin_changes'],
     ['wasm', 'oracle_updates'], ['wasm', 'token_events'],
 
@@ -38,8 +38,18 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
   await client.query(`SELECT pg_advisory_lock($1)`, [PARTITION_LOCK_ID]);
 
   try {
+    // Table-specific range sizes (must match util.height_part_ranges)
+    const RANGE_SIZES: Record<string, number> = {
+      'core.events': 100000,
+      'core.event_attrs': 100000,
+    };
+    const DEFAULT_RANGE_SIZE = 1000000;
+
     // Ensure Range partitions for BOTH min and max heights
     for (const [schema, table] of tables) {
+      const key = `${schema}.${table}`;
+      const rangeSize = RANGE_SIZES[key] || DEFAULT_RANGE_SIZE;
+
       // Ensure partition for minHeight (start of range)
       await client.query(
         `SELECT util.ensure_partition_for_height($1, $2, $3)`,
@@ -47,7 +57,6 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
       );
       // Ensure partition for maxHeight (end of range)
       // Only if maxHeight is in a different partition bucket
-      const rangeSize = 100000; // Default from util.height_part_ranges
       if (Math.floor(minHeight / rangeSize) !== Math.floor(maxHeight / rangeSize)) {
         await client.query(
           `SELECT util.ensure_partition_for_height($1, $2, $3)`,

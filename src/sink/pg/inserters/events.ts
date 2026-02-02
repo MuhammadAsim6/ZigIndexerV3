@@ -84,7 +84,7 @@ export function safeSerializeAttributes(attributes: any): string {
 }
 
 /**
- * Inserts events into the hash-partitioned core.events table.
+ * Inserts events into the range-partitioned core.events table.
  */
 export async function insertEvents(client: PoolClient, rows: any[]): Promise<void> {
     if (!rows?.length) return;

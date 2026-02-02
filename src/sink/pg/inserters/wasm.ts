@@ -16,12 +16,39 @@ export async function insertWasmCodes(client: PoolClient, rows: any[]): Promise<
 
 export async function insertWasmContracts(client: PoolClient, rows: any[]): Promise<void> {
     if (!rows?.length) return;
+
+    // Deduplicate by address - keep the row with most complete data (prefer one with admin/label)
+    const dedupedMap = new Map<string, any>();
+    for (const row of rows) {
+        const existing = dedupedMap.get(row.address);
+        if (!existing) {
+            dedupedMap.set(row.address, row);
+        } else {
+            // Merge: prefer non-null values, earlier height
+            dedupedMap.set(row.address, {
+                address: row.address,
+                code_id: row.code_id || existing.code_id,
+                creator: row.creator || existing.creator,
+                admin: row.admin || existing.admin,
+                label: row.label || existing.label,
+                created_height: Math.min(existing.created_height || Infinity, row.created_height || Infinity),
+                created_tx_hash: existing.created_tx_hash || row.created_tx_hash
+            });
+        }
+    }
+    const dedupedRows = Array.from(dedupedMap.values());
+
     const cols = ['address', 'code_id', 'creator', 'admin', 'label', 'created_height', 'created_tx_hash'];
     const { text, values } = makeMultiInsert(
         'wasm.contracts',
         cols,
-        rows,
-        'ON CONFLICT (address) DO NOTHING'
+        dedupedRows,
+        `ON CONFLICT (address) DO UPDATE SET 
+            code_id = EXCLUDED.code_id,
+            admin = COALESCE(wasm.contracts.admin, EXCLUDED.admin),
+            label = COALESCE(wasm.contracts.label, EXCLUDED.label),
+            created_height = LEAST(wasm.contracts.created_height, EXCLUDED.created_height),
+            created_tx_hash = COALESCE(wasm.contracts.created_tx_hash, EXCLUDED.created_tx_hash)`
     );
     await client.query(text, values);
 }
