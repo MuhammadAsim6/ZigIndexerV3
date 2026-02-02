@@ -7,12 +7,12 @@ import { getConfig } from '../config.js';
 const log = getLogger('scripts/genesis-bootstrap');
 
 /**
- * Script to bootstrap bank balances from a genesis file.
- * Usage: npx tsx src/scripts/genesis-bootstrap.ts <path-to-genesis.json>
- */
-/**
- * Script to bootstrap bank balances from a genesis file.
- * Can be run standalone or imported.
+ * Enhanced Genesis Bootstrap Script
+ * Captures:
+ * - Bank balances (standard)
+ * - Staking delegations (bonded tokens - informational)
+ * - Vesting accounts (locked + vested - informational)
+ * - Supply verification
  */
 export async function bootstrapGenesis(genesisPath: string) {
     if (!genesisPath) {
@@ -35,20 +35,26 @@ export async function bootstrapGenesis(genesisPath: string) {
         return;
     }
 
-    const balances = genesis.app_state?.bank?.balances;
-    if (!Array.isArray(balances)) {
-        log.error('Invalid genesis format: app_state.bank.balances is missing or not an array');
+    const bankBalances = genesis.app_state?.bank?.balances ?? [];
+    const stakingDelegations = genesis.app_state?.staking?.delegations ?? [];
+    const vestingAccounts = genesis.app_state?.auth?.accounts?.filter(
+        (acc: any) => acc['@type']?.includes('Vesting') || acc.base_vesting_account
+    ) ?? [];
+    const totalSupply = genesis.app_state?.bank?.supply ?? [];
+
+    if (!Array.isArray(bankBalances) || bankBalances.length === 0) {
+        log.error('Invalid genesis format: app_state.bank.balances is missing or empty');
         return;
     }
 
-    log.info(`Found ${balances.length} accounts with initial balances.`);
+    log.info(`Found: ${bankBalances.length} bank accounts, ${stakingDelegations.length} delegations, ${vestingAccounts.length} vesting accounts`);
 
     const config = getConfig();
     const pool = getPgPool({ ...config.pg, applicationName: 'genesis-bootstrap' });
     const client = await pool.connect();
 
     try {
-        // Check if we already have genesis data (heuristic: check if height 0 exists)
+        // Check if we already have genesis data
         const checkRes = await client.query('SELECT 1 FROM bank.balance_deltas WHERE height = 0 LIMIT 1');
         if (checkRes.rowCount && checkRes.rowCount > 0) {
             log.info('Genesis balances already exist (Height 0 found). Skipping.');
@@ -57,17 +63,64 @@ export async function bootstrapGenesis(genesisPath: string) {
 
         await client.query('BEGIN');
 
-        // 1. Prepare Delta Rows
+        // 1. Bank Balances (liquid balances)
         const rows: any[] = [];
-        for (const bal of balances) {
+        const balanceTracker = new Map<string, bigint>(); // Track total per denom for verification
+
+        for (const bal of bankBalances) {
             const address = bal.address;
-            for (const coin of bal.coins) {
+            for (const coin of bal.coins ?? []) {
                 rows.push({
                     height: 0,
                     account: address,
                     denom: coin.denom,
-                    delta: coin.amount // Positive delta for initial balance
+                    delta: coin.amount,
+                    tx_hash: 'genesis_bank',
+                    msg_index: 0,
+                    event_index: 0
                 });
+                // Track for verification
+                const current = balanceTracker.get(coin.denom) ?? 0n;
+                balanceTracker.set(coin.denom, current + BigInt(coin.amount));
+            }
+        }
+        log.info(`Prepared ${rows.length} bank balance entries.`);
+
+        // 2. Staking Delegations (bonded tokens - informational only)
+        // Note: Delegated tokens are NOT additional liquid balances
+        // They represent tokens bonded to validators from the delegator's account
+        let totalDelegated = 0n;
+        for (const del of stakingDelegations) {
+            if (del.shares) {
+                // shares are typically equal to tokens at genesis
+                totalDelegated += BigInt(Math.floor(parseFloat(del.shares)));
+            }
+        }
+        log.info(`Total delegated tokens at genesis: ${totalDelegated.toString()} (informational - not added to balances)`);
+
+        // 3. Vesting Accounts (track original vesting for reference)
+        // Vesting tokens ARE included in bank balances, this is informational
+        let totalVesting = 0n;
+        for (const acc of vestingAccounts) {
+            const vestingAcc = acc.base_vesting_account ?? acc;
+            const originalVesting = vestingAcc.original_vesting ?? [];
+            for (const coin of originalVesting) {
+                totalVesting += BigInt(coin.amount);
+            }
+        }
+        log.info(`Total vesting tokens at genesis: ${totalVesting.toString()} (included in bank balances)`);
+
+        // 4. Supply Verification
+        if (totalSupply.length > 0) {
+            log.info('Verifying total supply...');
+            for (const supply of totalSupply) {
+                const tracked = balanceTracker.get(supply.denom) ?? 0n;
+                const expected = BigInt(supply.amount);
+                if (tracked !== expected) {
+                    log.warn(`[supply mismatch] ${supply.denom}: tracked=${tracked}, expected=${expected}, diff=${expected - tracked}`);
+                } else {
+                    log.info(`[supply verified] ${supply.denom}: ${tracked.toString()}`);
+                }
             }
         }
 
@@ -77,9 +130,7 @@ export async function bootstrapGenesis(genesisPath: string) {
             return;
         }
 
-        log.info(`Prepared ${rows.length} balance entries. Inserting into bank.balance_deltas...`);
-
-        // 2. Batch Insert into bank.balance_deltas (Chunked)
+        // 5. Batch Insert into bank.balance_deltas (Chunked)
         const BATCH_SIZE = 5000;
         for (let i = 0; i < rows.length; i += BATCH_SIZE) {
             const batch = rows.slice(i, i + BATCH_SIZE);
@@ -104,7 +155,7 @@ export async function bootstrapGenesis(genesisPath: string) {
 
         log.info('All deltas inserted. Refreshing current balances view...');
 
-        // 3. Trigger Refresh
+        // 6. Trigger Refresh
         await client.query('SELECT bank.populate_balances_current()');
 
         await client.query('COMMIT');
@@ -115,15 +166,6 @@ export async function bootstrapGenesis(genesisPath: string) {
         log.error(`Bootstrap failed: ${err.message}`);
     } finally {
         client.release();
-        // Do not close pool here if imported, let main app handle it? 
-        // Actually, getting a new pool from getPgPool might reuse the singleton if configured.
-        // However, looking at db/pg.ts, getPgPool creates a singleton.
-        // We probably shouldn't close it if we are part of the main app flow, 
-        // OR we should rely on the main app's pool. 
-        // For safety in this hybrid script, let's NOT close the global pool if imported.
-        // But since we used getPgPool with a custom applicationName, it might have created a new one or replaced the global?
-        // Let's assume for now we shouldn't close it to avoid killing the main app's connection.
-        // await closePgPool(); 
     }
 }
 
@@ -134,10 +176,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const genesisPath = args[0] || process.env.GENESIS_PATH;
     if (genesisPath) {
         bootstrapGenesis(genesisPath).then(() => {
-            // For standalone, we DO want to close the pool
             closePgPool();
         });
     } else {
-        // console.log('Usage: npx tsx src/scripts/genesis-bootstrap.ts <path-to-genesis.json>');
+        console.log('Usage: npx tsx src/scripts/genesis-bootstrap.ts <path-to-genesis.json>');
     }
 }
