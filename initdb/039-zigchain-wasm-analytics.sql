@@ -61,23 +61,8 @@ CREATE TABLE IF NOT EXISTS tokens.factory_tokens (
 CREATE INDEX IF NOT EXISTS idx_factory_tokens_creator ON tokens.factory_tokens (creator);
 CREATE INDEX IF NOT EXISTS idx_factory_tokens_symbol ON tokens.factory_tokens (symbol);
 
--- ============================================================================
--- 3. SWAP VOLUME HOURLY (Pre-aggregated Analytics)
--- ============================================================================
-CREATE TABLE IF NOT EXISTS analytics.swap_volume_hourly (
-    hour              TIMESTAMPTZ NOT NULL,
-    contract          TEXT NOT NULL,
-    offer_asset       TEXT NOT NULL,
-    ask_asset         TEXT NOT NULL,
-    swap_count        BIGINT DEFAULT 0,
-    total_offer       NUMERIC(80,0) DEFAULT 0,
-    total_return      NUMERIC(80,0) DEFAULT 0,
-    total_commission  NUMERIC(80,0) DEFAULT 0,
-    PRIMARY KEY (hour, contract, offer_asset, ask_asset)
-);
-
-CREATE INDEX IF NOT EXISTS idx_swap_volume_hour ON analytics.swap_volume_hourly (hour DESC);
-CREATE INDEX IF NOT EXISTS idx_swap_volume_contract ON analytics.swap_volume_hourly (contract);
+-- NOTE: analytics.swap_volume_hourly moved to initdb/050-analytics-schema.sql
+-- See initdb/051-analytics-functions.sql for population logic
 
 -- ============================================================================
 -- 4. HELPER: Update Pool Reserves (Trigger for dex_pools)

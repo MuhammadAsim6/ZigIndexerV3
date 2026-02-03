@@ -124,15 +124,13 @@ export function createRpcClient(opts: RpcClientOptions): RpcClient {
         clearTimeout(t);
 
         if (!res.ok) {
-          const text = await res.text().catch(() => '');
-          const err = new Error(`HTTP ${res.status} ${res.statusText} for ${url} :: ${text.slice(0, 200)}`);
           if ((res.status >= 500 || res.status === 429) && attempt < opts.retries) {
             const delay = jitter(opts.backoffMs * Math.pow(2, attempt), opts.backoffJitter);
             log.debug('retry http', { attempt, delay, status: res.status });
             await sleep(delay);
             continue;
           }
-          throw err;
+          throw new Error(`HTTP ${res.status} ${res.statusText}`);
         }
 
         return (await res.json()) as T;

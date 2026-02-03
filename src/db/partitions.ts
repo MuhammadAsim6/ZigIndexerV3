@@ -45,19 +45,33 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     };
     const DEFAULT_RANGE_SIZE = 1000000;
 
-    // Ensure Range partitions for BOTH min and max heights
+    // Ensure Range partitions for min, max, and min-1 (safety buffer for boundary blocks)
     for (const [schema, table] of tables) {
       const key = `${schema}.${table}`;
       const rangeSize = RANGE_SIZES[key] || DEFAULT_RANGE_SIZE;
 
-      // Ensure partition for minHeight (start of range)
+      // 1. Ensure partition for minHeight (start of range)
       await client.query(
         `SELECT util.ensure_partition_for_height($1, $2, $3)`,
         [schema, table, minHeight]
       );
-      // Ensure partition for maxHeight (end of range)
-      // Only if maxHeight is in a different partition bucket
-      if (Math.floor(minHeight / rangeSize) !== Math.floor(maxHeight / rangeSize)) {
+
+      // 2. Ensure partition for minHeight - 1 (for operations like missed_blocks referring back)
+      if (minHeight > 0) {
+        const prevHeight = minHeight - 1;
+        if (Math.floor(prevHeight / rangeSize) !== Math.floor(minHeight / rangeSize)) {
+          await client.query(
+            `SELECT util.ensure_partition_for_height($1, $2, $3)`,
+            [schema, table, prevHeight]
+          );
+        }
+      }
+
+      // 3. Ensure partition for maxHeight (end of range)
+      // Only if maxHeight is in a different partition bucket than both minHeight and minHeight-1
+      const minBucket = Math.floor(minHeight / rangeSize);
+      const maxBucket = Math.floor(maxHeight / rangeSize);
+      if (minBucket !== maxBucket) {
         await client.query(
           `SELECT util.ensure_partition_for_height($1, $2, $3)`,
           [schema, table, maxHeight]
