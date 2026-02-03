@@ -171,7 +171,15 @@ export async function bootstrapGenesis(genesisPath: string) {
 
 // Support standalone execution if called directly
 import { fileURLToPath } from 'node:url';
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+const isEntry = () => {
+    try {
+        return process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+    } catch {
+        return false;
+    }
+};
+
+if (isEntry()) {
     const args = process.argv.slice(2);
     const genesisPath = args[0] || process.env.GENESIS_PATH;
     if (genesisPath) {

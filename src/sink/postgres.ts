@@ -414,14 +414,15 @@ export class PostgresSink implements Sink {
       }
     }
 
-    // ✅ GOVERNANCE: Process EndBlock Events for Timestamps
+    // ✅ GOVERNANCE: Process EndBlock Events for Timestamps and Results
     // Timestamps like voting_end_time are often only found in EndBlock events, not in transactions.
     const endEvents = blockLine.block_results?.end_block_events ?? [];
     for (const ev of endEvents) {
-      if (ev.type === 'active_proposal' || ev.type === 'proposal_deposit' || ev.type === 'proposal_vote' || ev.type === 'inactive_proposal') {
-        const attrs = attrsToPairs(ev.attributes);
-        const pid = findAttr(attrs, 'proposal_id');
-        if (pid) {
+      const attrs = attrsToPairs(ev.attributes);
+      const pid = findAttr(attrs, 'proposal_id');
+
+      if (pid) {
+        if (ev.type === 'active_proposal' || ev.type === 'proposal_deposit' || ev.type === 'proposal_vote' || ev.type === 'inactive_proposal') {
           const votingStart = toDateFromTimestamp(findAttr(attrs, 'voting_period_start') || findAttr(attrs, 'voting_start_time'));
           const votingEnd = toDateFromTimestamp(findAttr(attrs, 'voting_period_end') || findAttr(attrs, 'voting_end_time'));
           const depositEnd = toDateFromTimestamp(findAttr(attrs, 'deposit_end_time'));
@@ -436,6 +437,32 @@ export class PostgresSink implements Sink {
               deposit_end: depositEnd
             } as any);
           }
+        }
+
+        // ✅ ENHANCEMENT: Final Tally Result extraction
+        if (ev.type === 'proposal_tally' || ev.type === 'inactive_proposal') {
+          const tally = {
+            yes: findAttr(attrs, 'yes') || findAttr(attrs, 'tally_yes'),
+            no: findAttr(attrs, 'no') || findAttr(attrs, 'tally_no'),
+            no_with_veto: findAttr(attrs, 'no_with_veto') || findAttr(attrs, 'tally_no_with_veto'),
+            abstain: findAttr(attrs, 'abstain') || findAttr(attrs, 'tally_abstain')
+          };
+          if (tally.yes || tally.no) {
+            govProposalsRows.push({
+              proposal_id: pid,
+              tally_result: tally
+            } as any);
+          }
+        }
+
+        // ✅ ENHANCEMENT: Execution Result tracking
+        if (ev.type === 'proposal_executed') {
+          const result = findAttr(attrs, 'result') || findAttr(attrs, 'proposal_result') || 'executed';
+          govProposalsRows.push({
+            proposal_id: pid,
+            status: result.toLowerCase().includes('pass') ? 'passed' : 'rejected',
+            executor_result: result
+          } as any);
         }
       }
     }
@@ -525,15 +552,24 @@ export class PostgresSink implements Sink {
             proposal_id: m.proposal_id,
             voter: m.voter,
             option: m.option?.toString() ?? 'VOTE_OPTION_UNSPECIFIED',
-            weight: null, // Simple votes have no weight
+            weight: "1.0", // ✅ FIX: Simple votes always have 1.0 weight
             height,
-            tx_hash
+            tx_hash,
+            metadata: m.metadata ?? null, // v1 support
           });
+          // ✅ ENHANCEMENT: Any vote implies the proposal is in voting period
+          if (m.proposal_id) {
+            govProposalsRows.push({
+              proposal_id: m.proposal_id,
+              status: 'voting_period'
+            } as any);
+          }
         }
 
         // 1b. WEIGHTED VOTE
         if (type === '/cosmos.gov.v1beta1.MsgVoteWeighted' || type === '/cosmos.gov.v1.MsgVoteWeighted') {
           const options = Array.isArray(m.options) ? m.options : [];
+          const metadata = m.metadata ?? null;
           for (const opt of options) {
             govVotesRows.push({
               proposal_id: m.proposal_id,
@@ -541,7 +577,8 @@ export class PostgresSink implements Sink {
               option: opt.option?.toString() ?? 'VOTE_OPTION_UNSPECIFIED',
               weight: opt.weight ?? '1.0', // Weight is a decimal string like "0.5"
               height,
-              tx_hash
+              tx_hash,
+              metadata,
             });
           }
           // ✅ ENHANCEMENT: Any vote implies the proposal is in voting period
@@ -598,8 +635,9 @@ export class PostgresSink implements Sink {
             const initialDeposit = m.initial_deposit ?? m.initialDeposit ?? null;
 
             // ✅ EXTRACTION: Changes (for Param Changes or legacy content)
+            // For v1, we store the full messages array. For v1beta1, we try to be specific.
             const content = m.content || (Array.isArray(m.messages) ? m.messages[0] : null);
-            const changes = content?.params ?? content?.changes ?? content?.plan ?? content?.msg ?? content?.msgs ?? null;
+            const changes = m.messages ?? content?.params ?? content?.changes ?? content?.plan ?? content?.msg ?? content?.msgs ?? content ?? null;
 
             // ✅ EXTRACTION: Timestamps from events (accurate vs block time)
             const attrs = attrsToPairs(event?.attributes);
@@ -610,8 +648,8 @@ export class PostgresSink implements Sink {
             govProposalsRows.push({
               proposal_id: pid,
               submitter,
-              title: m.content?.title ?? m.title ?? content?.title ?? '',
-              summary: m.content?.description ?? m.summary ?? content?.description ?? '',
+              title: m.title ?? m.content?.title ?? content?.title ?? '',
+              summary: m.summary ?? m.content?.description ?? content?.description ?? '',
               proposal_type: proposalType,
               submit_time: time,
               status: votingStart ? 'voting_period' : 'deposit_period',
@@ -620,6 +658,7 @@ export class PostgresSink implements Sink {
               voting_end: votingEnd,
               total_deposit: initialDeposit,
               changes: changes,
+              metadata: m.metadata ?? null,
             });
           }
         }
@@ -1923,12 +1962,19 @@ export class PostgresSink implements Sink {
     const client = await pool.connect();
 
     try {
-      const heights = snapshot.blocks.map(r => r.height);
-      const minH = Math.min(...heights);
-      const maxH = Math.max(...heights);
+      let maxH: number | null = null;
+      if (snapshot.blocks.length === 0) {
+        // If we are flushing but have no blocks (e.g. metadata only),
+        // skip partition check or use a fallback if absolutely needed.
+        await client.query('BEGIN');
+      } else {
+        const heights = snapshot.blocks.map(r => r.height);
+        const minH = Math.min(...heights);
+        maxH = Math.max(...heights);
 
-      await ensureCorePartitions(client, minH, maxH);
-      await client.query('BEGIN');
+        await ensureCorePartitions(client, minH, maxH);
+        await client.query('BEGIN');
+      }
 
       // 1. Standard
       await flushBlocks(client, snapshot.blocks);
@@ -2027,7 +2073,9 @@ export class PostgresSink implements Sink {
         wrapperEvents: snapshot.wrapperEvents
       });
 
-      await upsertProgress(client, this.cfg.pg?.progressId ?? 'default', maxH);
+      if (maxH != null) {
+        await upsertProgress(client, this.cfg.pg?.progressId ?? 'default', maxH);
+      }
       await client.query('COMMIT');
     } catch (e) {
       log.error(`[flush-error] rollback initiated: ${String(e)}`);

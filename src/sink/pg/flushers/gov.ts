@@ -52,11 +52,12 @@ export async function flushGovVotes(
     weight: string | null;
     height: number;
     tx_hash: string;
+    metadata?: string | null;
   }>,
 ) {
   if (!rows.length) return;
 
-  const columns = ['proposal_id', 'voter', 'option', 'weight', 'height', 'tx_hash'] as const;
+  const columns = ['proposal_id', 'voter', 'option', 'weight', 'height', 'tx_hash', 'metadata'] as const;
 
   const shaped = rows.map((r) => ({
     proposal_id: r.proposal_id.toString(),
@@ -65,6 +66,7 @@ export async function flushGovVotes(
     weight: r.weight,
     height: r.height,
     tx_hash: r.tx_hash,
+    metadata: r.metadata ?? null,
   }));
 
   await execBatchedInsert(client, 'gov.votes', columns as unknown as string[], shaped, 'ON CONFLICT DO NOTHING');
@@ -95,6 +97,9 @@ export async function upsertGovProposals(
     voting_end?: Date | null;
     total_deposit?: any | null;
     changes?: any | null;
+    metadata?: string | null;
+    tally_result?: any | null;
+    executor_result?: string | null;
   }>,
 ) {
   if (!rows.length) return;
@@ -109,7 +114,7 @@ export async function upsertGovProposals(
   const columns = [
     'proposal_id', 'submitter', 'title', 'summary', 'proposal_type',
     'status', 'submit_time', 'deposit_end', 'voting_start', 'voting_end',
-    'total_deposit', 'changes'
+    'total_deposit', 'changes', 'metadata', 'tally_result', 'executor_result'
   ] as const;
 
   const shaped = finalRows.map((r) => ({
@@ -125,6 +130,9 @@ export async function upsertGovProposals(
     voting_end: r.voting_end ? r.voting_end.toISOString() : null,
     total_deposit: r.total_deposit ? JSON.stringify(r.total_deposit) : null,
     changes: r.changes ? JSON.stringify(r.changes) : null,
+    metadata: r.metadata ?? null,
+    tally_result: r.tally_result ? JSON.stringify(r.tally_result) : null,
+    executor_result: r.executor_result ?? null,
   }));
 
   await execBatchedInsert(
@@ -133,16 +141,19 @@ export async function upsertGovProposals(
     columns as unknown as string[],
     shaped,
     `ON CONFLICT (proposal_id) DO UPDATE SET
-      submitter     = COALESCE(EXCLUDED.submitter, gov.proposals.submitter),
-      title         = COALESCE(EXCLUDED.title, gov.proposals.title),
-      summary       = COALESCE(EXCLUDED.summary, gov.proposals.summary),
-      proposal_type = COALESCE(EXCLUDED.proposal_type, gov.proposals.proposal_type),
-      status        = EXCLUDED.status,
-      submit_time   = COALESCE(EXCLUDED.submit_time, gov.proposals.submit_time),
-      deposit_end   = COALESCE(EXCLUDED.deposit_end, gov.proposals.deposit_end),
-      voting_start  = COALESCE(EXCLUDED.voting_start, gov.proposals.voting_start),
-      voting_end    = COALESCE(EXCLUDED.voting_end, gov.proposals.voting_end),
-      total_deposit = COALESCE(EXCLUDED.total_deposit, gov.proposals.total_deposit),
-      changes       = COALESCE(EXCLUDED.changes, gov.proposals.changes)`,
+      submitter       = COALESCE(EXCLUDED.submitter, gov.proposals.submitter),
+      title           = COALESCE(EXCLUDED.title, gov.proposals.title),
+      summary         = COALESCE(EXCLUDED.summary, gov.proposals.summary),
+      proposal_type   = COALESCE(EXCLUDED.proposal_type, gov.proposals.proposal_type),
+      status          = EXCLUDED.status,
+      submit_time     = COALESCE(EXCLUDED.submit_time, gov.proposals.submit_time),
+      deposit_end     = COALESCE(EXCLUDED.deposit_end, gov.proposals.deposit_end),
+      voting_start    = COALESCE(EXCLUDED.voting_start, gov.proposals.voting_start),
+      voting_end      = COALESCE(EXCLUDED.voting_end, gov.proposals.voting_end),
+      total_deposit   = COALESCE(EXCLUDED.total_deposit, gov.proposals.total_deposit),
+      changes         = COALESCE(EXCLUDED.changes, gov.proposals.changes),
+      metadata        = COALESCE(EXCLUDED.metadata, gov.proposals.metadata),
+      tally_result    = COALESCE(EXCLUDED.tally_result, gov.proposals.tally_result),
+      executor_result = COALESCE(EXCLUDED.executor_result, gov.proposals.executor_result)`,
   );
 }

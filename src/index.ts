@@ -20,6 +20,7 @@ import { retryMissingBlocks } from './runner/retryMissing.ts';
 import { followLoop } from './runner/follow.ts';
 import { bootstrapGenesis } from './scripts/genesis-bootstrap.ts';
 import { reconcileNegativeBalances } from './sink/pg/reconcile.ts';
+import { ensureCorePartitions } from './db/partitions.js';
 
 EventEmitter.defaultMaxListeners = 0;
 const log = getLogger('index');
@@ -56,9 +57,10 @@ async function main() {
         const explicitFrom = typeof cfg.from === 'number' ? cfg.from : (cfg.firstBlock as number | undefined);
         startFrom = last != null ? last + 1 : (explicitFrom ?? earliest);
         log.info(`[resume] last_height=${last ?? 'null'} → start from ${startFrom}`);
-      } finally {
-        await closePgPool();
+      } catch (err) {
+        log.warn(`[resume] check failed: ${err instanceof Error ? err.message : String(err)}`);
       }
+      // 🛡️ DO NOT closePgPool() here! The pool is needed for the rest of the app.
     } else {
       log.warn('[resume] requested, but sinkKind is not postgres — skipping.');
     }
@@ -237,6 +239,9 @@ async function main() {
     const pool = getPgPool();
     const client = await pool.connect();
     try {
+      // ✅ FIX: Ensure partitions exist for the current height before inserting parameters
+      await ensureCorePartitions(client, startFrom, startFrom);
+
       const modules = [
         { name: 'auth', path: '/cosmos.auth.v1beta1.Query/Params', resp: 'cosmos.auth.v1beta1.QueryParamsResponse' },
         { name: 'bank', path: '/cosmos.bank.v1beta1.Query/Params', resp: 'cosmos.bank.v1beta1.QueryParamsResponse' },
