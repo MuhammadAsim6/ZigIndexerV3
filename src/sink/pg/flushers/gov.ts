@@ -52,12 +52,11 @@ export async function flushGovVotes(
     weight: string | null;
     height: number;
     tx_hash: string;
-    metadata?: string | null;
   }>,
 ) {
   if (!rows.length) return;
 
-  const columns = ['proposal_id', 'voter', 'option', 'weight', 'height', 'tx_hash', 'metadata'] as const;
+  const columns = ['proposal_id', 'voter', 'option', 'weight', 'height', 'tx_hash'] as const;
 
   const shaped = rows.map((r) => ({
     proposal_id: r.proposal_id.toString(),
@@ -66,7 +65,6 @@ export async function flushGovVotes(
     weight: r.weight,
     height: r.height,
     tx_hash: r.tx_hash,
-    metadata: r.metadata ?? null,
   }));
 
   await execBatchedInsert(client, 'gov.votes', columns as unknown as string[], shaped, 'ON CONFLICT DO NOTHING');
@@ -105,9 +103,33 @@ export async function upsertGovProposals(
   if (!rows.length) return;
 
   // 🛡️ PRE-MERGE: Prevent "ON CONFLICT DO UPDATE command cannot affect row a second time"
+  // **FIX**: Merge values from multiple rows for the same proposal_id, preferring non-null values
   const mergedMap = new Map<string, any>();
   for (const row of rows) {
-    mergedMap.set(row.proposal_id.toString(), row); // Keep latest
+    const key = row.proposal_id.toString();
+    const existing = mergedMap.get(key);
+    if (existing) {
+      // Merge: prefer new non-null values over existing null values
+      mergedMap.set(key, {
+        proposal_id: row.proposal_id,
+        submitter: row.submitter ?? existing.submitter,
+        title: row.title ?? existing.title,
+        summary: row.summary ?? existing.summary,
+        proposal_type: row.proposal_type ?? existing.proposal_type,
+        status: row.status ?? existing.status, // Latest status wins (but don't downgrade with null)
+        submit_time: row.submit_time ?? existing.submit_time,
+        deposit_end: row.deposit_end ?? existing.deposit_end,
+        voting_start: row.voting_start ?? existing.voting_start,
+        voting_end: row.voting_end ?? existing.voting_end,
+        total_deposit: row.total_deposit ?? existing.total_deposit,
+        changes: row.changes ?? existing.changes,
+        metadata: row.metadata ?? existing.metadata,
+        tally_result: row.tally_result ?? existing.tally_result,
+        executor_result: row.executor_result ?? existing.executor_result,
+      });
+    } else {
+      mergedMap.set(key, { ...row });
+    }
   }
   const finalRows = Array.from(mergedMap.values());
 

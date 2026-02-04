@@ -28,8 +28,9 @@ export function createSink(cfg: SinkConfig): Sink {
       return new PostgresSink({
         kind: 'postgres',
         pg: cfg.pg ?? {},
-        mode: (cfg as any).pgMode ?? 'batch-insert',
-        batchSizes: (cfg as any).batchSizes,
+        mode: cfg.pg?.mode ?? 'batch-insert',
+        batchSizes: cfg.batchSizes,
+        rpcUrl: cfg.rpcUrl ?? '',
       });
     case 'clickhouse':
       return new ClickhouseSink(cfg);

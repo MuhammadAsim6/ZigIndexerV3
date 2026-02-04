@@ -30,296 +30,321 @@ async function main() {
   log.info(`[start] Cosmos Indexer v1.1.0-reconcile-refactor starting...`);
   printConfig(cfg);
 
-  // 🛡️ INITIALIZE DB POOL EARLY
-  // We need the pool ready for genesis bootstrap and resume checks
-  if (cfg.sinkKind === 'postgres') {
-    createPgPool({ ...cfg.pg, applicationName: 'cosmos-indexer' });
-  }
+  let decodePool: any = null;
+  let sink: any = null;
 
-  // 🛡️ GENESIS BOOTSTRAP (Auto-run if genesis.json exists)
-  const genesisPath = process.env.GENESIS_PATH || '/usr/src/app/genesis.json';
-  await bootstrapGenesis(genesisPath);
+  // Cleanup handler for signals and catch blocks
+  const gracefulCleanup = async (exitCode: number) => {
+    await cleanup(decodePool, sink);
+    process.exit(exitCode);
+  };
 
-  const rpc = createRpcClientFromConfig(cfg);
-  const status = await rpc.fetchStatus();
-
-  let startFrom = cfg.from as number | undefined;
-  const wantResume =
-    !startFrom || cfg.resume === true || (typeof cfg.from === 'string' && cfg.from.toLowerCase() === 'resume');
-
-  if (wantResume) {
-    if (cfg.sinkKind === 'postgres') {
-      // Pool is already created above
-      const pool = getPgPool();
-      try {
-        const last = await getProgress(pool, cfg.pg?.progressId ?? 'default');
-        const earliest = Number(status['sync_info']['earliest_block_height']);
-        const explicitFrom = typeof cfg.from === 'number' ? cfg.from : (cfg.firstBlock as number | undefined);
-        startFrom = last != null ? last + 1 : (explicitFrom ?? earliest);
-        log.info(`[resume] last_height=${last ?? 'null'} → start from ${startFrom}`);
-      } catch (err) {
-        log.warn(`[resume] check failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-      // 🛡️ DO NOT closePgPool() here! The pool is needed for the rest of the app.
-    } else {
-      log.warn('[resume] requested, but sinkKind is not postgres — skipping.');
-    }
-  }
-
-  let endHeight = cfg.to as number | undefined;
-  if (!endHeight) {
-    endHeight = Number(status['sync_info']['latest_block_height']);
-    log.info(`[config] --to not provided → using latest height ${endHeight}`);
-  }
-  if (startFrom == null || endHeight == null) throw new Error('Both startFrom and endHeight must be resolved.');
-  log.info(`[start] from ${startFrom} to ${endHeight} (incl.)`);
-
-  const protoDir = process.env.PROTO_DIR || path.join(process.cwd(), 'protos');
-  log.info(`[proto] dir = ${protoDir}`);
-
-  const poolSize = Math.max(1, Math.min(cfg.concurrency ?? 12, 12));
-  const decodePool = createTxDecodePool(poolSize, { protoDir });
-
-  const sink = createSink({
-    kind: cfg.sinkKind,
-    outPath: cfg.outPath,
-    flushEvery: cfg.flushEvery ?? 1,
-    pg: cfg.pg,
-    batchSizes: {
-      blocks: cfg.pg?.batchBlocks,
-      txs: cfg.pg?.batchTxs,
-      msgs: cfg.pg?.batchMsgs,
-      events: cfg.pg?.batchEvents,
-      attrs: cfg.pg?.batchAttrs,
-    },
-    rpcUrl: cfg.rpcUrl, // ✅ ADDED: Pass RPC URL to Sink
+  process.on('SIGINT', () => {
+    log.info('SIGINT received. Cleaning up...');
+    gracefulCleanup(0);
   });
-  await sink.init();
+  process.on('SIGTERM', () => {
+    log.info('SIGTERM received. Cleaning up...');
+    gracefulCleanup(0);
+  });
 
-  // 🛡️ INITIAL SYNC: Fetch validators on startup
-  if (cfg.sinkKind === 'postgres') {
+  try {
+    // 🛡️ INITIALIZE DB POOL EARLY
+    if (cfg.sinkKind === 'postgres') {
+      createPgPool({ ...cfg.pg, applicationName: 'cosmos-indexer' });
+    }
+
+    // 🛡️ GENESIS BOOTSTRAP (Auto-run if genesis.json exists)
+    const genesisPath = process.env.GENESIS_PATH || '/usr/src/app/genesis.json';
+    await bootstrapGenesis(genesisPath);
+
+    const rpc = createRpcClientFromConfig(cfg);
+    const status = await rpc.fetchStatus();
+
+    let startFrom = cfg.from as number | undefined;
+    const wantResume =
+      !startFrom || cfg.resume === true || (typeof cfg.from === 'string' && cfg.from.toLowerCase() === 'resume');
+
+    if (wantResume) {
+      if (cfg.sinkKind === 'postgres') {
+        const pool = getPgPool();
+        try {
+          const last = await getProgress(pool, cfg.pg?.progressId ?? 'default');
+          const earliest = Number(status['sync_info']['earliest_block_height']);
+          const explicitFrom = typeof cfg.from === 'number' ? cfg.from : (cfg.firstBlock as number | undefined);
+          startFrom = last != null ? last + 1 : (explicitFrom ?? earliest);
+          log.info(`[resume] last_height=${last ?? 'null'} → start from ${startFrom}`);
+        } catch (err) {
+          log.warn(`[resume] check failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      } else {
+        log.warn('[resume] requested, but sinkKind is not postgres — skipping.');
+      }
+    }
+
+    let endHeight = cfg.to as number | undefined;
+    if (!endHeight) {
+      endHeight = Number(status['sync_info']['latest_block_height']);
+      log.info(`[config] --to not provided → using latest height ${endHeight}`);
+    }
+    if (startFrom == null || endHeight == null) throw new Error('Both startFrom and endHeight must be resolved.');
+    log.info(`[start] from ${startFrom} to ${endHeight} (incl.)`);
+
+    const protoDir = process.env.PROTO_DIR || path.join(process.cwd(), 'protos');
+    log.info(`[proto] dir = ${protoDir}`);
+
+    const poolSize = Math.max(1, Math.min(cfg.concurrency ?? 12, 12));
+    decodePool = createTxDecodePool(poolSize, { protoDir });
+
+    sink = createSink({
+      kind: cfg.sinkKind,
+      outPath: cfg.outPath,
+      flushEvery: cfg.flushEvery ?? 1,
+      pg: cfg.pg,
+      batchSizes: {
+        blocks: cfg.pg?.batchBlocks,
+        txs: cfg.pg?.batchTxs,
+        msgs: cfg.pg?.batchMsgs,
+        events: cfg.pg?.batchEvents,
+        attrs: cfg.pg?.batchAttrs,
+      },
+      rpcUrl: cfg.rpcUrl,
+    });
+    await sink.init();
+
+    // 🛡️ INITIAL SYNC: Fetch validators on startup
+    if (cfg.sinkKind === 'postgres') {
+      try {
+        log.info('[start] syncing staking validators…');
+        const protoRoot = await loadProtoRoot(protoDir);
+        const pool = getPgPool();
+        const client = await pool.connect();
+        try {
+          const stakingRes = await rpc.queryAbci('/cosmos.staking.v1beta1.Query/Validators');
+          if (stakingRes?.value) {
+            const decoded = decodeAnyWithRoot('cosmos.staking.v1beta1.QueryValidatorsResponse', base64ToBytes(stakingRes.value), protoRoot);
+            const stakingVals = Array.isArray(decoded.validators) ? decoded.validators : [];
+
+            if (stakingVals.length > 0) {
+              log.info(`[start] found ${stakingVals.length} staking validators`);
+            }
+
+            const rows = [];
+            for (const v of (stakingVals as any[])) {
+              const opAddr = v.operator_address || v.operatorAddress || v.address || v.operator_addr;
+              if (!opAddr) continue;
+
+              let consAddr: string | null = null;
+              const pubAny = v.consensus_pubkey || v.consensusPubkey || v.consensusPubKey || v.consensus_pub_key;
+              if (pubAny?.value) {
+                try {
+                  let rawVal: Uint8Array;
+                  if (typeof pubAny.value === 'string') {
+                    rawVal = base64ToBytes(pubAny.value);
+                  } else if (typeof pubAny.value === 'object' && pubAny.value !== null) {
+                    rawVal = new Uint8Array(Object.values(pubAny.value));
+                  } else {
+                    throw new Error('Unsupported pubAny.value type: ' + typeof pubAny.value);
+                  }
+
+                  const decodedPub = decodeAnyWithRoot(pubAny['@type'] || pubAny.type_url || pubAny.typeUrl, rawVal, protoRoot);
+                  const rawKey = decodedPub.key || decodedPub.value;
+
+                  if (rawKey) {
+                    const rawKeyB64 = (typeof rawKey === 'string')
+                      ? rawKey
+                      : Buffer.from(Object.values(rawKey) as any).toString('base64');
+
+                    consAddr = deriveConsensusAddress(rawKeyB64);
+                    log.info(`[start] derived consAddr ${consAddr} for ${opAddr}`);
+                  }
+                } catch (e) {
+                  log.warn(`Failed to derive consAddr for ${opAddr}: ${e}`);
+                }
+              }
+
+              const commRates = v.commission?.commissionRates || v.commission?.commission_rates;
+
+              const toDecimal = (val: string | number | null | undefined): string | null => {
+                if (val == null) return null;
+                try {
+                  const str = String(val);
+                  if (str.includes('.') && parseFloat(str) < 100) return str;
+                  const num = BigInt(str);
+                  const divisor = BigInt('1000000000000000000');
+                  const intPart = num / divisor;
+                  const fracPart = num % divisor;
+                  const fracStr = fracPart.toString().padStart(18, '0');
+                  return `${intPart}.${fracStr}`;
+                } catch { return null; }
+              };
+
+              let rawPubkeyB64: string | null = null;
+              if (pubAny?.value) {
+                try {
+                  if (typeof pubAny.value === 'string') {
+                    rawPubkeyB64 = pubAny.value;
+                  } else if (typeof pubAny.value === 'object' && pubAny.value !== null) {
+                    rawPubkeyB64 = Buffer.from(Object.values(pubAny.value) as any).toString('base64');
+                  }
+                } catch (e) { /* ignore */ }
+              }
+
+              rows.push({
+                operator_address: opAddr,
+                consensus_address: consAddr,
+                consensus_pubkey: rawPubkeyB64,
+                moniker: v.description?.moniker || `Validator ${String(opAddr).slice(-8)}`,
+                website: v.description?.website,
+                details: v.description?.details,
+                commission_rate: toDecimal(commRates?.rate || commRates?.Rate),
+                max_commission_rate: toDecimal(commRates?.maxRate || commRates?.max_rate || commRates?.MaxRate),
+                max_change_rate: toDecimal(commRates?.maxChangeRate || commRates?.max_change_rate || commRates?.MaxChangeRate),
+                min_self_delegation: v.min_self_delegation || v.minSelfDelegation,
+                status: v.status,
+                updated_at_height: startFrom,
+                updated_at_time: new Date()
+              });
+            }
+
+            if (rows.length > 0) {
+              await client.query('BEGIN');
+              await client.query('DELETE FROM core.validators');
+              await upsertValidators(client, rows);
+              await client.query('COMMIT');
+              log.info(`[start] synced ${rows.length} validators`);
+            }
+          }
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        log.warn('[start] validator sync failed:', err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    // 🛡️ RECONCILIATION LOOP
+    if (cfg.sinkKind === 'postgres') {
+      setInterval(async () => {
+        try {
+          const pool = getPgPool();
+          const client = await pool.connect();
+          try {
+            await reconcileNegativeBalances(client, rpc, await loadProtoRoot(protoDir));
+          } finally {
+            client.release();
+          }
+        } catch (err) {
+          log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
+        }
+      }, 5 * 60 * 1000);
+    }
+
+    // 🛡️ INITIAL SYNC: Fetch network parameters
     try {
-      log.info('[start] syncing staking validators…');
-      const protoRoot = await loadProtoRoot(protoDir);
       const pool = getPgPool();
       const client = await pool.connect();
       try {
-        const stakingRes = await rpc.queryAbci('/cosmos.staking.v1beta1.Query/Validators');
-        if (stakingRes?.value) {
-          const decoded = decodeAnyWithRoot('cosmos.staking.v1beta1.QueryValidatorsResponse', base64ToBytes(stakingRes.value), protoRoot);
-          const stakingVals = Array.isArray(decoded.validators) ? decoded.validators : [];
+        await ensureCorePartitions(client, startFrom, startFrom);
 
-          if (stakingVals.length > 0) {
-            log.info(`[start] found ${stakingVals.length} staking validators`);
-            log.info('[start] sample validator keys: ' + Object.keys(stakingVals[0]).join(', '));
-            log.info('[start] sample validator JSON: ' + JSON.stringify(stakingVals[0]));
-          }
+        const modules = [
+          { name: 'auth', path: '/cosmos.auth.v1beta1.Query/Params', resp: 'cosmos.auth.v1beta1.QueryParamsResponse' },
+          { name: 'bank', path: '/cosmos.bank.v1beta1.Query/Params', resp: 'cosmos.bank.v1beta1.QueryParamsResponse' },
+          { name: 'staking', path: '/cosmos.staking.v1beta1.Query/Params', resp: 'cosmos.staking.v1beta1.QueryParamsResponse' },
+          { name: 'distribution', path: '/cosmos.distribution.v1beta1.Query/Params', resp: 'cosmos.distribution.v1beta1.QueryParamsResponse' },
+          { name: 'mint', path: '/cosmos.mint.v1beta1.Query/Params', resp: 'cosmos.mint.v1beta1.QueryParamsResponse' },
+          { name: 'slashing', path: '/cosmos.slashing.v1beta1.Query/Params', resp: 'cosmos.slashing.v1beta1.QueryParamsResponse' },
+          { name: 'factory', path: '/zigchain.factory.Query/Params', resp: 'zigchain.factory.QueryParamsResponse' },
+          { name: 'gov', path: '/cosmos.gov.v1.Query/Params', resp: 'cosmos.gov.v1.QueryParamsResponse' },
+        ];
 
-          const rows = [];
-          for (const v of (stakingVals as any[])) {
-            const opAddr = v.operator_address || v.operatorAddress || v.address || v.operator_addr;
-            if (!opAddr) continue;
-
-            let consAddr: string | null = null;
-            const pubAny = v.consensus_pubkey || v.consensusPubkey || v.consensusPubKey || v.consensus_pub_key;
-            if (pubAny?.value) {
-              try {
-                let rawVal: Uint8Array;
-                if (typeof pubAny.value === 'string') {
-                  rawVal = base64ToBytes(pubAny.value);
-                } else if (typeof pubAny.value === 'object' && pubAny.value !== null) {
-                  rawVal = new Uint8Array(Object.values(pubAny.value));
-                } else {
-                  throw new Error('Unsupported pubAny.value type: ' + typeof pubAny.value);
+        const rows = [];
+        for (const mod of modules) {
+          try {
+            const abci = await rpc.queryAbci(mod.path);
+            if (abci?.value) {
+              const decoded = await decodePool.decodeGeneric(mod.resp, abci.value);
+              const params = decoded.params || decoded.voting_params || decoded.tally_params || decoded.deposit_params || decoded;
+              if (params) {
+                // ✅ ENHANCEMENT: Update governance parameters helper for accurate fallbacks
+                if (mod.name === 'gov') {
+                  try {
+                    const { updateGovParams, parseDurationToMs } = await import('./utils/gov_params.js');
+                    updateGovParams({
+                      maxDepositPeriodMs: parseDurationToMs(params.max_deposit_period) ?? undefined,
+                      votingPeriodMs: parseDurationToMs(params.voting_period) ?? undefined,
+                      expeditedVotingPeriodMs: parseDurationToMs(params.expedited_voting_period) ?? undefined,
+                    });
+                    log.info(`[start] synchronized gov params: maxDeposit=${params.max_deposit_period}, voting=${params.voting_period}`);
+                  } catch (e) {
+                    log.warn(`[start] failed to update gov params helper: ${e}`);
+                  }
                 }
 
-                const decodedPub = decodeAnyWithRoot(pubAny['@type'] || pubAny.type_url || pubAny.typeUrl, rawVal, protoRoot);
-                const rawKey = decodedPub.key || decodedPub.value;
-
-                if (rawKey) {
-                  // If rawKey is a byte object, convert back to b64 for deriveConsensusAddress
-                  const rawKeyB64 = (typeof rawKey === 'string')
-                    ? rawKey
-                    : Buffer.from(Object.values(rawKey) as any).toString('base64');
-
-                  consAddr = deriveConsensusAddress(rawKeyB64);
-                  log.info(`[start] derived consAddr ${consAddr} for ${opAddr}`);
-                }
-              } catch (e) {
-                log.warn(`Failed to derive consAddr for ${opAddr}: ${e}`);
+                rows.push({
+                  height: startFrom,
+                  time: new Date(),
+                  module: mod.name,
+                  param_key: '_all',
+                  old_value: null,
+                  new_value: params
+                });
               }
-            } else {
-              log.info(`[start] no consensus pubkey for ${opAddr}`);
             }
-
-            // Extract commission rates (handle both camelCase and snake_case)
-            const commRates = v.commission?.commissionRates || v.commission?.commission_rates;
-
-            // Helper to convert 18-decimal integer to decimal (e.g., "50000000000000000" -> "0.05")
-            const toDecimal = (val: string | number | null | undefined): string | null => {
-              if (val == null) return null;
-              try {
-                const str = String(val);
-                // If already looks like a decimal, return as-is
-                if (str.includes('.') && parseFloat(str) < 100) return str;
-                // Otherwise divide by 10^18
-                const num = BigInt(str);
-                const divisor = BigInt('1000000000000000000');
-                const intPart = num / divisor;
-                const fracPart = num % divisor;
-                const fracStr = fracPart.toString().padStart(18, '0');
-                return `${intPart}.${fracStr}`;
-              } catch { return null; }
-            };
-
-            // Store raw pubkey for reference
-            let rawPubkeyB64: string | null = null;
-            if (pubAny?.value) {
-              try {
-                if (typeof pubAny.value === 'string') {
-                  rawPubkeyB64 = pubAny.value;
-                } else if (typeof pubAny.value === 'object' && pubAny.value !== null) {
-                  rawPubkeyB64 = Buffer.from(Object.values(pubAny.value) as any).toString('base64');
-                }
-              } catch (e) { /* ignore */ }
-            }
-
-            rows.push({
-              operator_address: opAddr,
-              consensus_address: consAddr,
-              consensus_pubkey: rawPubkeyB64,
-              moniker: v.description?.moniker || `Validator ${String(opAddr).slice(-8)}`,
-              website: v.description?.website,
-              details: v.description?.details,
-              commission_rate: toDecimal(commRates?.rate || commRates?.Rate),
-              max_commission_rate: toDecimal(commRates?.maxRate || commRates?.max_rate || commRates?.MaxRate),
-              max_change_rate: toDecimal(commRates?.maxChangeRate || commRates?.max_change_rate || commRates?.MaxChangeRate),
-              min_self_delegation: v.min_self_delegation || v.minSelfDelegation,
-              status: v.status,
-              updated_at_height: startFrom,
-              updated_at_time: new Date()
-            });
+          } catch (e) {
+            log.debug(`[start] skip module ${mod.name}`);
           }
+        }
 
-          if (rows.length > 0) {
-            await client.query('BEGIN');
-            await client.query('DELETE FROM core.validators');
-            await upsertValidators(client, rows);
-            await client.query('COMMIT');
-            log.info(`[start] synced ${rows.length} validators`);
-          }
+        if (rows.length > 0) {
+          const { flushNetworkParams } = await import('./sink/pg/flushers/params.js');
+          await client.query('BEGIN');
+          await flushNetworkParams(client, rows);
+          await client.query('COMMIT');
+          log.info(`[start] synced parameters for ${rows.length} modules`);
         }
       } finally {
         client.release();
       }
     } catch (err) {
-      log.warn('[start] validator sync failed:', err instanceof Error ? err.message : String(err));
+      log.warn('[start] params sync failed');
     }
-  }
 
-  // 🛡️ RECONCILIATION LOOP: Periodically check for negative balances
-  if (cfg.sinkKind === 'postgres') {
-    setInterval(async () => {
-      try {
-        const pool = getPgPool();
-        const client = await pool.connect();
-        try {
-          await reconcileNegativeBalances(client, rpc, await loadProtoRoot(protoDir));
-        } finally {
-          client.release();
-        }
-      } catch (err) {
-        log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
-      }
-    }, 5 * 60 * 1000);
-  }
-
-  // 🛡️ INITIAL SYNC: Fetch network parameters
-  try {
-    const pool = getPgPool();
-    const client = await pool.connect();
-    try {
-      // ✅ FIX: Ensure partitions exist for the current height before inserting parameters
-      await ensureCorePartitions(client, startFrom, startFrom);
-
-      const modules = [
-        { name: 'auth', path: '/cosmos.auth.v1beta1.Query/Params', resp: 'cosmos.auth.v1beta1.QueryParamsResponse' },
-        { name: 'bank', path: '/cosmos.bank.v1beta1.Query/Params', resp: 'cosmos.bank.v1beta1.QueryParamsResponse' },
-        { name: 'staking', path: '/cosmos.staking.v1beta1.Query/Params', resp: 'cosmos.staking.v1beta1.QueryParamsResponse' },
-        { name: 'distribution', path: '/cosmos.distribution.v1beta1.Query/Params', resp: 'cosmos.distribution.v1beta1.QueryParamsResponse' },
-        { name: 'mint', path: '/cosmos.mint.v1beta1.Query/Params', resp: 'cosmos.mint.v1beta1.QueryParamsResponse' },
-        { name: 'slashing', path: '/cosmos.slashing.v1beta1.Query/Params', resp: 'cosmos.slashing.v1beta1.QueryParamsResponse' },
-        { name: 'factory', path: '/zigchain.factory.Query/Params', resp: 'zigchain.factory.QueryParamsResponse' },
-        { name: 'gov', path: '/cosmos.gov.v1.Query/Params', resp: 'cosmos.gov.v1.QueryParamsResponse' },
-      ];
-
-      const rows = [];
-      for (const mod of modules) {
-        try {
-          const abci = await rpc.queryAbci(mod.path);
-          if (abci?.value) {
-            const decoded = await decodePool.decodeGeneric(mod.resp, abci.value);
-            const params = decoded.params || decoded.voting_params || decoded.tally_params || decoded.deposit_params || decoded;
-            if (params) {
-              rows.push({
-                height: startFrom,
-                time: new Date(),
-                module: mod.name,
-                param_key: '_all',
-                old_value: null,
-                new_value: params
-              });
-            }
-          }
-        } catch (e) {
-          log.debug(`[start] skip module ${mod.name}`);
-        }
-      }
-
-      if (rows.length > 0) {
-        const { flushNetworkParams } = await import('./sink/pg/flushers/params.js');
-        await client.query('BEGIN');
-        await flushNetworkParams(client, rows);
-        await client.query('COMMIT');
-        log.info(`[start] synced parameters for ${rows.length} modules`);
-      }
-    } finally {
-      client.release();
-    }
-  } catch (err) {
-    log.warn('[start] params sync failed');
-  }
-
-  const backfill = await syncRange(rpc, decodePool, sink, {
-    from: startFrom,
-    to: endHeight,
-    concurrency: cfg.concurrency,
-    progressEveryBlocks: cfg.progressEveryBlocks,
-    progressIntervalSec: cfg.progressIntervalSec,
-    caseMode: cfg.caseMode,
-  });
-
-  log.info(`[done-range] processed ${backfill.processed} blocks`);
-
-  if (cfg.sinkKind === 'postgres') {
-    await retryMissingBlocks(rpc, decodePool, sink, {
-      concurrency: Math.max(1, Math.min(cfg.concurrency ?? 8, 8)),
-      caseMode: cfg.caseMode,
-    });
-  }
-
-  if (cfg.follow !== false) {
-    const pollMs = cfg.followIntervalMs ?? 1500;
-    await followLoop(rpc, decodePool, sink, {
-      startNext: endHeight + 1,
-      pollMs,
+    const backfill = await syncRange(rpc, decodePool, sink, {
+      from: startFrom,
+      to: endHeight,
       concurrency: cfg.concurrency,
+      progressEveryBlocks: cfg.progressEveryBlocks,
+      progressIntervalSec: cfg.progressIntervalSec,
       caseMode: cfg.caseMode,
-      missingRetryIntervalMs: cfg.missingRetryIntervalMs,
     });
-  }
 
-  await cleanup(decodePool, sink);
+    log.info(`[done-range] processed ${backfill.processed} blocks`);
+
+    if (cfg.sinkKind === 'postgres') {
+      await retryMissingBlocks(rpc, decodePool, sink, {
+        concurrency: Math.max(1, Math.min(cfg.concurrency ?? 8, 8)),
+        caseMode: cfg.caseMode,
+      });
+    }
+
+    if (cfg.follow !== false) {
+      const pollMs = cfg.followIntervalMs ?? 1500;
+      await followLoop(rpc, decodePool, sink, {
+        startNext: endHeight + 1,
+        pollMs,
+        concurrency: cfg.concurrency,
+        caseMode: cfg.caseMode,
+        missingRetryIntervalMs: cfg.missingRetryIntervalMs,
+      });
+    }
+
+    await cleanup(decodePool, sink);
+  } catch (e) {
+    const msg = e instanceof Error ? e.stack || e.message : String(e);
+    log.error(msg);
+    await gracefulCleanup(1);
+  }
 }
 
 async function cleanup(decodePool: any, sink: any) {
@@ -336,11 +361,4 @@ async function cleanup(decodePool: any, sink: any) {
   }
 }
 
-process.on('SIGINT', () => process.exit(0));
-process.on('SIGTERM', () => process.exit(0));
-
-main().catch((e) => {
-  const msg = e instanceof Error ? e.stack || e.message : String(e);
-  getLogger('index').error(msg);
-  process.exit(1);
-});
+main();

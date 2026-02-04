@@ -221,18 +221,21 @@ CREATE TABLE stake.distribution_events (
 -- 4) GOVERNANCE
 -- ============================================================================
 CREATE TABLE gov.proposals (
-    proposal_id   BIGINT PRIMARY KEY,
-    submitter     TEXT NULL,
-    title         TEXT NULL,
-    summary       TEXT NULL,
-    proposal_type TEXT NULL,
-    status        proposal_status NOT NULL,
-    deposit_end   TIMESTAMPTZ NULL,
-    voting_start  TIMESTAMPTZ NULL,
-    voting_end    TIMESTAMPTZ NULL,
-    total_deposit JSONB NULL,
-    changes       JSONB NULL,
-    submit_time   TIMESTAMPTZ NULL
+    proposal_id     BIGINT PRIMARY KEY,
+    submitter       TEXT NULL,
+    title           TEXT NULL,
+    summary         TEXT NULL,
+    proposal_type   TEXT NULL,
+    status          proposal_status NOT NULL,
+    deposit_end     TIMESTAMPTZ NULL,
+    voting_start    TIMESTAMPTZ NULL,
+    voting_end      TIMESTAMPTZ NULL,
+    total_deposit   JSONB NULL,
+    changes         JSONB NULL,
+    submit_time     TIMESTAMPTZ NULL,
+    metadata        TEXT NULL,          -- v1 support
+    tally_result    JSONB NULL,         -- Final tally when voting ends
+    executor_result TEXT NULL           -- Execution result for passed proposals
 );
 
 CREATE TABLE gov.deposits (

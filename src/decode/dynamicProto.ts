@@ -65,7 +65,7 @@ export async function loadProtoRootWithProgress(
   }
 
   root.resolveAll();
-  log.debug('Loaded proto root', { totalFiles: total });
+  log.debug('Loaded proto root', { totalFiles: total, dir: protoDir });
   return root;
 }
 
