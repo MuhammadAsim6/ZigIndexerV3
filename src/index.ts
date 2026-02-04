@@ -19,7 +19,7 @@ import { syncRange } from './runner/syncRange.ts';
 import { retryMissingBlocks } from './runner/retryMissing.ts';
 import { followLoop } from './runner/follow.ts';
 import { bootstrapGenesis } from './scripts/genesis-bootstrap.ts';
-import { reconcileNegativeBalances } from './sink/pg/reconcile.ts';
+import { reconcileNegativeBalances, reconcileGovProposalTimestamps } from './sink/pg/reconcile.ts';
 import { ensureCorePartitions } from './db/partitions.js';
 
 EventEmitter.defaultMaxListeners = 0;
@@ -231,6 +231,7 @@ async function main() {
           const client = await pool.connect();
           try {
             await reconcileNegativeBalances(client, rpc, await loadProtoRoot(protoDir));
+            await reconcileGovProposalTimestamps(client, rpc);
           } finally {
             client.release();
           }

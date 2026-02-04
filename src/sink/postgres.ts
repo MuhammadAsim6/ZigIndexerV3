@@ -69,9 +69,6 @@ import { flushZigchainData } from './pg/flushers/zigchain.js';
 // ✅ WASM DEX Swap Analytics
 import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js';
 
-// ✅ Specialized WASM Analytics
-import { flushWasmAnalytics } from './pg/flushers/wasm_analytics.js';
-
 // ✅ Unknown Messages Quarantine
 import { flushUnknownMessages } from './pg/flushers/unknown_msgs.js';
 
@@ -180,10 +177,6 @@ export class PostgresSink implements Sink {
   private bufWasmSwaps: any[] = [];
   private bufFactoryTokens: any[] = [];
   private bufWrapperEvents: any[] = [];
-
-  // ✅ Specialized WASM Analytics
-  private bufWasmOracleUpdates: any[] = [];
-  private bufWasmTokenEvents: any[] = [];
 
   // ✅ Unknown Messages Quarantine
   private bufUnknownMsgs: any[] = [];
@@ -362,8 +355,6 @@ export class PostgresSink implements Sink {
     const unknownMsgsRows: any[] = [];
     const factorySupplyEventsRows: any[] = [];
     const wrapperEventsRows: any[] = [];
-    const wasmOracleUpdatesRows: any[] = [];
-    const wasmTokenEventsRows: any[] = [];
 
     // 🟢 BANK BALANCE DELTAS (Helper)
     const extractBalanceDeltas = (evType: string, attrsPairs: { key: string, value: string | null }[], tx_hash?: string, msg_index?: number, event_index?: number) => {
@@ -1852,36 +1843,7 @@ export class PostgresSink implements Sink {
             }
           }
 
-          // ✅ Phase 3: Specialized WASM Analytics Dispatcher
-          if (event_type === 'wasm-temporal_numeric_value_update') {
-            const contract = findAttr(attrsPairs, 'contract') || findAttr(attrsPairs, '_contract_address');
-            const key = findAttr(attrsPairs, 'key');
-            const value = findAttr(attrsPairs, 'value');
-            if (contract && key && value) {
-              wasmOracleUpdatesRows.push({
-                height, tx_hash, msg_index, contract, key,
-                value: parseFloat(value) || null
-              });
-            }
-          }
-
-          if (event_type === 'wasm-token_minted' || event_type === 'wasm-token_burned' || event_type === 'wasm-token_transferred') {
-            const contract = findAttr(attrsPairs, 'contract') || findAttr(attrsPairs, '_contract_address');
-            const amountAttr = findAttr(attrsPairs, 'amount');
-            if (contract && amountAttr) {
-              let action = 'transfer';
-              if (event_type.includes('mint')) action = 'mint';
-              else if (event_type.includes('burn')) action = 'burn';
-
-              wasmTokenEventsRows.push({
-                height, tx_hash, msg_index, contract,
-                action,
-                amount: toBigIntStr(amountAttr),
-                recipient: findAttr(attrsPairs, 'recipient'),
-                sender: findAttr(attrsPairs, 'sender')
-              });
-            }
-          }
+          // Specialized WASM Analytics for Oracles/Tokens removed (not needed for Zigchain)
 
           for (let ai = 0; ai < attrsPairs.length; ai++) {
             const attr = attrsPairs[ai];
@@ -1951,8 +1913,6 @@ export class PostgresSink implements Sink {
       wasmSwapsRows, factoryTokensRows, // ✅ WASM DEX Swaps Analytics
       unknownMsgsRows, // ✅ Unknown Messages Quarantine
       factorySupplyEventsRows,
-      wasmOracleUpdatesRows,
-      wasmTokenEventsRows,
       wasmInstantiateConfigsRows,
       height
     };
@@ -1975,13 +1935,9 @@ export class PostgresSink implements Sink {
     this.bufDexLiquidity.push(...data.dexLiquidityRows);
     this.bufWrapperSettings.push(...data.wrapperSettingsRows);
     this.bufWrapperEvents.push(...data.wrapperEventsRows);
-    this.bufWasmOracleUpdates.push(...data.wasmOracleUpdatesRows);
-    this.bufWasmTokenEvents.push(...data.wasmTokenEventsRows);
-
-    // WASM
-    this.bufWasmExec.push(...data.wasmExecRows);
-    this.bufWasmEvents.push(...data.wasmEventsRows);
     this.bufWasmEventAttrs.push(...data.wasmEventAttrsRows);
+
+    // WASM Data
 
     // ✅ Gov (Pushing to Buffers)
     this.bufGovVotes.push(...data.govVotesRows);
@@ -2063,11 +2019,9 @@ export class PostgresSink implements Sink {
       dexLiquidity: this.bufDexLiquidity,
       wrapperSettings: this.bufWrapperSettings,
       wrapperEvents: this.bufWrapperEvents,
-      wasmOracleUpdates: this.bufWasmOracleUpdates,
-      wasmTokenEvents: this.bufWasmTokenEvents,
+      wasmEventAttrs: this.bufWasmEventAttrs,
       wasmExec: this.bufWasmExec,
       wasmEvents: this.bufWasmEvents,
-      wasmEventAttrs: this.bufWasmEventAttrs,
       govVotes: this.bufGovVotes,
       govDeposits: this.bufGovDeposits,
       govProposals: this.bufGovProposals,
@@ -2101,7 +2055,7 @@ export class PostgresSink implements Sink {
     // Reset all main buffers
     this.bufBlocks = []; this.bufTxs = []; this.bufMsgs = []; this.bufEvents = []; this.bufAttrs = []; this.bufTransfers = [];
     this.bufFactoryDenoms = []; this.bufDexPools = []; this.bufDexSwaps = []; this.bufDexLiquidity = [];
-    this.bufWrapperSettings = []; this.bufWrapperEvents = []; this.bufWasmOracleUpdates = []; this.bufWasmTokenEvents = [];
+    this.bufWrapperSettings = []; this.bufWrapperEvents = [];
     this.bufWasmExec = []; this.bufWasmEvents = []; this.bufWasmEventAttrs = [];
     this.bufGovVotes = []; this.bufGovDeposits = []; this.bufGovProposals = [];
     this.bufStakeDeleg = []; this.bufStakeDistr = [];
@@ -2141,10 +2095,6 @@ export class PostgresSink implements Sink {
       await flushTransfers(client, snapshot.transfers);
 
       // 2. Modules (WASM & Gov)
-      await flushWasmExec(client, snapshot.wasmExec);
-      await flushWasmEvents(client, snapshot.wasmEvents);
-      await flushWasmEventAttrs(client, snapshot.wasmEventAttrs);
-
       await flushGovVotes(client, snapshot.govVotes);
       await flushGovDeposits(client, snapshot.govDeposits);
       await upsertGovProposals(client, snapshot.govProposals);
@@ -2193,22 +2143,13 @@ export class PostgresSink implements Sink {
       if (snapshot.wasmAdminChanges.length > 0) {
         await flushWasmAdminChanges(client, snapshot.wasmAdminChanges);
       }
+
+      // Core WASM Data
+      await flushWasmExec(client, snapshot.wasmExec);
+      await flushWasmEvents(client, snapshot.wasmEvents);
+      await flushWasmEventAttrs(client, snapshot.wasmEventAttrs);
       if (snapshot.networkParams.length > 0) {
         await flushNetworkParams(client, snapshot.networkParams);
-      }
-
-      // WASM Analytics
-      if (snapshot.wasmSwaps.length > 0) {
-        await flushWasmSwaps(client, snapshot.wasmSwaps);
-      }
-      if (snapshot.factoryTokens.length > 0) {
-        await flushFactoryTokens(client, snapshot.factoryTokens);
-      }
-      if (snapshot.wasmOracleUpdates.length > 0 || snapshot.wasmTokenEvents.length > 0) {
-        await flushWasmAnalytics(client, {
-          oracleUpdates: snapshot.wasmOracleUpdates,
-          tokenEvents: snapshot.wasmTokenEvents
-        });
       }
 
       if (snapshot.unknownMsgs.length > 0) {
@@ -2251,11 +2192,9 @@ export class PostgresSink implements Sink {
       this.bufDexLiquidity = [...snapshot.dexLiquidity, ...this.bufDexLiquidity];
       this.bufWrapperSettings = [...snapshot.wrapperSettings, ...this.bufWrapperSettings];
       this.bufWrapperEvents = [...snapshot.wrapperEvents, ...this.bufWrapperEvents];
-      this.bufWasmOracleUpdates = [...snapshot.wasmOracleUpdates, ...this.bufWasmOracleUpdates];
-      this.bufWasmTokenEvents = [...snapshot.wasmTokenEvents, ...this.bufWasmTokenEvents];
+      this.bufWasmEventAttrs = [...snapshot.wasmEventAttrs, ...this.bufWasmEventAttrs];
       this.bufWasmExec = [...snapshot.wasmExec, ...this.bufWasmExec];
       this.bufWasmEvents = [...snapshot.wasmEvents, ...this.bufWasmEvents];
-      this.bufWasmEventAttrs = [...snapshot.wasmEventAttrs, ...this.bufWasmEventAttrs];
       this.bufGovVotes = [...snapshot.govVotes, ...this.bufGovVotes];
       this.bufGovDeposits = [...snapshot.govDeposits, ...this.bufGovDeposits];
       this.bufGovProposals = [...snapshot.govProposals, ...this.bufGovProposals];
