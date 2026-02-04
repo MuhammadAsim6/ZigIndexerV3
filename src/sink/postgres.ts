@@ -69,14 +69,14 @@ import { flushZigchainData } from './pg/flushers/zigchain.js';
 // ✅ WASM DEX Swap Analytics
 import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js';
 
-// ✅ Specialized WASM Analytics
-import { flushWasmAnalytics } from './pg/flushers/wasm_analytics.js';
-
 // ✅ Unknown Messages Quarantine
 import { flushUnknownMessages } from './pg/flushers/unknown_msgs.js';
 
 // ✅ Zigchain Factory Supply Tracking
 import { flushFactorySupplyEvents } from './pg/flushers/factory_supply.js';
+
+// ✅ Gov Params Helper (for timestamp calculation)
+import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
 
 const log = getLogger('sink/postgres');
 
@@ -177,10 +177,6 @@ export class PostgresSink implements Sink {
   private bufWasmSwaps: any[] = [];
   private bufFactoryTokens: any[] = [];
   private bufWrapperEvents: any[] = [];
-
-  // ✅ Specialized WASM Analytics
-  private bufWasmOracleUpdates: any[] = [];
-  private bufWasmTokenEvents: any[] = [];
 
   // ✅ Unknown Messages Quarantine
   private bufUnknownMsgs: any[] = [];
@@ -359,8 +355,6 @@ export class PostgresSink implements Sink {
     const unknownMsgsRows: any[] = [];
     const factorySupplyEventsRows: any[] = [];
     const wrapperEventsRows: any[] = [];
-    const wasmOracleUpdatesRows: any[] = [];
-    const wasmTokenEventsRows: any[] = [];
 
     // 🟢 BANK BALANCE DELTAS (Helper)
     const extractBalanceDeltas = (evType: string, attrsPairs: { key: string, value: string | null }[], tx_hash?: string, msg_index?: number, event_index?: number) => {
@@ -422,35 +416,49 @@ export class PostgresSink implements Sink {
       const pid = findAttr(attrs, 'proposal_id');
 
       if (pid) {
+        // Handle voting period transitions and timestamp extraction
         if (ev.type === 'active_proposal' || ev.type === 'proposal_deposit' || ev.type === 'proposal_vote' || ev.type === 'inactive_proposal') {
           const votingStart = toDateFromTimestamp(findAttr(attrs, 'voting_period_start') || findAttr(attrs, 'voting_start_time'));
           const votingEnd = toDateFromTimestamp(findAttr(attrs, 'voting_period_end') || findAttr(attrs, 'voting_end_time'));
           const depositEnd = toDateFromTimestamp(findAttr(attrs, 'deposit_end_time'));
 
-          if (votingStart || votingEnd || depositEnd) {
+          // ✅ FIX: Calculate timestamps if they are missing but the event implies we are in/entering voting period
+          // 'active_proposal' means it just started. 'proposal_vote' means it's currently active.
+          const needsFallback = (ev.type === 'active_proposal' || ev.type === 'proposal_vote') && !votingStart;
+          const effectiveVotingStart = votingStart || (needsFallback ? time : null);
+          const effectiveVotingEnd = votingEnd || (effectiveVotingStart ? calculateVotingEnd(effectiveVotingStart) : null);
+
+          if (effectiveVotingStart || effectiveVotingEnd || depositEnd) {
             govProposalsRows.push({
               proposal_id: pid,
-              // If we see voting timestamps, it's definitely in voting period or passed it
-              status: (votingEnd && votingEnd < time) ? 'passed' : (votingStart ? 'voting_period' : undefined),
-              voting_start: votingStart,
-              voting_end: votingEnd,
+              // If we see voting timestamps or events, it's definitely in voting period or passed it
+              status: (effectiveVotingEnd && effectiveVotingEnd < time) ? 'passed' : (effectiveVotingStart ? 'voting_period' : undefined),
+              voting_start: effectiveVotingStart,
+              voting_end: effectiveVotingEnd,
               deposit_end: depositEnd
             } as any);
           }
         }
 
         // ✅ ENHANCEMENT: Final Tally Result extraction
-        if (ev.type === 'proposal_tally' || ev.type === 'inactive_proposal') {
+        // Handle multiple event types that may contain tally info
+        if (ev.type === 'proposal_tally' || ev.type === 'inactive_proposal' || ev.type === 'proposal_result') {
           const tally = {
-            yes: findAttr(attrs, 'yes') || findAttr(attrs, 'tally_yes'),
-            no: findAttr(attrs, 'no') || findAttr(attrs, 'tally_no'),
-            no_with_veto: findAttr(attrs, 'no_with_veto') || findAttr(attrs, 'tally_no_with_veto'),
-            abstain: findAttr(attrs, 'abstain') || findAttr(attrs, 'tally_abstain')
+            yes: findAttr(attrs, 'yes') || findAttr(attrs, 'tally_yes') || findAttr(attrs, 'yes_count'),
+            no: findAttr(attrs, 'no') || findAttr(attrs, 'tally_no') || findAttr(attrs, 'no_count'),
+            no_with_veto: findAttr(attrs, 'no_with_veto') || findAttr(attrs, 'tally_no_with_veto') || findAttr(attrs, 'no_with_veto_count'),
+            abstain: findAttr(attrs, 'abstain') || findAttr(attrs, 'tally_abstain') || findAttr(attrs, 'abstain_count')
           };
-          if (tally.yes || tally.no) {
+
+          // Also extract status from result events
+          const status = findAttr(attrs, 'status') || findAttr(attrs, 'proposal_status');
+          const finalStatus = status ? status.toLowerCase().replace('proposal_status_', '') : undefined;
+
+          if (tally.yes || tally.no || finalStatus) {
             govProposalsRows.push({
               proposal_id: pid,
-              tally_result: tally
+              status: finalStatus || undefined,
+              tally_result: (tally.yes || tally.no) ? tally : undefined
             } as any);
           }
         }
@@ -460,8 +468,28 @@ export class PostgresSink implements Sink {
           const result = findAttr(attrs, 'result') || findAttr(attrs, 'proposal_result') || 'executed';
           govProposalsRows.push({
             proposal_id: pid,
-            status: result.toLowerCase().includes('pass') ? 'passed' : 'rejected',
+            status: result.toLowerCase().includes('pass') || result.toLowerCase().includes('success') ? 'passed' : 'rejected',
             executor_result: result
+          } as any);
+        }
+
+        // ✅ NEW: Handle passed/rejected/failed status events
+        if (ev.type === 'proposal_passed' || ev.type === 'submit_proposal_passed') {
+          govProposalsRows.push({
+            proposal_id: pid,
+            status: 'passed'
+          } as any);
+        }
+        if (ev.type === 'proposal_rejected' || ev.type === 'submit_proposal_rejected') {
+          govProposalsRows.push({
+            proposal_id: pid,
+            status: 'rejected'
+          } as any);
+        }
+        if (ev.type === 'proposal_failed' || ev.type === 'submit_proposal_failed') {
+          govProposalsRows.push({
+            proposal_id: pid,
+            status: 'failed'
           } as any);
         }
       }
@@ -555,7 +583,6 @@ export class PostgresSink implements Sink {
             weight: "1.0", // ✅ FIX: Simple votes always have 1.0 weight
             height,
             tx_hash,
-            metadata: m.metadata ?? null, // v1 support
           });
           // ✅ ENHANCEMENT: Any vote implies the proposal is in voting period
           if (m.proposal_id) {
@@ -569,7 +596,6 @@ export class PostgresSink implements Sink {
         // 1b. WEIGHTED VOTE
         if (type === '/cosmos.gov.v1beta1.MsgVoteWeighted' || type === '/cosmos.gov.v1.MsgVoteWeighted') {
           const options = Array.isArray(m.options) ? m.options : [];
-          const metadata = m.metadata ?? null;
           for (const opt of options) {
             govVotesRows.push({
               proposal_id: m.proposal_id,
@@ -578,7 +604,6 @@ export class PostgresSink implements Sink {
               weight: opt.weight ?? '1.0', // Weight is a decimal string like "0.5"
               height,
               tx_hash,
-              metadata,
             });
           }
           // ✅ ENHANCEMENT: Any vote implies the proposal is in voting period
@@ -607,12 +632,23 @@ export class PostgresSink implements Sink {
 
           // ✅ ENHANCEMENT: Check if deposit triggers voting period
           const activeEv = msgLog?.events.find((e: any) => e.type === 'proposal_deposit' || e.type === 'active_proposal');
-          const vsAt = findAttr(attrsToPairs(activeEv?.attributes), 'voting_period_start');
-          if (vsAt && m.proposal_id) {
+          const vsAttr = findAttr(attrsToPairs(activeEv?.attributes), 'voting_period_start') ||
+            findAttr(attrsToPairs(activeEv?.attributes), 'voting_start_time');
+          const vsAt = toDateFromTimestamp(vsAttr);
+          const veAttr = findAttr(attrsToPairs(activeEv?.attributes), 'voting_period_end') ||
+            findAttr(attrsToPairs(activeEv?.attributes), 'voting_end_time');
+          const veAt = toDateFromTimestamp(veAttr);
+
+          if ((vsAt || activeEv?.type === 'active_proposal') && m.proposal_id) {
+            // Calculate voting_start/end if not in event
+            const votingStart = vsAt || time;
+            const votingEnd = veAt || calculateVotingEnd(votingStart);
+
             govProposalsRows.push({
               proposal_id: m.proposal_id,
               status: 'voting_period',
-              voting_start: toDateFromTimestamp(vsAt),
+              voting_start: votingStart,
+              voting_end: votingEnd,
             } as any);
           }
         }
@@ -641,9 +677,39 @@ export class PostgresSink implements Sink {
 
             // ✅ EXTRACTION: Timestamps from events (accurate vs block time)
             const attrs = attrsToPairs(event?.attributes);
-            const depositEnd = toDateFromTimestamp(findAttr(attrs, 'deposit_end_time'));
-            const votingStart = toDateFromTimestamp(findAttr(attrs, 'voting_period_start') || findAttr(attrs, 'voting_start_time'));
-            const votingEnd = toDateFromTimestamp(findAttr(attrs, 'voting_period_end') || findAttr(attrs, 'voting_end_time'));
+            const eventDepositEnd = toDateFromTimestamp(findAttr(attrs, 'deposit_end_time'));
+            const eventVotingStart = toDateFromTimestamp(findAttr(attrs, 'voting_period_start') || findAttr(attrs, 'voting_start_time'));
+            const eventVotingEnd = toDateFromTimestamp(findAttr(attrs, 'voting_period_end') || findAttr(attrs, 'voting_end_time'));
+
+            // ✅ FIX: Check if proposal entered voting period (from event status or active_proposal event)
+            const proposalStatus = findAttr(attrs, 'proposal_status') || findAttr(attrs, 'status');
+            const isVotingPeriodFromStatus = proposalStatus?.toLowerCase().includes('voting');
+
+            // Also check for active_proposal event in the same tx (initial deposit triggered voting period)
+            const activeEvent = msgLog?.events.find((e: any) => e.type === 'active_proposal');
+            const activeVotingStart = activeEvent
+              ? toDateFromTimestamp(findAttr(attrsToPairs(activeEvent.attributes), 'voting_period_start') ||
+                findAttr(attrsToPairs(activeEvent.attributes), 'voting_start_time'))
+              : null;
+
+            // Determine if proposal is in voting period
+            const isVotingPeriod = !!eventVotingStart || !!activeVotingStart || isVotingPeriodFromStatus || !!activeEvent;
+
+            // ✅ CALCULATION: Fallback timestamps when events don't include them (common in Cosmos SDK v0.47+)
+            const depositEnd = eventDepositEnd || calculateDepositEnd(time);
+
+            // For voting timestamps: use event data if available, otherwise calculate if in voting period
+            let votingStart: Date | null = eventVotingStart || activeVotingStart;
+            let votingEnd: Date | null = eventVotingEnd;
+
+            // If proposal is in voting period but we don't have timestamps, calculate them
+            if (isVotingPeriod && !votingStart) {
+              // When proposal enters voting period immediately, voting_start = submit_time
+              votingStart = time;
+            }
+            if (votingStart && !votingEnd) {
+              votingEnd = calculateVotingEnd(votingStart);
+            }
 
             govProposalsRows.push({
               proposal_id: pid,
@@ -652,7 +718,7 @@ export class PostgresSink implements Sink {
               summary: m.summary ?? m.content?.description ?? content?.description ?? '',
               proposal_type: proposalType,
               submit_time: time,
-              status: votingStart ? 'voting_period' : 'deposit_period',
+              status: isVotingPeriod ? 'voting_period' : 'deposit_period',
               deposit_end: depositEnd,
               voting_start: votingStart,
               voting_end: votingEnd,
@@ -761,7 +827,7 @@ export class PostgresSink implements Sink {
               code_id: codeId,
               checksum: checksum || '', // Ensure not null
               creator: m.sender || m.authority || m.signer || firstSigner,
-              instantiate_permission: instantiatePermission,
+              instantiate_permission: instantiatePermission || { permission: 'Everybody' },
               store_tx_hash: tx_hash,
               store_height: height
             });
@@ -1089,18 +1155,41 @@ export class PostgresSink implements Sink {
 
         if (type === '/cosmos.staking.v1beta1.MsgDelegate' || type === '/cosmos.staking.v1beta1.MsgUndelegate') {
           const coin = m.amount;
+          const isUndelegate = type.includes('Undelegate');
+
+          // ✅ FIX: Extract completion_time from unbond event for undelegations
+          let completionTime: Date | null = null;
+          if (isUndelegate && msgLog) {
+            const unbondEvent = msgLog.events.find((e: any) => e.type === 'unbond');
+            if (unbondEvent) {
+              const ctStr = findAttr(attrsToPairs(unbondEvent.attributes), 'completion_time');
+              completionTime = toDateFromTimestamp(ctStr);
+            }
+          }
+
           stakeDelegRows.push({
             height, tx_hash, msg_index: i,
-            event_type: type.includes('Undelegate') ? 'undelegate' : 'delegate',
+            event_type: isUndelegate ? 'undelegate' : 'delegate',
             delegator_address: m.delegator_address,
-            validator_src: null,
+            validator_src: null, // Only applies to redelegate
             validator_dst: m.validator_address,
             denom: coin?.denom, amount: coin?.amount,
-            completion_time: null
+            completion_time: completionTime
           });
         }
         if (type === '/cosmos.staking.v1beta1.MsgBeginRedelegate') {
           const coin = m.amount;
+
+          // ✅ FIX: Extract completion_time from redelegate event
+          let completionTime: Date | null = null;
+          if (msgLog) {
+            const redelegateEvent = msgLog.events.find((e: any) => e.type === 'redelegate');
+            if (redelegateEvent) {
+              const ctStr = findAttr(attrsToPairs(redelegateEvent.attributes), 'completion_time');
+              completionTime = toDateFromTimestamp(ctStr);
+            }
+          }
+
           stakeDelegRows.push({
             height, tx_hash, msg_index: i,
             event_type: 'redelegate',
@@ -1108,15 +1197,23 @@ export class PostgresSink implements Sink {
             validator_src: m.validator_src_address,
             validator_dst: m.validator_dst_address,
             denom: coin?.denom, amount: coin?.amount,
-            completion_time: null
+            completion_time: completionTime
           });
         }
 
         // 🟢 DISTRIBUTION LOGIC 🟢
         if (type === '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward') {
           const event = msgLog?.events.find((e: any) => e.type === 'withdraw_rewards');
-          const amountStr = event ? findAttr(attrsToPairs(event.attributes), 'amount') : null;
+          const eventAttrs = attrsToPairs(event?.attributes);
+          const amountStr = findAttr(eventAttrs, 'amount');
           const coins = parseCoins(amountStr);
+
+          // ✅ FIX: Try to extract withdraw_address from event or use delegator_address as fallback
+          // Note: If user hasn't set a custom withdraw address, it defaults to delegator_address
+          const withdrawAddr = findAttr(eventAttrs, 'withdraw_address') ||
+            findAttr(eventAttrs, 'receiver') ||
+            m.delegator_address; // Fallback to delegator (default behavior)
+
           for (const coin of coins) {
             stakeDistrRows.push({
               height, tx_hash, msg_index: i,
@@ -1124,7 +1221,7 @@ export class PostgresSink implements Sink {
               delegator_address: m.delegator_address,
               validator_address: m.validator_address,
               denom: coin.denom, amount: coin.amount,
-              withdraw_address: null
+              withdraw_address: withdrawAddr
             });
           }
         }
@@ -1152,6 +1249,47 @@ export class PostgresSink implements Sink {
           });
         }
 
+        // 🟢 IBC CLIENT CREATION - Extract chain_id from client_state 🟢
+        if (type === '/ibc.core.client.v1.MsgCreateClient' && code === 0) {
+          const clientState = m.client_state || m.clientState;
+          let chainId = clientState?.chain_id || clientState?.chainId;
+
+          // If client_state is encoded (has 'value' field with base64), try to extract chain_id
+          if (!chainId && clientState?.value && typeof clientState.value === 'string') {
+            try {
+              // Decode base64 and extract chain_id (first field in tendermint ClientState protobuf)
+              const decoded = Buffer.from(clientState.value, 'base64');
+              // Chain_id is typically the first string field in protobuf (field 1, wire type 2)
+              // The format is: 0x0a (tag for field 1, length-delimited), length, string bytes
+              if (decoded[0] === 0x0a && decoded.length > 2) {
+                const strLen = decoded[1];
+                if (strLen > 0 && strLen < decoded.length - 2) {
+                  chainId = decoded.slice(2, 2 + strLen).toString('utf-8');
+                }
+              }
+            } catch {
+              // Ignore decoding errors
+            }
+          }
+
+          // Get client_id from events
+          const createClientEvent = msgLog?.events.find((e: any) => e.type === 'create_client');
+          const clientId = createClientEvent
+            ? findAttr(attrsToPairs(createClientEvent.attributes), 'client_id')
+            : null;
+
+          if (clientId) {
+            ibcClientsRows.push({
+              client_id: clientId,
+              chain_id: chainId,
+              client_type: clientState?.type_url?.split('.').pop()?.toLowerCase() ||
+                clientState?.['@type']?.split('.').pop()?.toLowerCase() || 'tendermint',
+              updated_at_height: height,
+              updated_at_time: time
+            });
+          }
+        }
+
         // 🟢 MSG_UPDATE_PARAMS (GENERIC) 🟢
         if (type.endsWith('.MsgUpdateParams') && code === 0) {
           const moduleMatch = type.match(/^\/([^.]+)\./);
@@ -1174,11 +1312,15 @@ export class PostgresSink implements Sink {
         const msg_index = Number(log?.msg_index ?? -1);
         const events = normArray<any>(log?.events);
 
-        // 🔄 Pre-scan message events for IBC metadata
+        // 🔄 Pre-scan message events for IBC metadata and general sender
         let msgIbcMeta: any = {};
+        let msgSender: string | null = null;
         for (const ev of events) {
+          const ap = attrsToPairs(ev.attributes);
+          if (ev.type === 'message') {
+            msgSender = findAttr(ap, 'sender');
+          }
           if (ev.type === 'fungible_token_packet') {
-            const ap = attrsToPairs(ev.attributes);
             msgIbcMeta.sender = findAttr(ap, 'sender');
             msgIbcMeta.receiver = findAttr(ap, 'receiver');
             msgIbcMeta.amount = findAttr(ap, 'amount');
@@ -1377,12 +1519,17 @@ export class PostgresSink implements Sink {
             const addr = findAttr(attrsPairs, '_contract_address') || findAttr(attrsPairs, 'contract_address');
             const codeId = findAttr(attrsPairs, 'code_id');
             if (addr && codeId) {
+              // ✅ ENHANCEMENT: Fallbacks for creator, admin, label (vital for internal calls)
+              const creator = findAttr(attrsPairs, 'creator') || findAttr(attrsPairs, '_contract_creator') || findAttr(attrsPairs, '_creator') || msgSender;
+              const admin = findAttr(attrsPairs, 'admin') || findAttr(attrsPairs, '_contract_admin') || findAttr(attrsPairs, '_admin');
+              const label = findAttr(attrsPairs, 'label') || findAttr(attrsPairs, '_contract_label') || findAttr(attrsPairs, '_label');
+
               wasmContractsRows.push({
                 address: addr,
                 code_id: toBigIntStr(codeId),
-                creator: findAttr(attrsPairs, 'creator'),
-                admin: findAttr(attrsPairs, 'admin'),
-                label: findAttr(attrsPairs, 'label'),
+                creator,
+                admin,
+                label,
                 created_height: height,
                 created_tx_hash: tx_hash
               });
@@ -1696,36 +1843,7 @@ export class PostgresSink implements Sink {
             }
           }
 
-          // ✅ Phase 3: Specialized WASM Analytics Dispatcher
-          if (event_type === 'wasm-temporal_numeric_value_update') {
-            const contract = findAttr(attrsPairs, 'contract') || findAttr(attrsPairs, '_contract_address');
-            const key = findAttr(attrsPairs, 'key');
-            const value = findAttr(attrsPairs, 'value');
-            if (contract && key && value) {
-              wasmOracleUpdatesRows.push({
-                height, tx_hash, msg_index, contract, key,
-                value: parseFloat(value) || null
-              });
-            }
-          }
-
-          if (event_type === 'wasm-token_minted' || event_type === 'wasm-token_burned' || event_type === 'wasm-token_transferred') {
-            const contract = findAttr(attrsPairs, 'contract') || findAttr(attrsPairs, '_contract_address');
-            const amountAttr = findAttr(attrsPairs, 'amount');
-            if (contract && amountAttr) {
-              let action = 'transfer';
-              if (event_type.includes('mint')) action = 'mint';
-              else if (event_type.includes('burn')) action = 'burn';
-
-              wasmTokenEventsRows.push({
-                height, tx_hash, msg_index, contract,
-                action,
-                amount: toBigIntStr(amountAttr),
-                recipient: findAttr(attrsPairs, 'recipient'),
-                sender: findAttr(attrsPairs, 'sender')
-              });
-            }
-          }
+          // Specialized WASM Analytics for Oracles/Tokens removed (not needed for Zigchain)
 
           for (let ai = 0; ai < attrsPairs.length; ai++) {
             const attr = attrsPairs[ai];
@@ -1795,8 +1913,6 @@ export class PostgresSink implements Sink {
       wasmSwapsRows, factoryTokensRows, // ✅ WASM DEX Swaps Analytics
       unknownMsgsRows, // ✅ Unknown Messages Quarantine
       factorySupplyEventsRows,
-      wasmOracleUpdatesRows,
-      wasmTokenEventsRows,
       wasmInstantiateConfigsRows,
       height
     };
@@ -1819,13 +1935,9 @@ export class PostgresSink implements Sink {
     this.bufDexLiquidity.push(...data.dexLiquidityRows);
     this.bufWrapperSettings.push(...data.wrapperSettingsRows);
     this.bufWrapperEvents.push(...data.wrapperEventsRows);
-    this.bufWasmOracleUpdates.push(...data.wasmOracleUpdatesRows);
-    this.bufWasmTokenEvents.push(...data.wasmTokenEventsRows);
-
-    // WASM
-    this.bufWasmExec.push(...data.wasmExecRows);
-    this.bufWasmEvents.push(...data.wasmEventsRows);
     this.bufWasmEventAttrs.push(...data.wasmEventAttrsRows);
+
+    // WASM Data
 
     // ✅ Gov (Pushing to Buffers)
     this.bufGovVotes.push(...data.govVotesRows);
@@ -1907,11 +2019,9 @@ export class PostgresSink implements Sink {
       dexLiquidity: this.bufDexLiquidity,
       wrapperSettings: this.bufWrapperSettings,
       wrapperEvents: this.bufWrapperEvents,
-      wasmOracleUpdates: this.bufWasmOracleUpdates,
-      wasmTokenEvents: this.bufWasmTokenEvents,
+      wasmEventAttrs: this.bufWasmEventAttrs,
       wasmExec: this.bufWasmExec,
       wasmEvents: this.bufWasmEvents,
-      wasmEventAttrs: this.bufWasmEventAttrs,
       govVotes: this.bufGovVotes,
       govDeposits: this.bufGovDeposits,
       govProposals: this.bufGovProposals,
@@ -1945,7 +2055,7 @@ export class PostgresSink implements Sink {
     // Reset all main buffers
     this.bufBlocks = []; this.bufTxs = []; this.bufMsgs = []; this.bufEvents = []; this.bufAttrs = []; this.bufTransfers = [];
     this.bufFactoryDenoms = []; this.bufDexPools = []; this.bufDexSwaps = []; this.bufDexLiquidity = [];
-    this.bufWrapperSettings = []; this.bufWrapperEvents = []; this.bufWasmOracleUpdates = []; this.bufWasmTokenEvents = [];
+    this.bufWrapperSettings = []; this.bufWrapperEvents = [];
     this.bufWasmExec = []; this.bufWasmEvents = []; this.bufWasmEventAttrs = [];
     this.bufGovVotes = []; this.bufGovDeposits = []; this.bufGovProposals = [];
     this.bufStakeDeleg = []; this.bufStakeDistr = [];
@@ -1985,10 +2095,6 @@ export class PostgresSink implements Sink {
       await flushTransfers(client, snapshot.transfers);
 
       // 2. Modules (WASM & Gov)
-      await flushWasmExec(client, snapshot.wasmExec);
-      await flushWasmEvents(client, snapshot.wasmEvents);
-      await flushWasmEventAttrs(client, snapshot.wasmEventAttrs);
-
       await flushGovVotes(client, snapshot.govVotes);
       await flushGovDeposits(client, snapshot.govDeposits);
       await upsertGovProposals(client, snapshot.govProposals);
@@ -2037,22 +2143,13 @@ export class PostgresSink implements Sink {
       if (snapshot.wasmAdminChanges.length > 0) {
         await flushWasmAdminChanges(client, snapshot.wasmAdminChanges);
       }
+
+      // Core WASM Data
+      await flushWasmExec(client, snapshot.wasmExec);
+      await flushWasmEvents(client, snapshot.wasmEvents);
+      await flushWasmEventAttrs(client, snapshot.wasmEventAttrs);
       if (snapshot.networkParams.length > 0) {
         await flushNetworkParams(client, snapshot.networkParams);
-      }
-
-      // WASM Analytics
-      if (snapshot.wasmSwaps.length > 0) {
-        await flushWasmSwaps(client, snapshot.wasmSwaps);
-      }
-      if (snapshot.factoryTokens.length > 0) {
-        await flushFactoryTokens(client, snapshot.factoryTokens);
-      }
-      if (snapshot.wasmOracleUpdates.length > 0 || snapshot.wasmTokenEvents.length > 0) {
-        await flushWasmAnalytics(client, {
-          oracleUpdates: snapshot.wasmOracleUpdates,
-          tokenEvents: snapshot.wasmTokenEvents
-        });
       }
 
       if (snapshot.unknownMsgs.length > 0) {
@@ -2095,11 +2192,9 @@ export class PostgresSink implements Sink {
       this.bufDexLiquidity = [...snapshot.dexLiquidity, ...this.bufDexLiquidity];
       this.bufWrapperSettings = [...snapshot.wrapperSettings, ...this.bufWrapperSettings];
       this.bufWrapperEvents = [...snapshot.wrapperEvents, ...this.bufWrapperEvents];
-      this.bufWasmOracleUpdates = [...snapshot.wasmOracleUpdates, ...this.bufWasmOracleUpdates];
-      this.bufWasmTokenEvents = [...snapshot.wasmTokenEvents, ...this.bufWasmTokenEvents];
+      this.bufWasmEventAttrs = [...snapshot.wasmEventAttrs, ...this.bufWasmEventAttrs];
       this.bufWasmExec = [...snapshot.wasmExec, ...this.bufWasmExec];
       this.bufWasmEvents = [...snapshot.wasmEvents, ...this.bufWasmEvents];
-      this.bufWasmEventAttrs = [...snapshot.wasmEventAttrs, ...this.bufWasmEventAttrs];
       this.bufGovVotes = [...snapshot.govVotes, ...this.bufGovVotes];
       this.bufGovDeposits = [...snapshot.govDeposits, ...this.bufGovDeposits];
       this.bufGovProposals = [...snapshot.govProposals, ...this.bufGovProposals];
@@ -2135,6 +2230,9 @@ export class PostgresSink implements Sink {
     }
   }
 
-  // Atomic mode stub
-  private async persistBlockAtomic(blockLine: BlockLine): Promise<void> { return; }
+  // Atomic mode: write one block and flush immediately in a single DB transaction.
+  private async persistBlockAtomic(blockLine: BlockLine): Promise<void> {
+    await this.persistBlockBuffered(blockLine);
+    await this.flushAll();
+  }
 }
