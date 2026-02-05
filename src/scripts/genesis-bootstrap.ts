@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { getPgPool, closePgPool } from '../db/pg.js';
+import { getPgPool, closePgPool, createPgPool } from '../db/pg.js';
 import { getLogger } from '../utils/logger.js';
 import { getConfig } from '../config.js';
 
@@ -50,7 +50,7 @@ export async function bootstrapGenesis(genesisPath: string) {
     log.info(`Found: ${bankBalances.length} bank accounts, ${stakingDelegations.length} delegations, ${vestingAccounts.length} vesting accounts`);
 
     const config = getConfig();
-    const pool = getPgPool({ ...config.pg, applicationName: 'genesis-bootstrap' });
+    const pool = createPgPool({ ...config.pg, applicationName: 'genesis-bootstrap' });
     const client = await pool.connect();
 
     try {

@@ -19,7 +19,7 @@ import { syncRange } from './runner/syncRange.ts';
 import { retryMissingBlocks } from './runner/retryMissing.ts';
 import { followLoop } from './runner/follow.ts';
 import { bootstrapGenesis } from './scripts/genesis-bootstrap.ts';
-import { reconcileNegativeBalances, reconcileGovProposalTimestamps } from './sink/pg/reconcile.ts';
+import { reconcileNegativeBalances } from './sink/pg/reconcile.ts';
 import { ensureCorePartitions } from './db/partitions.js';
 
 EventEmitter.defaultMaxListeners = 0;
@@ -34,7 +34,10 @@ async function main() {
   let sink: any = null;
 
   // Cleanup handler for signals and catch blocks
+  let isCleaningUp = false;
   const gracefulCleanup = async (exitCode: number) => {
+    if (isCleaningUp) return;
+    isCleaningUp = true;
     await cleanup(decodePool, sink);
     process.exit(exitCode);
   };
@@ -223,15 +226,15 @@ async function main() {
       }
     }
 
-    // 🛡️ RECONCILIATION LOOP
+    // 🛡️ RECONCILIATION LOOP (Balance only - Gov timestamps now handled inline)
     if (cfg.sinkKind === 'postgres') {
       setInterval(async () => {
         try {
           const pool = getPgPool();
           const client = await pool.connect();
           try {
-            await reconcileNegativeBalances(client, rpc, await loadProtoRoot(protoDir));
-            await reconcileGovProposalTimestamps(client, rpc);
+            const protoRoot = await loadProtoRoot(protoDir);
+            await reconcileNegativeBalances(client, rpc, protoRoot);
           } finally {
             client.release();
           }
@@ -353,8 +356,7 @@ async function cleanup(decodePool: any, sink: any) {
   try {
     if (decodePool) await decodePool.close();
     if (sink) {
-      await sink.flush?.();
-      await sink.close?.();
+      await sink.close?.(); // close() handles flushing internally
     }
     log.info('Shutdown complete.');
   } catch (err) {

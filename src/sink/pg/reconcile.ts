@@ -4,6 +4,7 @@ import { insertBalanceDeltas } from './inserters/bank.js';
 import { RpcClient } from '../../rpc/client.js';
 import { Root } from 'protobufjs';
 import { decodeAnyWithRoot } from '../../decode/dynamicProto.js';
+import Long from 'long';
 
 const log = getLogger('sink/reconcile');
 
@@ -116,117 +117,4 @@ async function fetchBalanceViaAbci(rpc: RpcClient, root: Root, address: string, 
     const balance = (decoded as any).balance;
 
     return BigInt(balance?.amount || '0');
-}
-
-/**
- * Reconciles governance proposals with missing voting_start or voting_end timestamps.
- * Queries the chain via RPC (/cosmos/gov/v1/proposals/{id}) to get accurate data.
- * @param client - Database client
- * @param rpc - RPC Client for querying proposal details
- */
-export async function reconcileGovProposalTimestamps(client: PoolClient, rpc: RpcClient) {
-    log.info('[reconcile-gov] Starting reconciliation of proposal timestamps...');
-
-    // 1. Find proposals with missing timestamps that are in voting_period or passed/rejected
-    const res = await client.query(`
-        SELECT proposal_id, status, voting_start, voting_end
-        FROM gov.proposals
-        WHERE (voting_start IS NULL OR voting_end IS NULL)
-          AND status IN ('voting_period', 'passed', 'rejected', 'failed')
-        ORDER BY proposal_id
-        LIMIT 50
-    `);
-
-    if (res.rowCount === 0) {
-        log.info('[reconcile-gov] No proposals with missing timestamps found.');
-        return;
-    }
-
-    log.info(`[reconcile-gov] Found ${res.rowCount} proposals with missing timestamps. Processing...`);
-
-    let updatedCount = 0;
-
-    for (const row of res.rows) {
-        const proposalId = row.proposal_id;
-
-        try {
-            // Query the chain for proposal details
-            const proposalData = await fetchProposalFromChain(rpc, proposalId);
-
-            if (!proposalData) {
-                log.warn(`[reconcile-gov] Proposal ${proposalId} not found on chain.`);
-                continue;
-            }
-
-            const { voting_start_time, voting_end_time, deposit_end_time, submit_time } = proposalData;
-
-            // Update the proposal in DB
-            await client.query(`
-                UPDATE gov.proposals
-                SET 
-                    voting_start = COALESCE(voting_start, $2),
-                    voting_end = COALESCE(voting_end, $3),
-                    deposit_end = COALESCE(deposit_end, $4),
-                    submit_time = COALESCE(submit_time, $5)
-                WHERE proposal_id = $1
-            `, [proposalId, voting_start_time, voting_end_time, deposit_end_time, submit_time]);
-
-            log.info(`[reconcile-gov] Updated proposal ${proposalId}: voting_start=${voting_start_time}, voting_end=${voting_end_time}`);
-            updatedCount++;
-
-        } catch (err: any) {
-            log.error(`[reconcile-gov] Failed to reconcile proposal ${proposalId}: ${err.message}`);
-        }
-    }
-
-    log.info(`[reconcile-gov] Successfully updated ${updatedCount} proposals.`);
-}
-
-/**
- * Fetches proposal details from the chain via RPC.
- * Tries both v1 and v1beta1 endpoints for compatibility.
- */
-async function fetchProposalFromChain(rpc: RpcClient, proposalId: string | number): Promise<{
-    voting_start_time: Date | null;
-    voting_end_time: Date | null;
-    deposit_end_time: Date | null;
-    submit_time: Date | null;
-} | null> {
-    // Try v1 endpoint first (Cosmos SDK v0.46+)
-    let proposal: any = null;
-
-    try {
-        const v1Res = await rpc.getJson(`/cosmos/gov/v1/proposals/${proposalId}`, {});
-        proposal = v1Res?.proposal;
-    } catch {
-        // Fallback to v1beta1 for older chains
-        try {
-            const v1beta1Res = await rpc.getJson(`/cosmos/gov/v1beta1/proposals/${proposalId}`, {});
-            proposal = v1beta1Res?.proposal;
-        } catch {
-            return null;
-        }
-    }
-
-    if (!proposal) return null;
-
-    // Parse timestamps - handle both string ISO and object formats
-    const parseTime = (val: any): Date | null => {
-        if (!val) return null;
-        if (typeof val === 'string') {
-            const d = new Date(val);
-            return isNaN(d.getTime()) ? null : d;
-        }
-        if (val.seconds) {
-            return new Date(Number(val.seconds) * 1000);
-        }
-        return null;
-    };
-
-    return {
-        voting_start_time: parseTime(proposal.voting_start_time),
-        voting_end_time: parseTime(proposal.voting_end_time),
-        deposit_end_time: parseTime(proposal.deposit_end_time),
-        submit_time: parseTime(proposal.submit_time),
-    };
 }

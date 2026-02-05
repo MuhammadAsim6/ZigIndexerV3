@@ -168,7 +168,7 @@ export function createRpcClient(opts: RpcClientOptions): RpcClient {
     // Tendermint GET RPC requires string parameters to be quoted
     // to avoid misparsing paths starting with /
     const params: any = { path: `"${path}"` };
-    if (data) params.data = `"${data}"`;
+    if (data) params.data = data;
     if (height) params.height = String(height);
     const j = await getJson<any>('/abci_query', params);
     return j.result?.response ?? j;

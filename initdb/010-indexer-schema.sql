@@ -232,10 +232,7 @@ CREATE TABLE gov.proposals (
     voting_end      TIMESTAMPTZ NULL,
     total_deposit   JSONB NULL,
     changes         JSONB NULL,
-    submit_time     TIMESTAMPTZ NULL,
-    metadata        TEXT NULL,          -- v1 support
-    tally_result    JSONB NULL,         -- Final tally when voting ends
-    executor_result TEXT NULL           -- Execution result for passed proposals
+    submit_time     TIMESTAMPTZ NULL
 );
 
 CREATE TABLE gov.deposits (

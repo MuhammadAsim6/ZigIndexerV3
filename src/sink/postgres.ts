@@ -77,6 +77,13 @@ import { flushFactorySupplyEvents } from './pg/flushers/factory_supply.js';
 
 // ✅ Gov Params Helper (for timestamp calculation)
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
+// ✅ Gov ABCI Helper (for fetching proposal data via RPC)
+import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
+// ✅ RPC Client and ProtoRoot for ABCI queries
+import { createRpcClientFromConfig, RpcClient } from '../rpc/client.js';
+import { loadProtoRoot } from '../decode/dynamicProto.js';
+import { Root } from 'protobufjs';
+import path from 'node:path';
 
 const log = getLogger('sink/postgres');
 
@@ -120,6 +127,10 @@ type BlockLine = any;
 export class PostgresSink implements Sink {
   private cfg: PostgresSinkConfig;
   private mode: PostgresMode;
+  private rpc: RpcClient | null = null;
+  private protoRoot: Root | null = null;
+  private govTimestampsCache = new Map<string, any>();
+  private isShuttingDown = false;
 
   // Standard Buffers
   private bufBlocks: any[] = [];
@@ -217,6 +228,24 @@ export class PostgresSink implements Sink {
 
   async init(): Promise<void> {
     await createPgPool({ ...this.cfg.pg, applicationName: 'cosmos-indexer' });
+
+    // ✅ Initialize RPC client and protoRoot for ABCI queries (gov timestamps)
+    if (this.cfg.rpcUrl) {
+      this.rpc = createRpcClientFromConfig({
+        rpcUrl: this.cfg.rpcUrl,
+        timeoutMs: 30000,
+        retries: 2,
+        backoffMs: 500,
+        backoffJitter: 0.2,
+        rps: 10,
+      });
+      const protoDir = process.env.PROTO_DIR || path.join(process.cwd(), 'protos');
+      try {
+        this.protoRoot = await loadProtoRoot(protoDir);
+      } catch (err) {
+        log.warn(`[postgres] Failed to load proto root from ${protoDir}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   async write(line: any): Promise<void> {
@@ -246,6 +275,8 @@ export class PostgresSink implements Sink {
   }
 
   async close(): Promise<void> {
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
     await this.flush?.();
     await closePgPool();
   }
@@ -430,7 +461,7 @@ export class PostgresSink implements Sink {
 
           if (effectiveVotingStart || effectiveVotingEnd || depositEnd) {
             govProposalsRows.push({
-              proposal_id: pid,
+              proposal_id: BigInt(pid),
               // If we see voting timestamps or events, it's definitely in voting period or passed it
               status: (effectiveVotingEnd && effectiveVotingEnd < time) ? 'passed' : (effectiveVotingStart ? 'voting_period' : undefined),
               voting_start: effectiveVotingStart,
@@ -440,55 +471,24 @@ export class PostgresSink implements Sink {
           }
         }
 
-        // ✅ ENHANCEMENT: Final Tally Result extraction
-        // Handle multiple event types that may contain tally info
-        if (ev.type === 'proposal_tally' || ev.type === 'inactive_proposal' || ev.type === 'proposal_result') {
-          const tally = {
-            yes: findAttr(attrs, 'yes') || findAttr(attrs, 'tally_yes') || findAttr(attrs, 'yes_count'),
-            no: findAttr(attrs, 'no') || findAttr(attrs, 'tally_no') || findAttr(attrs, 'no_count'),
-            no_with_veto: findAttr(attrs, 'no_with_veto') || findAttr(attrs, 'tally_no_with_veto') || findAttr(attrs, 'no_with_veto_count'),
-            abstain: findAttr(attrs, 'abstain') || findAttr(attrs, 'tally_abstain') || findAttr(attrs, 'abstain_count')
-          };
-
-          // Also extract status from result events
-          const status = findAttr(attrs, 'status') || findAttr(attrs, 'proposal_status');
-          const finalStatus = status ? status.toLowerCase().replace('proposal_status_', '') : undefined;
-
-          if (tally.yes || tally.no || finalStatus) {
-            govProposalsRows.push({
-              proposal_id: pid,
-              status: finalStatus || undefined,
-              tally_result: (tally.yes || tally.no) ? tally : undefined
-            } as any);
-          }
-        }
-
-        // ✅ ENHANCEMENT: Execution Result tracking
-        if (ev.type === 'proposal_executed') {
-          const result = findAttr(attrs, 'result') || findAttr(attrs, 'proposal_result') || 'executed';
-          govProposalsRows.push({
-            proposal_id: pid,
-            status: result.toLowerCase().includes('pass') || result.toLowerCase().includes('success') ? 'passed' : 'rejected',
-            executor_result: result
-          } as any);
-        }
-
-        // ✅ NEW: Handle passed/rejected/failed status events
+        // ✅ Final Tally Result extraction REMOVED (per user request)
+        // ✅ Execution Result tracking REMOVED (per user request)
+        // ✅ Handle passed/rejected/failed status events
         if (ev.type === 'proposal_passed' || ev.type === 'submit_proposal_passed') {
           govProposalsRows.push({
-            proposal_id: pid,
+            proposal_id: BigInt(pid),
             status: 'passed'
           } as any);
         }
         if (ev.type === 'proposal_rejected' || ev.type === 'submit_proposal_rejected') {
           govProposalsRows.push({
-            proposal_id: pid,
+            proposal_id: BigInt(pid),
             status: 'rejected'
           } as any);
         }
         if (ev.type === 'proposal_failed' || ev.type === 'submit_proposal_failed') {
           govProposalsRows.push({
-            proposal_id: pid,
+            proposal_id: BigInt(pid),
             status: 'failed'
           } as any);
         }
@@ -645,7 +645,7 @@ export class PostgresSink implements Sink {
             const votingEnd = veAt || calculateVotingEnd(votingStart);
 
             govProposalsRows.push({
-              proposal_id: m.proposal_id,
+              proposal_id: BigInt(m.proposal_id),
               status: 'voting_period',
               voting_start: votingStart,
               voting_end: votingEnd,
@@ -669,6 +669,22 @@ export class PostgresSink implements Sink {
 
             // ✅ EXTRACTION: Initial Deposit
             const initialDeposit = m.initial_deposit ?? m.initialDeposit ?? null;
+
+            // ✅ FIX: Capture Initial Deposit in gov.deposits table
+            if (initialDeposit) {
+              const deposits = Array.isArray(initialDeposit) ? initialDeposit : [initialDeposit];
+              for (const coin of deposits) {
+                if (!coin) continue;
+                govDepositsRows.push({
+                  proposal_id: pid,
+                  depositor: submitter,
+                  amount: coin.amount,
+                  denom: coin.denom,
+                  height,
+                  tx_hash
+                });
+              }
+            }
 
             // ✅ EXTRACTION: Changes (for Param Changes or legacy content)
             // For v1, we store the full messages array. For v1beta1, we try to be specific.
@@ -712,7 +728,7 @@ export class PostgresSink implements Sink {
             }
 
             govProposalsRows.push({
-              proposal_id: pid,
+              proposal_id: BigInt(pid),
               submitter,
               title: m.title ?? m.content?.title ?? content?.title ?? '',
               summary: m.summary ?? m.content?.description ?? content?.description ?? '',
@@ -724,7 +740,6 @@ export class PostgresSink implements Sink {
               voting_end: votingEnd,
               total_deposit: initialDeposit,
               changes: changes,
-              metadata: m.metadata ?? null,
             });
           }
         }
@@ -1885,10 +1900,13 @@ export class PostgresSink implements Sink {
       ...(blockLine.block_results?.end_block_events ?? [])
     ];
 
-    for (const ev of allBlockEvents) {
+    for (let i = 0; i < allBlockEvents.length; i++) {
+      const ev = allBlockEvents[i];
       const evType = ev.type;
       const attrsPairs = attrsToPairs(ev.attributes);
-      extractBalanceDeltas(evType, attrsPairs);
+      // ✅ FIX: Pass 'i' as event_index to prevent dedup collisions (defaults to -1 otherwise)
+      // tx_hash and msg_index are undefined for block events
+      extractBalanceDeltas(evType, attrsPairs, undefined, undefined, i);
     }
 
 
@@ -2097,6 +2115,45 @@ export class PostgresSink implements Sink {
       // 2. Modules (WASM & Gov)
       await flushGovVotes(client, snapshot.govVotes);
       await flushGovDeposits(client, snapshot.govDeposits);
+
+      // ✅ ENHANCEMENT: Fetch accurate timestamps via ABCI for new proposals (with caching)
+      if (snapshot.govProposals.length > 0 && this.rpc && this.protoRoot) {
+        const uniqueProposalIds = [...new Set(snapshot.govProposals.map(p => p.proposal_id))];
+        for (const pid of uniqueProposalIds) {
+          const pidStr = pid.toString();
+          try {
+            // Check cache first to avoid redundant RPC calls
+            let abciData = this.govTimestampsCache.get(pidStr);
+
+            if (!abciData) {
+              abciData = await fetchProposalDataViaAbci(this.rpc, this.protoRoot, pidStr);
+              if (abciData) {
+                this.govTimestampsCache.set(pidStr, abciData);
+              }
+            }
+
+            if (abciData) {
+              // Update all proposal rows for this ID with accurate data
+              for (const row of snapshot.govProposals) {
+                if (row.proposal_id === pid) {
+                  // RPC data is authoritative for lifecycle and metadata
+                  if (abciData.submit_time) row.submit_time = abciData.submit_time;
+                  if (abciData.deposit_end_time) row.deposit_end = abciData.deposit_end_time;
+                  if (abciData.voting_start_time) row.voting_start = abciData.voting_start_time;
+                  if (abciData.voting_end_time) row.voting_end = abciData.voting_end_time;
+
+                  // fallback for title/summary if missed from message
+                  if (abciData.title && !row.title) row.title = abciData.title;
+                  if (abciData.summary && !row.summary) row.summary = abciData.summary;
+                }
+              }
+            }
+          } catch (err: any) {
+            log.warn(`[flush] Failed to fetch ABCI timestamps for proposal ${pid}: ${err.message}`);
+          }
+        }
+      }
+
       await upsertGovProposals(client, snapshot.govProposals);
 
       await flushAuthzGrants(client, snapshot.authzGrants);
