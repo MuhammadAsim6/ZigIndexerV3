@@ -17,11 +17,12 @@ export async function flushGovDeposits(
     amount: string;
     height: number;
     tx_hash: string;
+    msg_index: number;
   }>,
 ) {
   if (!rows.length) return;
 
-  const columns = ['proposal_id', 'depositor', 'denom', 'amount', 'height', 'tx_hash'] as const;
+  const columns = ['proposal_id', 'depositor', 'denom', 'amount', 'height', 'tx_hash', 'msg_index'] as const;
 
   const shaped = rows.map((r) => ({
     proposal_id: r.proposal_id.toString(),
@@ -30,6 +31,7 @@ export async function flushGovDeposits(
     amount: r.amount,
     height: r.height,
     tx_hash: r.tx_hash,
+    msg_index: r.msg_index,
   }));
 
   await execBatchedInsert(client, 'gov.deposits', columns as unknown as string[], shaped, 'ON CONFLICT DO NOTHING');

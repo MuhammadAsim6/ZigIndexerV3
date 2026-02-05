@@ -66,14 +66,13 @@ import { flushWasmAdminChanges } from './pg/flushers/wasm_admin_changes.js';
 // ✅ Zigchain Flusher
 import { flushZigchainData } from './pg/flushers/zigchain.js';
 
-// ✅ WASM DEX Swap Analytics
-import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js';
 
 // ✅ Unknown Messages Quarantine
 import { flushUnknownMessages } from './pg/flushers/unknown_msgs.js';
 
 // ✅ Zigchain Factory Supply Tracking
 import { flushFactorySupplyEvents } from './pg/flushers/factory_supply.js';
+import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js'; // ✅ ADDED
 
 // ✅ Gov Params Helper (for timestamp calculation)
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
@@ -626,7 +625,8 @@ export class PostgresSink implements Sink {
               amount: coin.amount,
               denom: coin.denom,
               height,
-              tx_hash
+              tx_hash,
+              msg_index: i // Capture message index
             });
           }
 
@@ -681,7 +681,8 @@ export class PostgresSink implements Sink {
                   amount: coin.amount,
                   denom: coin.denom,
                   height,
-                  tx_hash
+                  tx_hash,
+                  msg_index: i // Capture message index to differentiate same-block deposits
                 });
               }
             }
@@ -1300,7 +1301,7 @@ export class PostgresSink implements Sink {
               client_type: clientState?.type_url?.split('.').pop()?.toLowerCase() ||
                 clientState?.['@type']?.split('.').pop()?.toLowerCase() || 'tendermint',
               updated_at_height: height,
-              updated_at_time: time
+              updated_at_time: !isNaN(time.getTime()) ? time : new Date()
             });
           }
         }
@@ -1573,8 +1574,15 @@ export class PostgresSink implements Sink {
             const sequence = toBigIntStr(sequenceStr);
             const srcPort = findAttr(attrsPairs, 'packet_src_port');
             const srcChan = findAttr(attrsPairs, 'packet_src_channel');
-            const dstPort = findAttr(attrsPairs, 'packet_dst_port');
-            const dstChan = findAttr(attrsPairs, 'packet_dst_channel');
+            let dstPort = findAttr(attrsPairs, 'packet_dst_port');
+            let dstChan = findAttr(attrsPairs, 'packet_dst_channel');
+
+            // 🛡️ Fallback: If dst missing, try to find it in previous packets for this channel? No, stateless.
+            // Just warn if it's a send_packet
+            if (event_type === 'send_packet' && (!dstPort || !dstChan)) {
+              // Try identifying from raw packet_data if possible, but for now just warn
+              log.warn(`[ibc] send_packet missing dst info: ${srcPort}/${srcChan} seq=${sequence}`);
+            }
 
             // ✅ FIX: Extract timeout fields
             const timeoutHeightStr = findAttr(attrsPairs, 'packet_timeout_height');
@@ -1640,16 +1648,28 @@ export class PostgresSink implements Sink {
               };
               const status = statusMap[event_type] || 'failed';
 
+              const safeTime = !isNaN(time.getTime()) ? time : new Date();
+
+              // ✅ FIX: Improved Ack Parsing (Handle non-JSON strings correctly)
               let ackSuccess: boolean | null = null;
               let ackError: string | null = null;
               if (event_type === 'acknowledge_packet') {
                 const ackHex = findAttr(attrsPairs, 'packet_ack');
                 if (ackHex) {
-                  try {
-                    const ackJson = tryParseJson(ackHex);
+                  const ackJson = tryParseJson(ackHex);
+                  if (ackJson && typeof ackJson === 'object' && !Array.isArray(ackJson)) {
                     ackSuccess = !!ackJson.result;
                     ackError = ackJson.error || null;
-                  } catch { /* ignore hex/binary parse errors for now */ }
+                  } else {
+                    // Fallback for strings (e.g. "error: code 123")
+                    // tryParseJson returns the string itself if it fails to parse as JSON
+                    const ackStr = typeof ackJson === 'string' ? ackJson : ackHex;
+                    if (ackStr.includes('result')) ackSuccess = true;
+                    else if (ackStr.includes('error') || ackStr.includes('failed')) {
+                      ackSuccess = false;
+                      ackError = ackStr;
+                    }
+                  }
                 }
               }
 
@@ -1657,7 +1677,7 @@ export class PostgresSink implements Sink {
               const packetRow: any = {
                 port_id_src: srcPort,
                 channel_id_src: srcChan,
-                sequence: Number(sequence), // Ensure numeric for BIGINT
+                sequence: sequence, // ✅ FIX: Use string/BigInt directly, avoid Number() precision loss
                 port_id_dst: dstPort,
                 channel_id_dst: dstChan,
                 timeout_height: timeoutHeightStr ?? null,
@@ -1679,24 +1699,24 @@ export class PostgresSink implements Sink {
               if (event_type === 'send_packet') {
                 packetRow.tx_hash_send = tx_hash;
                 packetRow.height_send = height;
-                packetRow.time_send = time;
+                packetRow.time_send = safeTime; // ✅ FIX: Use safeTime
                 packetRow.relayer_send = relayer;
               } else if (event_type === 'recv_packet') {
                 packetRow.tx_hash_recv = tx_hash;
                 packetRow.height_recv = height;
-                packetRow.time_recv = time;
+                packetRow.time_recv = safeTime; // ✅ FIX: Use safeTime
                 packetRow.relayer_recv = relayer;
               } else if (event_type === 'acknowledge_packet') {
                 packetRow.tx_hash_ack = tx_hash;
                 packetRow.height_ack = height;
-                packetRow.time_ack = time;
+                packetRow.time_ack = safeTime; // ✅ FIX: Use safeTime
                 packetRow.relayer_ack = relayer;
                 packetRow.ack_success = ackSuccess;
                 packetRow.ack_error = ackError;
               } else if (event_type === 'timeout_packet') {
                 packetRow.tx_hash_timeout = tx_hash;
                 packetRow.height_timeout = height;
-                packetRow.time_timeout = time;
+                packetRow.time_timeout = safeTime; // ✅ FIX: Use safeTime
               }
 
               ibcPacketsRows.push(packetRow);
@@ -1706,7 +1726,7 @@ export class PostgresSink implements Sink {
               const transferRow: any = {
                 port_id_src: srcPort,
                 channel_id_src: srcChan,
-                sequence: Number(sequence),
+                sequence: sequence, // ✅ FIX: Use string/BigInt directly
                 port_id_dst: dstPort,
                 channel_id_dst: dstChan,
                 sender,
@@ -1726,24 +1746,24 @@ export class PostgresSink implements Sink {
               if (event_type === 'send_packet') {
                 transferRow.tx_hash_send = tx_hash;
                 transferRow.height_send = height;
-                transferRow.time_send = time;
+                transferRow.time_send = safeTime; // ✅ FIX
                 transferRow.relayer_send = relayer;
               } else if (event_type === 'recv_packet') {
                 transferRow.tx_hash_recv = tx_hash;
                 transferRow.height_recv = height;
-                transferRow.time_recv = time;
+                transferRow.time_recv = safeTime; // ✅ FIX
                 transferRow.relayer_recv = relayer;
               } else if (event_type === 'acknowledge_packet') {
                 transferRow.tx_hash_ack = tx_hash;
                 transferRow.height_ack = height;
-                transferRow.time_ack = time;
+                transferRow.time_ack = safeTime; // ✅ FIX
                 transferRow.relayer_ack = relayer;
                 transferRow.ack_success = ackSuccess;
                 transferRow.ack_error = ackError;
               } else if (event_type === 'timeout_packet') {
                 transferRow.tx_hash_timeout = tx_hash;
                 transferRow.height_timeout = height;
-                transferRow.time_timeout = time;
+                transferRow.time_timeout = safeTime; // ✅ FIX
               }
 
               ibcTransfersRows.push(transferRow);
@@ -1868,30 +1888,6 @@ export class PostgresSink implements Sink {
           }
         }
       }
-
-      // 🛡️ ENHANCEMENT: Final Flush for any unlinked IBC Intents in this TX
-      // This ensures we capture MsgTransfer rows even if the send_packet event is missing or malformed.
-      for (const intent of txIbcIntents) {
-        if (!intent.linked) {
-          ibcTransfersRows.push({
-            height,
-            tx_hash,
-            msg_index: intent.msg_index,
-            port_id_src: intent.port,
-            channel_id_src: intent.channel,
-            sequence: '0',
-            sender: intent.sender,
-            receiver: intent.receiver,
-            denom: intent.denom,
-            amount: intent.amount,
-            memo: intent.memo,
-            status: 'sent',
-            tx_hash_send: tx_hash,
-            height_send: height,
-            time
-          });
-        }
-      }
     }
 
     // ✅ FIX: Process Begin/End Block Events for Balances (e.g. Gov Refunds, Minting)
@@ -1956,6 +1952,8 @@ export class PostgresSink implements Sink {
     this.bufWasmEventAttrs.push(...data.wasmEventAttrsRows);
 
     // WASM Data
+    this.bufWasmEvents.push(...data.wasmEventsRows);
+    this.bufWasmExec.push(...data.wasmExecRows);
 
     // ✅ Gov (Pushing to Buffers)
     this.bufGovVotes.push(...data.govVotesRows);
@@ -2218,6 +2216,9 @@ export class PostgresSink implements Sink {
       }
 
       // 3. Zigchain
+      await flushWasmSwaps(client, snapshot.wasmSwaps); // ✅ FIX: Flush WASM Swaps
+      await flushFactoryTokens(client, snapshot.factoryTokens); // ✅ FIX: Flush Factory Tokens
+
       await flushZigchainData(client, {
         factoryDenoms: snapshot.factoryDenoms,
         dexPools: snapshot.dexPools,
@@ -2244,8 +2245,10 @@ export class PostgresSink implements Sink {
       this.bufAttrs = [...snapshot.attrs, ...this.bufAttrs];
       this.bufTransfers = [...snapshot.transfers, ...this.bufTransfers];
       this.bufFactoryDenoms = [...snapshot.factoryDenoms, ...this.bufFactoryDenoms];
+      this.bufFactoryTokens = [...snapshot.factoryTokens, ...this.bufFactoryTokens]; // ✅ FIX: Restore Buffer
       this.bufDexPools = [...snapshot.dexPools, ...this.bufDexPools];
       this.bufDexSwaps = [...snapshot.dexSwaps, ...this.bufDexSwaps];
+      this.bufWasmSwaps = [...snapshot.wasmSwaps, ...this.bufWasmSwaps]; // ✅ FIX: Restore Buffer
       this.bufDexLiquidity = [...snapshot.dexLiquidity, ...this.bufDexLiquidity];
       this.bufWrapperSettings = [...snapshot.wrapperSettings, ...this.bufWrapperSettings];
       this.bufWrapperEvents = [...snapshot.wrapperEvents, ...this.bufWrapperEvents];
@@ -2276,8 +2279,7 @@ export class PostgresSink implements Sink {
       this.bufAuthzGrants = [...snapshot.authzGrants, ...this.bufAuthzGrants];
       this.bufFeeGrants = [...snapshot.feeGrants, ...this.bufFeeGrants];
       this.bufCw20Transfers = [...snapshot.cw20Transfers, ...this.bufCw20Transfers];
-      this.bufWasmSwaps = [...snapshot.wasmSwaps, ...this.bufWasmSwaps];
-      this.bufFactoryTokens = [...snapshot.factoryTokens, ...this.bufFactoryTokens];
+
       this.bufUnknownMsgs = [...snapshot.unknownMsgs, ...this.bufUnknownMsgs];
       this.bufFactorySupplyEvents = [...snapshot.factorySupplyEvents, ...this.bufFactorySupplyEvents];
 

@@ -49,7 +49,11 @@ export async function insertIbcTransfers(client: PoolClient, rows: any[]): Promi
        memo = COALESCE(EXCLUDED.memo, ibc.transfers.memo),
        timeout_height = COALESCE(EXCLUDED.timeout_height, ibc.transfers.timeout_height),
        timeout_ts = COALESCE(EXCLUDED.timeout_ts, ibc.transfers.timeout_ts),
-       status = EXCLUDED.status,
+       status = CASE
+         WHEN ibc.transfers.status IN ('acknowledged', 'timeout', 'failed') THEN ibc.transfers.status
+         WHEN ibc.transfers.status = 'received' AND EXCLUDED.status = 'sent' THEN ibc.transfers.status
+         ELSE EXCLUDED.status
+       END,
        tx_hash_send = COALESCE(EXCLUDED.tx_hash_send, ibc.transfers.tx_hash_send),
        height_send = COALESCE(EXCLUDED.height_send, ibc.transfers.height_send),
        time_send = COALESCE(EXCLUDED.time_send, ibc.transfers.time_send),

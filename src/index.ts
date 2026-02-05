@@ -242,6 +242,24 @@ async function main() {
           log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
         }
       }, 5 * 60 * 1000);
+
+      // 🛡️ ANALYTICS REFRESH LOOP (Hourly)
+      // Automatically populates materialized views for dashboard data
+      setInterval(async () => {
+        try {
+          const pool = getPgPool();
+          const client = await pool.connect();
+          try {
+            // Refresh last 2 days on hourly loop (Rolling update)
+            await client.query('SELECT util.refresh_all_analytics(2)');
+            log.info('[analytics] auto-refresh complete (window=2d)');
+          } finally {
+            client.release();
+          }
+        } catch (err) {
+          log.warn('[analytics] auto-refresh failed:', err instanceof Error ? err.message : String(err));
+        }
+      }, 60 * 60 * 1000); // 1 hour
     }
 
     // 🛡️ INITIAL SYNC: Fetch network parameters
@@ -312,6 +330,21 @@ async function main() {
       }
     } catch (err) {
       log.warn('[start] params sync failed');
+    }
+
+    // 🛡️ INITIAL SYNC: Refresh Analytics (Ensure dashboard has data on startup)
+    try {
+      const pool = getPgPool();
+      const client = await pool.connect();
+      try {
+        log.info('[start] refreshing analytics materialized views (window=365d)...');
+        await client.query('SELECT util.refresh_all_analytics(365)'); // Refresh last 1 year on startup
+        log.info('[start] analytics refreshed');
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      log.warn('[start] analytics refresh failed:', err instanceof Error ? err.message : String(err));
     }
 
     const backfill = await syncRange(rpc, decodePool, sink, {
