@@ -5,7 +5,8 @@
     "dev": "tsx --watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "refresh-analytics": "tsx src/scripts/refresh-analytics.ts"
   },
   "prettier": {
     "semi": true,

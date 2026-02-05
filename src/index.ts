@@ -19,7 +19,7 @@ import { syncRange } from './runner/syncRange.ts';
 import { retryMissingBlocks } from './runner/retryMissing.ts';
 import { followLoop } from './runner/follow.ts';
 import { bootstrapGenesis } from './scripts/genesis-bootstrap.ts';
-import { reconcileNegativeBalances, reconcileGovProposalTimestamps } from './sink/pg/reconcile.ts';
+import { reconcileNegativeBalances } from './sink/pg/reconcile.ts';
 import { ensureCorePartitions } from './db/partitions.js';
 
 EventEmitter.defaultMaxListeners = 0;
@@ -34,7 +34,10 @@ async function main() {
   let sink: any = null;
 
   // Cleanup handler for signals and catch blocks
+  let isCleaningUp = false;
   const gracefulCleanup = async (exitCode: number) => {
+    if (isCleaningUp) return;
+    isCleaningUp = true;
     await cleanup(decodePool, sink);
     process.exit(exitCode);
   };
@@ -223,15 +226,15 @@ async function main() {
       }
     }
 
-    // 🛡️ RECONCILIATION LOOP
+    // 🛡️ RECONCILIATION LOOP (Balance only - Gov timestamps now handled inline)
     if (cfg.sinkKind === 'postgres') {
       setInterval(async () => {
         try {
           const pool = getPgPool();
           const client = await pool.connect();
           try {
-            await reconcileNegativeBalances(client, rpc, await loadProtoRoot(protoDir));
-            await reconcileGovProposalTimestamps(client, rpc);
+            const protoRoot = await loadProtoRoot(protoDir);
+            await reconcileNegativeBalances(client, rpc, protoRoot);
           } finally {
             client.release();
           }
@@ -239,6 +242,24 @@ async function main() {
           log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
         }
       }, 5 * 60 * 1000);
+
+      // 🛡️ ANALYTICS REFRESH LOOP (Hourly)
+      // Automatically populates materialized views for dashboard data
+      setInterval(async () => {
+        try {
+          const pool = getPgPool();
+          const client = await pool.connect();
+          try {
+            // Refresh last 2 days on hourly loop (Rolling update)
+            await client.query('SELECT util.refresh_all_analytics(2)');
+            log.info('[analytics] auto-refresh complete (window=2d)');
+          } finally {
+            client.release();
+          }
+        } catch (err) {
+          log.warn('[analytics] auto-refresh failed:', err instanceof Error ? err.message : String(err));
+        }
+      }, 60 * 60 * 1000); // 1 hour
     }
 
     // 🛡️ INITIAL SYNC: Fetch network parameters
@@ -311,6 +332,21 @@ async function main() {
       log.warn('[start] params sync failed');
     }
 
+    // 🛡️ INITIAL SYNC: Refresh Analytics (Ensure dashboard has data on startup)
+    try {
+      const pool = getPgPool();
+      const client = await pool.connect();
+      try {
+        log.info('[start] refreshing analytics materialized views (window=365d)...');
+        await client.query('SELECT util.refresh_all_analytics(365)'); // Refresh last 1 year on startup
+        log.info('[start] analytics refreshed');
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      log.warn('[start] analytics refresh failed:', err instanceof Error ? err.message : String(err));
+    }
+
     const backfill = await syncRange(rpc, decodePool, sink, {
       from: startFrom,
       to: endHeight,
@@ -353,8 +389,7 @@ async function cleanup(decodePool: any, sink: any) {
   try {
     if (decodePool) await decodePool.close();
     if (sink) {
-      await sink.flush?.();
-      await sink.close?.();
+      await sink.close?.(); // close() handles flushing internally
     }
     log.info('Shutdown complete.');
   } catch (err) {

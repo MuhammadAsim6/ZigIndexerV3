@@ -17,11 +17,12 @@ export async function flushGovDeposits(
     amount: string;
     height: number;
     tx_hash: string;
+    msg_index: number;
   }>,
 ) {
   if (!rows.length) return;
 
-  const columns = ['proposal_id', 'depositor', 'denom', 'amount', 'height', 'tx_hash'] as const;
+  const columns = ['proposal_id', 'depositor', 'denom', 'amount', 'height', 'tx_hash', 'msg_index'] as const;
 
   const shaped = rows.map((r) => ({
     proposal_id: r.proposal_id.toString(),
@@ -30,6 +31,7 @@ export async function flushGovDeposits(
     amount: r.amount,
     height: r.height,
     tx_hash: r.tx_hash,
+    msg_index: r.msg_index,
   }));
 
   await execBatchedInsert(client, 'gov.deposits', columns as unknown as string[], shaped, 'ON CONFLICT DO NOTHING');
@@ -95,9 +97,6 @@ export async function upsertGovProposals(
     voting_end?: Date | null;
     total_deposit?: any | null;
     changes?: any | null;
-    metadata?: string | null;
-    tally_result?: any | null;
-    executor_result?: string | null;
   }>,
 ) {
   if (!rows.length) return;
@@ -123,9 +122,6 @@ export async function upsertGovProposals(
         voting_end: row.voting_end ?? existing.voting_end,
         total_deposit: row.total_deposit ?? existing.total_deposit,
         changes: row.changes ?? existing.changes,
-        metadata: row.metadata ?? existing.metadata,
-        tally_result: row.tally_result ?? existing.tally_result,
-        executor_result: row.executor_result ?? existing.executor_result,
       });
     } else {
       mergedMap.set(key, { ...row });
@@ -136,7 +132,7 @@ export async function upsertGovProposals(
   const columns = [
     'proposal_id', 'submitter', 'title', 'summary', 'proposal_type',
     'status', 'submit_time', 'deposit_end', 'voting_start', 'voting_end',
-    'total_deposit', 'changes', 'metadata', 'tally_result', 'executor_result'
+    'total_deposit', 'changes'
   ] as const;
 
   const shaped = finalRows.map((r) => ({
@@ -152,9 +148,6 @@ export async function upsertGovProposals(
     voting_end: r.voting_end ? r.voting_end.toISOString() : null,
     total_deposit: r.total_deposit ? JSON.stringify(r.total_deposit) : null,
     changes: r.changes ? JSON.stringify(r.changes) : null,
-    metadata: r.metadata ?? null,
-    tally_result: r.tally_result ? JSON.stringify(r.tally_result) : null,
-    executor_result: r.executor_result ?? null,
   }));
 
   await execBatchedInsert(
@@ -173,9 +166,6 @@ export async function upsertGovProposals(
       voting_start    = COALESCE(EXCLUDED.voting_start, gov.proposals.voting_start),
       voting_end      = COALESCE(EXCLUDED.voting_end, gov.proposals.voting_end),
       total_deposit   = COALESCE(EXCLUDED.total_deposit, gov.proposals.total_deposit),
-      changes         = COALESCE(EXCLUDED.changes, gov.proposals.changes),
-      metadata        = COALESCE(EXCLUDED.metadata, gov.proposals.metadata),
-      tally_result    = COALESCE(EXCLUDED.tally_result, gov.proposals.tally_result),
-      executor_result = COALESCE(EXCLUDED.executor_result, gov.proposals.executor_result)`,
+      changes         = COALESCE(EXCLUDED.changes, gov.proposals.changes)`,
   );
 }

@@ -66,17 +66,23 @@ import { flushWasmAdminChanges } from './pg/flushers/wasm_admin_changes.js';
 // ✅ Zigchain Flusher
 import { flushZigchainData } from './pg/flushers/zigchain.js';
 
-// ✅ WASM DEX Swap Analytics
-import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js';
 
 // ✅ Unknown Messages Quarantine
 import { flushUnknownMessages } from './pg/flushers/unknown_msgs.js';
 
 // ✅ Zigchain Factory Supply Tracking
 import { flushFactorySupplyEvents } from './pg/flushers/factory_supply.js';
+import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js'; // ✅ ADDED
 
 // ✅ Gov Params Helper (for timestamp calculation)
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
+// ✅ Gov ABCI Helper (for fetching proposal data via RPC)
+import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
+// ✅ RPC Client and ProtoRoot for ABCI queries
+import { createRpcClientFromConfig, RpcClient } from '../rpc/client.js';
+import { loadProtoRoot } from '../decode/dynamicProto.js';
+import { Root } from 'protobufjs';
+import path from 'node:path';
 
 const log = getLogger('sink/postgres');
 
@@ -120,6 +126,10 @@ type BlockLine = any;
 export class PostgresSink implements Sink {
   private cfg: PostgresSinkConfig;
   private mode: PostgresMode;
+  private rpc: RpcClient | null = null;
+  private protoRoot: Root | null = null;
+  private govTimestampsCache = new Map<string, any>();
+  private isShuttingDown = false;
 
   // Standard Buffers
   private bufBlocks: any[] = [];
@@ -217,6 +227,24 @@ export class PostgresSink implements Sink {
 
   async init(): Promise<void> {
     await createPgPool({ ...this.cfg.pg, applicationName: 'cosmos-indexer' });
+
+    // ✅ Initialize RPC client and protoRoot for ABCI queries (gov timestamps)
+    if (this.cfg.rpcUrl) {
+      this.rpc = createRpcClientFromConfig({
+        rpcUrl: this.cfg.rpcUrl,
+        timeoutMs: 30000,
+        retries: 2,
+        backoffMs: 500,
+        backoffJitter: 0.2,
+        rps: 10,
+      });
+      const protoDir = process.env.PROTO_DIR || path.join(process.cwd(), 'protos');
+      try {
+        this.protoRoot = await loadProtoRoot(protoDir);
+      } catch (err) {
+        log.warn(`[postgres] Failed to load proto root from ${protoDir}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   async write(line: any): Promise<void> {
@@ -246,6 +274,8 @@ export class PostgresSink implements Sink {
   }
 
   async close(): Promise<void> {
+    if (this.isShuttingDown) return;
+    this.isShuttingDown = true;
     await this.flush?.();
     await closePgPool();
   }
@@ -430,7 +460,7 @@ export class PostgresSink implements Sink {
 
           if (effectiveVotingStart || effectiveVotingEnd || depositEnd) {
             govProposalsRows.push({
-              proposal_id: pid,
+              proposal_id: BigInt(pid),
               // If we see voting timestamps or events, it's definitely in voting period or passed it
               status: (effectiveVotingEnd && effectiveVotingEnd < time) ? 'passed' : (effectiveVotingStart ? 'voting_period' : undefined),
               voting_start: effectiveVotingStart,
@@ -440,55 +470,24 @@ export class PostgresSink implements Sink {
           }
         }
 
-        // ✅ ENHANCEMENT: Final Tally Result extraction
-        // Handle multiple event types that may contain tally info
-        if (ev.type === 'proposal_tally' || ev.type === 'inactive_proposal' || ev.type === 'proposal_result') {
-          const tally = {
-            yes: findAttr(attrs, 'yes') || findAttr(attrs, 'tally_yes') || findAttr(attrs, 'yes_count'),
-            no: findAttr(attrs, 'no') || findAttr(attrs, 'tally_no') || findAttr(attrs, 'no_count'),
-            no_with_veto: findAttr(attrs, 'no_with_veto') || findAttr(attrs, 'tally_no_with_veto') || findAttr(attrs, 'no_with_veto_count'),
-            abstain: findAttr(attrs, 'abstain') || findAttr(attrs, 'tally_abstain') || findAttr(attrs, 'abstain_count')
-          };
-
-          // Also extract status from result events
-          const status = findAttr(attrs, 'status') || findAttr(attrs, 'proposal_status');
-          const finalStatus = status ? status.toLowerCase().replace('proposal_status_', '') : undefined;
-
-          if (tally.yes || tally.no || finalStatus) {
-            govProposalsRows.push({
-              proposal_id: pid,
-              status: finalStatus || undefined,
-              tally_result: (tally.yes || tally.no) ? tally : undefined
-            } as any);
-          }
-        }
-
-        // ✅ ENHANCEMENT: Execution Result tracking
-        if (ev.type === 'proposal_executed') {
-          const result = findAttr(attrs, 'result') || findAttr(attrs, 'proposal_result') || 'executed';
-          govProposalsRows.push({
-            proposal_id: pid,
-            status: result.toLowerCase().includes('pass') || result.toLowerCase().includes('success') ? 'passed' : 'rejected',
-            executor_result: result
-          } as any);
-        }
-
-        // ✅ NEW: Handle passed/rejected/failed status events
+        // ✅ Final Tally Result extraction REMOVED (per user request)
+        // ✅ Execution Result tracking REMOVED (per user request)
+        // ✅ Handle passed/rejected/failed status events
         if (ev.type === 'proposal_passed' || ev.type === 'submit_proposal_passed') {
           govProposalsRows.push({
-            proposal_id: pid,
+            proposal_id: BigInt(pid),
             status: 'passed'
           } as any);
         }
         if (ev.type === 'proposal_rejected' || ev.type === 'submit_proposal_rejected') {
           govProposalsRows.push({
-            proposal_id: pid,
+            proposal_id: BigInt(pid),
             status: 'rejected'
           } as any);
         }
         if (ev.type === 'proposal_failed' || ev.type === 'submit_proposal_failed') {
           govProposalsRows.push({
-            proposal_id: pid,
+            proposal_id: BigInt(pid),
             status: 'failed'
           } as any);
         }
@@ -626,7 +625,8 @@ export class PostgresSink implements Sink {
               amount: coin.amount,
               denom: coin.denom,
               height,
-              tx_hash
+              tx_hash,
+              msg_index: i // Capture message index
             });
           }
 
@@ -645,7 +645,7 @@ export class PostgresSink implements Sink {
             const votingEnd = veAt || calculateVotingEnd(votingStart);
 
             govProposalsRows.push({
-              proposal_id: m.proposal_id,
+              proposal_id: BigInt(m.proposal_id),
               status: 'voting_period',
               voting_start: votingStart,
               voting_end: votingEnd,
@@ -669,6 +669,23 @@ export class PostgresSink implements Sink {
 
             // ✅ EXTRACTION: Initial Deposit
             const initialDeposit = m.initial_deposit ?? m.initialDeposit ?? null;
+
+            // ✅ FIX: Capture Initial Deposit in gov.deposits table
+            if (initialDeposit) {
+              const deposits = Array.isArray(initialDeposit) ? initialDeposit : [initialDeposit];
+              for (const coin of deposits) {
+                if (!coin) continue;
+                govDepositsRows.push({
+                  proposal_id: pid,
+                  depositor: submitter,
+                  amount: coin.amount,
+                  denom: coin.denom,
+                  height,
+                  tx_hash,
+                  msg_index: i // Capture message index to differentiate same-block deposits
+                });
+              }
+            }
 
             // ✅ EXTRACTION: Changes (for Param Changes or legacy content)
             // For v1, we store the full messages array. For v1beta1, we try to be specific.
@@ -712,7 +729,7 @@ export class PostgresSink implements Sink {
             }
 
             govProposalsRows.push({
-              proposal_id: pid,
+              proposal_id: BigInt(pid),
               submitter,
               title: m.title ?? m.content?.title ?? content?.title ?? '',
               summary: m.summary ?? m.content?.description ?? content?.description ?? '',
@@ -724,7 +741,6 @@ export class PostgresSink implements Sink {
               voting_end: votingEnd,
               total_deposit: initialDeposit,
               changes: changes,
-              metadata: m.metadata ?? null,
             });
           }
         }
@@ -1285,7 +1301,7 @@ export class PostgresSink implements Sink {
               client_type: clientState?.type_url?.split('.').pop()?.toLowerCase() ||
                 clientState?.['@type']?.split('.').pop()?.toLowerCase() || 'tendermint',
               updated_at_height: height,
-              updated_at_time: time
+              updated_at_time: !isNaN(time.getTime()) ? time : new Date()
             });
           }
         }
@@ -1558,8 +1574,15 @@ export class PostgresSink implements Sink {
             const sequence = toBigIntStr(sequenceStr);
             const srcPort = findAttr(attrsPairs, 'packet_src_port');
             const srcChan = findAttr(attrsPairs, 'packet_src_channel');
-            const dstPort = findAttr(attrsPairs, 'packet_dst_port');
-            const dstChan = findAttr(attrsPairs, 'packet_dst_channel');
+            let dstPort = findAttr(attrsPairs, 'packet_dst_port');
+            let dstChan = findAttr(attrsPairs, 'packet_dst_channel');
+
+            // 🛡️ Fallback: If dst missing, try to find it in previous packets for this channel? No, stateless.
+            // Just warn if it's a send_packet
+            if (event_type === 'send_packet' && (!dstPort || !dstChan)) {
+              // Try identifying from raw packet_data if possible, but for now just warn
+              log.warn(`[ibc] send_packet missing dst info: ${srcPort}/${srcChan} seq=${sequence}`);
+            }
 
             // ✅ FIX: Extract timeout fields
             const timeoutHeightStr = findAttr(attrsPairs, 'packet_timeout_height');
@@ -1625,16 +1648,28 @@ export class PostgresSink implements Sink {
               };
               const status = statusMap[event_type] || 'failed';
 
+              const safeTime = !isNaN(time.getTime()) ? time : new Date();
+
+              // ✅ FIX: Improved Ack Parsing (Handle non-JSON strings correctly)
               let ackSuccess: boolean | null = null;
               let ackError: string | null = null;
               if (event_type === 'acknowledge_packet') {
                 const ackHex = findAttr(attrsPairs, 'packet_ack');
                 if (ackHex) {
-                  try {
-                    const ackJson = tryParseJson(ackHex);
+                  const ackJson = tryParseJson(ackHex);
+                  if (ackJson && typeof ackJson === 'object' && !Array.isArray(ackJson)) {
                     ackSuccess = !!ackJson.result;
                     ackError = ackJson.error || null;
-                  } catch { /* ignore hex/binary parse errors for now */ }
+                  } else {
+                    // Fallback for strings (e.g. "error: code 123")
+                    // tryParseJson returns the string itself if it fails to parse as JSON
+                    const ackStr = typeof ackJson === 'string' ? ackJson : ackHex;
+                    if (ackStr.includes('result')) ackSuccess = true;
+                    else if (ackStr.includes('error') || ackStr.includes('failed')) {
+                      ackSuccess = false;
+                      ackError = ackStr;
+                    }
+                  }
                 }
               }
 
@@ -1642,7 +1677,7 @@ export class PostgresSink implements Sink {
               const packetRow: any = {
                 port_id_src: srcPort,
                 channel_id_src: srcChan,
-                sequence: Number(sequence), // Ensure numeric for BIGINT
+                sequence: sequence, // ✅ FIX: Use string/BigInt directly, avoid Number() precision loss
                 port_id_dst: dstPort,
                 channel_id_dst: dstChan,
                 timeout_height: timeoutHeightStr ?? null,
@@ -1664,24 +1699,24 @@ export class PostgresSink implements Sink {
               if (event_type === 'send_packet') {
                 packetRow.tx_hash_send = tx_hash;
                 packetRow.height_send = height;
-                packetRow.time_send = time;
+                packetRow.time_send = safeTime; // ✅ FIX: Use safeTime
                 packetRow.relayer_send = relayer;
               } else if (event_type === 'recv_packet') {
                 packetRow.tx_hash_recv = tx_hash;
                 packetRow.height_recv = height;
-                packetRow.time_recv = time;
+                packetRow.time_recv = safeTime; // ✅ FIX: Use safeTime
                 packetRow.relayer_recv = relayer;
               } else if (event_type === 'acknowledge_packet') {
                 packetRow.tx_hash_ack = tx_hash;
                 packetRow.height_ack = height;
-                packetRow.time_ack = time;
+                packetRow.time_ack = safeTime; // ✅ FIX: Use safeTime
                 packetRow.relayer_ack = relayer;
                 packetRow.ack_success = ackSuccess;
                 packetRow.ack_error = ackError;
               } else if (event_type === 'timeout_packet') {
                 packetRow.tx_hash_timeout = tx_hash;
                 packetRow.height_timeout = height;
-                packetRow.time_timeout = time;
+                packetRow.time_timeout = safeTime; // ✅ FIX: Use safeTime
               }
 
               ibcPacketsRows.push(packetRow);
@@ -1691,7 +1726,7 @@ export class PostgresSink implements Sink {
               const transferRow: any = {
                 port_id_src: srcPort,
                 channel_id_src: srcChan,
-                sequence: Number(sequence),
+                sequence: sequence, // ✅ FIX: Use string/BigInt directly
                 port_id_dst: dstPort,
                 channel_id_dst: dstChan,
                 sender,
@@ -1711,24 +1746,24 @@ export class PostgresSink implements Sink {
               if (event_type === 'send_packet') {
                 transferRow.tx_hash_send = tx_hash;
                 transferRow.height_send = height;
-                transferRow.time_send = time;
+                transferRow.time_send = safeTime; // ✅ FIX
                 transferRow.relayer_send = relayer;
               } else if (event_type === 'recv_packet') {
                 transferRow.tx_hash_recv = tx_hash;
                 transferRow.height_recv = height;
-                transferRow.time_recv = time;
+                transferRow.time_recv = safeTime; // ✅ FIX
                 transferRow.relayer_recv = relayer;
               } else if (event_type === 'acknowledge_packet') {
                 transferRow.tx_hash_ack = tx_hash;
                 transferRow.height_ack = height;
-                transferRow.time_ack = time;
+                transferRow.time_ack = safeTime; // ✅ FIX
                 transferRow.relayer_ack = relayer;
                 transferRow.ack_success = ackSuccess;
                 transferRow.ack_error = ackError;
               } else if (event_type === 'timeout_packet') {
                 transferRow.tx_hash_timeout = tx_hash;
                 transferRow.height_timeout = height;
-                transferRow.time_timeout = time;
+                transferRow.time_timeout = safeTime; // ✅ FIX
               }
 
               ibcTransfersRows.push(transferRow);
@@ -1853,30 +1888,6 @@ export class PostgresSink implements Sink {
           }
         }
       }
-
-      // 🛡️ ENHANCEMENT: Final Flush for any unlinked IBC Intents in this TX
-      // This ensures we capture MsgTransfer rows even if the send_packet event is missing or malformed.
-      for (const intent of txIbcIntents) {
-        if (!intent.linked) {
-          ibcTransfersRows.push({
-            height,
-            tx_hash,
-            msg_index: intent.msg_index,
-            port_id_src: intent.port,
-            channel_id_src: intent.channel,
-            sequence: '0',
-            sender: intent.sender,
-            receiver: intent.receiver,
-            denom: intent.denom,
-            amount: intent.amount,
-            memo: intent.memo,
-            status: 'sent',
-            tx_hash_send: tx_hash,
-            height_send: height,
-            time
-          });
-        }
-      }
     }
 
     // ✅ FIX: Process Begin/End Block Events for Balances (e.g. Gov Refunds, Minting)
@@ -1885,10 +1896,13 @@ export class PostgresSink implements Sink {
       ...(blockLine.block_results?.end_block_events ?? [])
     ];
 
-    for (const ev of allBlockEvents) {
+    for (let i = 0; i < allBlockEvents.length; i++) {
+      const ev = allBlockEvents[i];
       const evType = ev.type;
       const attrsPairs = attrsToPairs(ev.attributes);
-      extractBalanceDeltas(evType, attrsPairs);
+      // ✅ FIX: Pass 'i' as event_index to prevent dedup collisions (defaults to -1 otherwise)
+      // tx_hash and msg_index are undefined for block events
+      extractBalanceDeltas(evType, attrsPairs, undefined, undefined, i);
     }
 
 
@@ -1938,6 +1952,8 @@ export class PostgresSink implements Sink {
     this.bufWasmEventAttrs.push(...data.wasmEventAttrsRows);
 
     // WASM Data
+    this.bufWasmEvents.push(...data.wasmEventsRows);
+    this.bufWasmExec.push(...data.wasmExecRows);
 
     // ✅ Gov (Pushing to Buffers)
     this.bufGovVotes.push(...data.govVotesRows);
@@ -2097,6 +2113,45 @@ export class PostgresSink implements Sink {
       // 2. Modules (WASM & Gov)
       await flushGovVotes(client, snapshot.govVotes);
       await flushGovDeposits(client, snapshot.govDeposits);
+
+      // ✅ ENHANCEMENT: Fetch accurate timestamps via ABCI for new proposals (with caching)
+      if (snapshot.govProposals.length > 0 && this.rpc && this.protoRoot) {
+        const uniqueProposalIds = [...new Set(snapshot.govProposals.map(p => p.proposal_id))];
+        for (const pid of uniqueProposalIds) {
+          const pidStr = pid.toString();
+          try {
+            // Check cache first to avoid redundant RPC calls
+            let abciData = this.govTimestampsCache.get(pidStr);
+
+            if (!abciData) {
+              abciData = await fetchProposalDataViaAbci(this.rpc, this.protoRoot, pidStr);
+              if (abciData) {
+                this.govTimestampsCache.set(pidStr, abciData);
+              }
+            }
+
+            if (abciData) {
+              // Update all proposal rows for this ID with accurate data
+              for (const row of snapshot.govProposals) {
+                if (row.proposal_id === pid) {
+                  // RPC data is authoritative for lifecycle and metadata
+                  if (abciData.submit_time) row.submit_time = abciData.submit_time;
+                  if (abciData.deposit_end_time) row.deposit_end = abciData.deposit_end_time;
+                  if (abciData.voting_start_time) row.voting_start = abciData.voting_start_time;
+                  if (abciData.voting_end_time) row.voting_end = abciData.voting_end_time;
+
+                  // fallback for title/summary if missed from message
+                  if (abciData.title && !row.title) row.title = abciData.title;
+                  if (abciData.summary && !row.summary) row.summary = abciData.summary;
+                }
+              }
+            }
+          } catch (err: any) {
+            log.warn(`[flush] Failed to fetch ABCI timestamps for proposal ${pid}: ${err.message}`);
+          }
+        }
+      }
+
       await upsertGovProposals(client, snapshot.govProposals);
 
       await flushAuthzGrants(client, snapshot.authzGrants);
@@ -2161,6 +2216,9 @@ export class PostgresSink implements Sink {
       }
 
       // 3. Zigchain
+      await flushWasmSwaps(client, snapshot.wasmSwaps); // ✅ FIX: Flush WASM Swaps
+      await flushFactoryTokens(client, snapshot.factoryTokens); // ✅ FIX: Flush Factory Tokens
+
       await flushZigchainData(client, {
         factoryDenoms: snapshot.factoryDenoms,
         dexPools: snapshot.dexPools,
@@ -2187,8 +2245,10 @@ export class PostgresSink implements Sink {
       this.bufAttrs = [...snapshot.attrs, ...this.bufAttrs];
       this.bufTransfers = [...snapshot.transfers, ...this.bufTransfers];
       this.bufFactoryDenoms = [...snapshot.factoryDenoms, ...this.bufFactoryDenoms];
+      this.bufFactoryTokens = [...snapshot.factoryTokens, ...this.bufFactoryTokens]; // ✅ FIX: Restore Buffer
       this.bufDexPools = [...snapshot.dexPools, ...this.bufDexPools];
       this.bufDexSwaps = [...snapshot.dexSwaps, ...this.bufDexSwaps];
+      this.bufWasmSwaps = [...snapshot.wasmSwaps, ...this.bufWasmSwaps]; // ✅ FIX: Restore Buffer
       this.bufDexLiquidity = [...snapshot.dexLiquidity, ...this.bufDexLiquidity];
       this.bufWrapperSettings = [...snapshot.wrapperSettings, ...this.bufWrapperSettings];
       this.bufWrapperEvents = [...snapshot.wrapperEvents, ...this.bufWrapperEvents];
@@ -2219,8 +2279,7 @@ export class PostgresSink implements Sink {
       this.bufAuthzGrants = [...snapshot.authzGrants, ...this.bufAuthzGrants];
       this.bufFeeGrants = [...snapshot.feeGrants, ...this.bufFeeGrants];
       this.bufCw20Transfers = [...snapshot.cw20Transfers, ...this.bufCw20Transfers];
-      this.bufWasmSwaps = [...snapshot.wasmSwaps, ...this.bufWasmSwaps];
-      this.bufFactoryTokens = [...snapshot.factoryTokens, ...this.bufFactoryTokens];
+
       this.bufUnknownMsgs = [...snapshot.unknownMsgs, ...this.bufUnknownMsgs];
       this.bufFactorySupplyEvents = [...snapshot.factorySupplyEvents, ...this.bufFactorySupplyEvents];
 

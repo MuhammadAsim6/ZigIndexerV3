@@ -232,10 +232,7 @@ CREATE TABLE gov.proposals (
     voting_end      TIMESTAMPTZ NULL,
     total_deposit   JSONB NULL,
     changes         JSONB NULL,
-    submit_time     TIMESTAMPTZ NULL,
-    metadata        TEXT NULL,          -- v1 support
-    tally_result    JSONB NULL,         -- Final tally when voting ends
-    executor_result TEXT NULL           -- Execution result for passed proposals
+    submit_time     TIMESTAMPTZ NULL
 );
 
 CREATE TABLE gov.deposits (
@@ -245,7 +242,8 @@ CREATE TABLE gov.deposits (
     amount      NUMERIC(80, 0) NOT NULL,
     height      BIGINT         NOT NULL,
     tx_hash     TEXT           NOT NULL,
-    PRIMARY KEY (proposal_id, depositor, denom, height, tx_hash)
+    msg_index   INT            NOT NULL DEFAULT 0,
+    PRIMARY KEY (proposal_id, depositor, denom, height, tx_hash, msg_index)
 ) PARTITION BY RANGE (height);
 
 CREATE TABLE gov.votes (

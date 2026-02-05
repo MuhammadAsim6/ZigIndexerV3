@@ -44,7 +44,11 @@ export async function insertIbcPackets(client: PoolClient, rows: any[]): Promise
        channel_id_dst = COALESCE(EXCLUDED.channel_id_dst, ibc.packets.channel_id_dst),
        timeout_height = COALESCE(EXCLUDED.timeout_height, ibc.packets.timeout_height),
        timeout_ts = COALESCE(EXCLUDED.timeout_ts, ibc.packets.timeout_ts),
-       status = EXCLUDED.status,
+       status = CASE
+         WHEN ibc.packets.status IN ('acknowledged', 'timeout', 'failed') THEN ibc.packets.status
+         WHEN ibc.packets.status = 'received' AND EXCLUDED.status = 'sent' THEN ibc.packets.status
+         ELSE EXCLUDED.status
+       END,
        tx_hash_send = COALESCE(EXCLUDED.tx_hash_send, ibc.packets.tx_hash_send),
        height_send = COALESCE(EXCLUDED.height_send, ibc.packets.height_send),
        time_send = COALESCE(EXCLUDED.time_send, ibc.packets.time_send),

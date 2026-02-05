@@ -37,11 +37,18 @@ export function collectProtoFiles(dir: string): string[] {
  * @param batchSize - Number of files to load per batch (default 200).
  * @returns Promise resolving to the loaded protobuf.Root.
  */
+const protoCache = new Map<string, protobuf.Root>();
+
 export async function loadProtoRootWithProgress(
   protoDir: string,
   onProgress?: (loaded: number, total: number) => void,
   batchSize = 200,
 ): Promise<protobuf.Root> {
+  // ✅ CACHE: return existing root if already loaded for this directory
+  if (protoCache.has(protoDir)) {
+    return protoCache.get(protoDir)!;
+  }
+
   const files = collectProtoFiles(protoDir);
   if (files.length === 0) throw new Error(`No .proto files found in ${protoDir}`);
 
@@ -65,6 +72,8 @@ export async function loadProtoRootWithProgress(
   }
 
   root.resolveAll();
+  // ✅ CACHE: Store the loaded root so future calls use the cache
+  protoCache.set(protoDir, root);
   log.debug('Loaded proto root', { totalFiles: total, dir: protoDir });
   return root;
 }
