@@ -55,7 +55,9 @@ export async function insertDexSwaps(client: PoolClient, rows: any[]): Promise<v
   if (!rows?.length) return;
   const cols = [
     'tx_hash', 'msg_index', 'pool_id', 'sender_address', 'token_in_denom',
-    'token_in_amount', 'token_out_denom', 'token_out_amount', 'price_impact', 'block_height'
+    'token_in_amount', 'token_out_denom', 'token_out_amount', 
+    'pair_id', 'effective_price', 'total_fee', 'price_impact', 
+    'block_height', 'timestamp'
   ];
   await execBatchedInsert(
     client,

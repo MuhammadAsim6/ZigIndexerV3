@@ -1,5 +1,5 @@
--- initdb/070-zigchain-wasm-analytics.sql
--- Enhanced WASM DEX Analytics for Zigchain
+-- initdb/038-wasm-dex-indexing.sql
+-- WASM DEX Indexing for Zigchain
 -- Tracks detailed swap data from CosmWasm AMM contracts
 
 -- ============================================================================
@@ -61,8 +61,7 @@ CREATE TABLE IF NOT EXISTS tokens.factory_tokens (
 CREATE INDEX IF NOT EXISTS idx_factory_tokens_creator ON tokens.factory_tokens (creator);
 CREATE INDEX IF NOT EXISTS idx_factory_tokens_symbol ON tokens.factory_tokens (symbol);
 
--- NOTE: analytics.swap_volume_hourly moved to initdb/050-analytics-schema.sql
--- See initdb/051-analytics-functions.sql for population logic
+
 
 -- ============================================================================
 -- 4. HELPER: Update Pool Reserves (Trigger for dex_pools)

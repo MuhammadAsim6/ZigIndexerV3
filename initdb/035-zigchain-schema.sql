@@ -56,6 +56,10 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
     token_in_amount   TEXT, 
     token_out_denom   TEXT,
     token_out_amount  TEXT, 
+    -- Analytics columns (Mirrored from wasm.dex_swaps)
+    pair_id           TEXT,
+    effective_price   NUMERIC,
+    total_fee         TEXT DEFAULT '0',
     price_impact      TEXT, 
     block_height      BIGINT NOT NULL,
     timestamp         TIMESTAMPTZ DEFAULT NOW(),

@@ -78,6 +78,8 @@ import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js'
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
 // ✅ Gov ABCI Helper (for fetching proposal data via RPC)
 import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
+// ✅ WASM ABCI Helper (for fetching contract data via RPC)
+import { fetchContractInfoViaAbci } from './pg/helpers/wasm_abci.js';
 // ✅ RPC Client and ProtoRoot for ABCI queries
 import { createRpcClientFromConfig, RpcClient } from '../rpc/client.js';
 import { loadProtoRoot } from '../decode/dynamicProto.js';
@@ -129,6 +131,7 @@ export class PostgresSink implements Sink {
   private rpc: RpcClient | null = null;
   private protoRoot: Root | null = null;
   private govTimestampsCache = new Map<string, any>();
+  private wasmContractsCache = new Map<string, any>();
   private isShuttingDown = false;
 
   // Standard Buffers
@@ -1038,33 +1041,13 @@ export class PostgresSink implements Sink {
           }
         }
 
+        // ✅ REDUNDANT: Native MsgSwap is now handled via 'token_swapped' events in the event loop for better accuracy (analytics parity).
+        /*
         if (type.endsWith('.MsgSwapExactIn') || type.endsWith('.MsgSwapExactOut') || type.endsWith('.MsgSwap')) {
           let priceImpact = null;
-          // Try to extract price_impact from event or calculate from amounts
-          if (msgLog) {
-            for (const e of msgLog.events) {
-              const pairs = attrsToPairs(e.attributes);
-              const pi = findAttr(pairs, 'price_impact');
-              if (pi) {
-                priceImpact = pi;
-                break;
-              }
-            }
-          }
-
-          dexSwapsRows.push({
-            tx_hash,
-            msg_index: i,
-            pool_id: m.pool_id,
-            sender_address: m.signer || m.creator || firstSigner,
-            token_in_denom: m.incoming?.denom || m.incoming_max?.denom,
-            token_in_amount: m.incoming?.amount || m.incoming_max?.amount,
-            token_out_denom: m.outgoing?.denom || m.outgoing_min?.denom,
-            token_out_amount: m.outgoing?.amount || m.outgoing_min?.amount,
-            price_impact: priceImpact,
-            block_height: height
-          });
+          // ... (moved to event-based indexing)
         }
+        */
 
         if (type.endsWith('.MsgAddLiquidity') || type.endsWith('.MsgRemoveLiquidity')) {
           let poolId = m.pool_id;
@@ -1324,9 +1307,9 @@ export class PostgresSink implements Sink {
       }
 
       // --- PROCESS LOGS (Events) ---
-      for (const log of logs) {
-        const msg_index = Number(log?.msg_index ?? -1);
-        const events = normArray<any>(log?.events);
+      for (const l of logs) {
+        const msg_index = Number(l?.msg_index ?? -1);
+        const events = normArray<any>(l?.events);
 
         // 🔄 Pre-scan message events for IBC metadata and general sender
         let msgIbcMeta: any = {};
@@ -1354,8 +1337,11 @@ export class PostgresSink implements Sink {
             attributes: attrsPairs, height
           });
 
+          const contract = findAttr(attrsPairs, 'contract_address') || findAttr(attrsPairs, '_contract_address');
+          const action = findAttr(attrsPairs, 'action');
+          const method = findAttr(attrsPairs, 'method');
+
           if (event_type === 'wasm') {
-            const contract = findAttr(attrsPairs, 'contract_address') || findAttr(attrsPairs, '_contract_address');
             if (contract) {
               wasmEventsRows.push({
                 contract, height, tx_hash, msg_index, event_index: ei, event_type, attributes: attrsPairs
@@ -1376,9 +1362,6 @@ export class PostgresSink implements Sink {
               }
 
               // ✅ ENHANCED CW20 DETECTION (Multiple patterns)
-              const action = findAttr(attrsPairs, 'action');
-              const method = findAttr(attrsPairs, 'method');
-
               // Pattern 1: action=transfer/send (standard CW20)
               // Pattern 2: method=transfer/send (some CW20 variants)
               // Pattern 3: Heuristic - from/to/amount without action (non-standard)
@@ -1388,6 +1371,7 @@ export class PostgresSink implements Sink {
                 action === 'transfer_from' || action === 'send_from' ||
                 method === 'transfer' || method === 'send' ||
                 (!action && !method && hasFromTo && findAttr(attrsPairs, 'amount'));
+
 
               if (isCw20Transfer) {
                 const fromAddr =
@@ -1414,122 +1398,175 @@ export class PostgresSink implements Sink {
                 }
               }
 
-              // ✅ WASM DEX SWAP EXTRACTION (Astroport/TerraSwap style)
-              if (action === 'swap') {
-                const sender = findAttr(attrsPairs, 'sender');
-                const receiver = findAttr(attrsPairs, 'receiver') || sender;
-                const offerAsset = findAttr(attrsPairs, 'offer_asset');
-                const askAsset = findAttr(attrsPairs, 'ask_asset');
-                const offerAmount = findAttr(attrsPairs, 'offer_amount');
-                const returnAmount = findAttr(attrsPairs, 'return_amount');
-                const spreadAmount = findAttr(attrsPairs, 'spread_amount');
-                const commissionAmount = findAttr(attrsPairs, 'commission_amount');
-                const makerFeeAmount = findAttr(attrsPairs, 'maker_fee_amount');
-                const feeShareAmount = findAttr(attrsPairs, 'fee_share_amount');
-                const reservesRaw = findAttr(attrsPairs, 'reserves');
-                let reserves = null;
-                if (reservesRaw) {
-                  // Handle both "amountDenom" and "denom:amount" formats
-                  const obj: Record<string, string> = {};
-                  const parts = reservesRaw.split(',');
-                  for (const p of parts) {
-                    const trimmed = p.trim();
-                    if (!trimmed) continue;
-                    // Try denom:amount
-                    const colonIdx = trimmed.lastIndexOf(':');
-                    if (colonIdx > 0) {
-                      const d = trimmed.slice(0, colonIdx);
-                      const a = trimmed.slice(colonIdx + 1).replace(/\D/g, ''); // sanitize amount
-                      if (d && a) obj[d] = a;
-                    } else {
-                      // fallback to standard parseCoin
-                      const c = parseCoin(trimmed);
-                      if (c) obj[c.denom] = c.amount;
-                    }
-                  }
-                  reserves = Object.keys(obj).length > 0 ? JSON.stringify(obj) : JSON.stringify({ raw: reservesRaw });
-                }
-
-                if (sender && offerAmount) {
-                  // ✅ Compute analytics columns with NaN validation
-                  const offerNum = parseFloat(offerAmount || '0');
-                  const returnNum = parseFloat(returnAmount || '0');
-                  const spreadNum = parseFloat(spreadAmount || '0');
-                  const commissionNum = parseFloat(commissionAmount || '0');
-                  const makerFeeNum = parseFloat(makerFeeAmount || '0');
-                  const feeShareNum = parseFloat(feeShareAmount || '0');
-
-                  // Generate sorted pair_id for consistent pair identification
-                  const pairId = offerAsset && askAsset
-                    ? [offerAsset, askAsset].sort().join('-')
-                    : null;
-
-                  // Effective price: return_amount / offer_amount (with NaN check)
-                  const effectivePrice = offerNum > 0 && !isNaN(returnNum)
-                    ? returnNum / offerNum
-                    : null;
-
-                  // Price impact (slippage %): (spread_amount / offer_amount) * 100 (with NaN check)
-                  const priceImpact = offerNum > 0 && !isNaN(spreadNum)
-                    ? (spreadNum / offerNum) * 100
-                    : null;
-
-                  // Total fee: sum of all fees (with NaN check)
-                  const feeSum = (isNaN(commissionNum) ? 0 : commissionNum) +
-                    (isNaN(makerFeeNum) ? 0 : makerFeeNum) +
-                    (isNaN(feeShareNum) ? 0 : feeShareNum);
-                  const totalFee = feeSum > 0 ? feeSum.toString() : '0';
-
-                  wasmSwapsRows.push({
-                    tx_hash,
-                    msg_index,
-                    event_index: ei,
-                    contract,
-                    sender,
-                    receiver,
-                    offer_asset: offerAsset,
-                    ask_asset: askAsset,
-                    offer_amount: toBigIntStr(offerAmount),
-                    return_amount: toBigIntStr(returnAmount),
-                    spread_amount: toBigIntStr(spreadAmount),
-                    commission_amount: toBigIntStr(commissionAmount),
-                    maker_fee_amount: toBigIntStr(makerFeeAmount),
-                    fee_share_amount: toBigIntStr(feeShareAmount),
-                    reserves,
-                    // Analytics columns
-                    pair_id: pairId,
-                    effective_price: effectivePrice,
-                    price_impact: priceImpact,
-                    total_fee: totalFee,
-                    block_height: height,
-                    timestamp: time
-                  });
-
-
-                  // ✅ Track factory tokens discovered in swaps
-                  for (const denom of [offerAsset, askAsset]) {
-                    if (denom && denom.startsWith('coin.zig')) {
-                      // Parse factory token format: coin.zigCREATOR.SYMBOL
-                      const parts = denom.split('.');
-                      if (parts.length >= 3) {
-                        const creator = parts[1]; // e.g., "zig109f7g2rzl2aqee7z6gffn8kfe9cpqx0mjkk7ethmx8m2hq4xpe9snmaam2"
-                        const symbol = parts.slice(2).join('.'); // e.g., "stzig"
-                        factoryTokensRows.push({
-                          denom,
-                          base_denom: symbol,
-                          creator,
-                          symbol,
-                          first_seen_height: height,
-                          first_seen_tx: tx_hash
-                        });
-                      }
-                    }
-                  }
-                }
-              }
-
             }
           }
+
+          // ✅ WASM & NATIVE DEX SWAP EXTRACTION
+          const isWasmSwap = event_type === 'wasm' && (action === 'swap' || method === 'swap' || (method && method.startsWith('swap_')));
+          const isNativeSwap = event_type === 'token_swapped';
+
+          if (isWasmSwap || isNativeSwap) {
+            let sender = findAttr(attrsPairs, 'sender');
+            let receiver = findAttr(attrsPairs, 'receiver') || sender;
+            let offerAsset = findAttr(attrsPairs, 'offer_asset');
+            let askAsset = findAttr(attrsPairs, 'ask_asset');
+            let offerAmount = findAttr(attrsPairs, 'offer_amount');
+            let returnAmount = findAttr(attrsPairs, 'return_amount');
+            let spreadAmount = findAttr(attrsPairs, 'spread_amount');
+            let commissionAmount = findAttr(attrsPairs, 'commission_amount');
+            let makerFeeAmount = findAttr(attrsPairs, 'maker_fee_amount');
+            let feeShareAmount = findAttr(attrsPairs, 'fee_share_amount');
+            let reservesRaw = findAttr(attrsPairs, 'reserves') || findAttr(attrsPairs, 'pool_snapshot');
+            let contractAddr = contract; // Default to the event's contract
+
+            // Native Zigchain token_swapped event mapping
+            if (isNativeSwap) {
+              contractAddr = findAttr(attrsPairs, 'pool_id') || 'dex';
+              const tIn = findAttr(attrsPairs, 'token_in');
+              const tOut = findAttr(attrsPairs, 'token_out');
+              const tFee = findAttr(attrsPairs, 'swap_fee');
+
+              // Extract from combined formats (e.g. "100uzig")
+              if (tIn) {
+                const c = parseCoin(tIn);
+                offerAsset = c?.denom || offerAsset;
+                offerAmount = c?.amount || offerAmount;
+              }
+              if (tOut) {
+                const c = parseCoin(tOut);
+                askAsset = c?.denom || askAsset;
+                returnAmount = c?.amount || returnAmount;
+              }
+              if (tFee) {
+                const c = parseCoin(tFee);
+                commissionAmount = c?.amount || commissionAmount;
+              }
+            }
+
+            let reserves = null;
+            if (reservesRaw) {
+              // Handle both "amountDenom" and "denom:amount" formats
+              const obj: Record<string, string> = {};
+              const parts = reservesRaw.split(',');
+              for (const p of parts) {
+                const trimmed = p.trim();
+                if (!trimmed) continue;
+                // Try denom:amount
+                const colonIdx = trimmed.lastIndexOf(':');
+                if (colonIdx > 0) {
+                  const d = trimmed.slice(0, colonIdx);
+                  const a = trimmed.slice(colonIdx + 1).replace(/\D/g, ''); // sanitize amount
+                  if (d && a) obj[d] = a;
+                } else {
+                  // fallback to standard parseCoin
+                  const c = parseCoin(trimmed);
+                  if (c) obj[c.denom] = c.amount;
+                }
+              }
+              reserves = Object.keys(obj).length > 0 ? JSON.stringify(obj) : JSON.stringify({ raw: reservesRaw });
+            }
+
+            if (sender && (offerAmount || isNativeSwap)) {
+
+              // ✅ Compute analytics columns with NaN validation
+              const offerNum = parseFloat(offerAmount || '0');
+              const returnNum = parseFloat(returnAmount || '0');
+              const spreadNum = parseFloat(spreadAmount || '0');
+              const commissionNum = parseFloat(commissionAmount || '0');
+              const makerFeeNum = parseFloat(makerFeeAmount || '0');
+              const feeShareNum = parseFloat(feeShareAmount || '0');
+
+              // Generate sorted pair_id for consistent pair identification
+              const pairId = offerAsset && askAsset
+                ? [offerAsset, askAsset].sort().join('-')
+                : null;
+
+              // Effective price: return_amount / offer_amount (with NaN check)
+              const effectivePrice = offerNum > 0 && !isNaN(returnNum)
+                ? returnNum / offerNum
+                : null;
+
+              // Price impact (slippage %): (spread_amount / offer_amount) * 100 (with NaN check)
+              const priceImpact = offerNum > 0 && !isNaN(spreadNum)
+                ? (spreadNum / offerNum) * 100
+                : null;
+
+              // Total fee: sum of all fees (with NaN check)
+              const feeSum = (isNaN(commissionNum) ? 0 : commissionNum) +
+                (isNaN(makerFeeNum) ? 0 : makerFeeNum) +
+                (isNaN(feeShareNum) ? 0 : feeShareNum);
+              const totalFee = feeSum > 0 ? feeSum.toString() : '0';
+
+              const swapRow = {
+                tx_hash,
+                msg_index,
+                event_index: ei,
+                contract: contractAddr,
+                sender,
+                receiver,
+                offer_asset: offerAsset,
+                ask_asset: askAsset,
+                offer_amount: toBigIntStr(offerAmount),
+                return_amount: toBigIntStr(returnAmount),
+                spread_amount: toBigIntStr(spreadAmount),
+                commission_amount: toBigIntStr(commissionAmount),
+                maker_fee_amount: toBigIntStr(makerFeeAmount),
+                fee_share_amount: toBigIntStr(feeShareAmount),
+                reserves,
+                pair_id: pairId,
+                effective_price: effectivePrice,
+                price_impact: priceImpact,
+                total_fee: totalFee,
+                block_height: height,
+                timestamp: time
+              };
+
+              if (isNativeSwap) {
+                // Route Native Zigchain Swaps to zigchain schema
+                dexSwapsRows.push({
+                  tx_hash: swapRow.tx_hash,
+                  msg_index: swapRow.msg_index,
+                  pool_id: swapRow.contract, // For native, contractAddr is the pool_id
+                  sender_address: swapRow.sender,
+                  token_in_denom: swapRow.offer_asset,
+                  token_in_amount: swapRow.offer_amount,
+                  token_out_denom: swapRow.ask_asset,
+                  token_out_amount: swapRow.return_amount,
+                  pair_id: swapRow.pair_id,
+                  effective_price: swapRow.effective_price,
+                  total_fee: swapRow.total_fee,
+                  price_impact: swapRow.price_impact ? swapRow.price_impact.toString() : null,
+                  block_height: swapRow.block_height,
+                  timestamp: swapRow.timestamp
+                });
+              } else {
+                // Route Smart Contract Swaps to wasm schema
+                wasmSwapsRows.push(swapRow);
+              }
+            }
+
+
+              // ✅ Track factory tokens discovered in swaps
+              for (const denom of [offerAsset, askAsset]) {
+                if (denom && denom.startsWith('coin.zig')) {
+                  // Parse factory token format: coin.zigCREATOR.SYMBOL
+                  const parts = denom.split('.');
+                  if (parts.length >= 3) {
+                    const creator = parts[1]; // e.g., "zig109f7g2rzl2aqee7z6gffn8kfe9cpqx0mjkk7ethmx8m2hq4xpe9snmaam2"
+                    const symbol = parts.slice(2).join('.'); // e.g., "stzig"
+                    factoryTokensRows.push({
+                      denom,
+                      base_denom: symbol,
+                      creator,
+                      symbol,
+                      first_seen_height: height,
+                      first_seen_tx: tx_hash
+                    });
+                  }
+                }
+            }
+          }
+
 
           if (event_type === 'instantiate' || event_type === '_instantiate') {
             const addr = findAttr(attrsPairs, '_contract_address') || findAttr(attrsPairs, 'contract_address');
@@ -2183,20 +2220,43 @@ export class PostgresSink implements Sink {
       await flushIbcDenoms(client, snapshot.ibcDenoms);
       await flushIbcConnections(client, snapshot.ibcConnections);
 
-      if (snapshot.balanceDeltas.length > 0) {
-        await flushBalanceDeltas(client, snapshot.balanceDeltas);
+      // WASM Registry and Enrichment (RPC Fallback)
+      // ✅ ENHANCEMENT: Enrich missing contract metadata via ABCI fallback
+      if (snapshot.wasmContracts.length > 0 && this.rpc && this.protoRoot) {
+        for (const row of snapshot.wasmContracts) {
+          if (!row.admin || !row.label) {
+            try {
+              let info = this.wasmContractsCache.get(row.address);
+              if (!info) {
+                info = await fetchContractInfoViaAbci(this.rpc, this.protoRoot, row.address);
+                if (info) this.wasmContractsCache.set(row.address, info);
+              }
+
+              if (info) {
+                if (!row.admin) row.admin = info.admin;
+                if (!row.label) row.label = info.label;
+                if (!row.creator && info.creator) row.creator = info.creator;
+              }
+            } catch (err: any) {
+              log.debug(`[flush] Metadata enrichment failed for ${row.address}: ${err.message}`);
+            }
+          }
+        }
       }
 
-      if (snapshot.wasmCodes.length > 0 || snapshot.wasmContracts.length > 0 || snapshot.wasmMigrations.length > 0 || snapshot.wasmInstantiateConfigs.length > 0) {
-        await flushWasmRegistry(client, {
-          codes: snapshot.wasmCodes,
-          contracts: snapshot.wasmContracts,
-          migrations: snapshot.wasmMigrations,
-          configs: snapshot.wasmInstantiateConfigs
-        });
-      }
+      await flushWasmRegistry(client, {
+        codes: snapshot.wasmCodes,
+        contracts: snapshot.wasmContracts,
+        migrations: snapshot.wasmMigrations,
+        configs: snapshot.wasmInstantiateConfigs
+      });
+
       if (snapshot.wasmAdminChanges.length > 0) {
         await flushWasmAdminChanges(client, snapshot.wasmAdminChanges);
+      }
+
+      if (snapshot.balanceDeltas.length > 0) {
+        await flushBalanceDeltas(client, snapshot.balanceDeltas);
       }
 
       // Core WASM Data
