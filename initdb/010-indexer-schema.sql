@@ -695,29 +695,5 @@ CREATE TABLE IF NOT EXISTS tokens.factory_supply_events (
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS tokens.factory_supply_events_p0 PARTITION OF tokens.factory_supply_events FOR VALUES FROM (0) TO (1000000);
 
--- WASM Oracle Updates
-CREATE TABLE IF NOT EXISTS wasm.oracle_updates (
-    height    BIGINT NOT NULL,
-    tx_hash   TEXT NOT NULL,
-    msg_index INT NOT NULL,
-    contract  TEXT NOT NULL,
-    key       TEXT NOT NULL,
-    value     TEXT NULL,
-    PRIMARY KEY (height, tx_hash, msg_index, contract, key)
-) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS wasm.oracle_updates_p0 PARTITION OF wasm.oracle_updates FOR VALUES FROM (0) TO (1000000);
 
--- WASM Token Events
-CREATE TABLE IF NOT EXISTS wasm.token_events (
-    height    BIGINT NOT NULL,
-    tx_hash   TEXT NOT NULL,
-    msg_index INT NOT NULL,
-    contract  TEXT NOT NULL,
-    action    TEXT NOT NULL,
-    amount    NUMERIC(80, 0) NULL,
-    sender    TEXT NULL,
-    recipient TEXT NULL,
-    PRIMARY KEY (height, tx_hash, msg_index, contract, action)
-) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS wasm.token_events_p0 PARTITION OF wasm.token_events FOR VALUES FROM (0) TO (1000000);
 

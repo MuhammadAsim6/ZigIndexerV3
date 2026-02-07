@@ -24,7 +24,6 @@ INSERT INTO util.height_part_ranges (schema_name, table_name, range_size) VALUES
  ('wasm', 'executions', 1000000), ('wasm', 'events', 1000000),
  ('wasm', 'event_attrs', 1000000), ('wasm', 'contract_migrations', 1000000),
  ('wasm', 'dex_swaps', 1000000), ('wasm', 'admin_changes', 1000000),
- ('wasm', 'oracle_updates', 1000000), ('wasm', 'token_events', 1000000),
  -- IBC: No longer partitioned (lifecycle merging requires simple PK)
  ('zigchain', 'dex_swaps', 1000000), ('zigchain', 'dex_liquidity', 1000000),
  ('zigchain', 'wrapper_events', 1000000),
@@ -45,7 +44,6 @@ WHERE (schema_name, table_name) NOT IN (
     ('wasm', 'executions'), ('wasm', 'events'), ('wasm', 'event_attrs'),
     ('wasm', 'contract_migrations'),
     ('wasm', 'dex_swaps'), ('wasm', 'admin_changes'),
-    ('wasm', 'oracle_updates'), ('wasm', 'token_events'),
     ('zigchain', 'dex_swaps'), ('zigchain', 'dex_liquidity'),
     ('zigchain', 'wrapper_events'),
     ('tokens', 'factory_supply_events')

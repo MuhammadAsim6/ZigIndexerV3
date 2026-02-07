@@ -26,7 +26,6 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
     ['tokens', 'cw20_transfers'],
     ['wasm', 'executions'], ['wasm', 'events'], ['wasm', 'event_attrs'], ['wasm', 'contract_migrations'],
     ['wasm', 'dex_swaps'], ['wasm', 'admin_changes'],
-    ['wasm', 'oracle_updates'], ['wasm', 'token_events'],
 
     // Zigchain
     ['zigchain', 'dex_swaps'], ['zigchain', 'dex_liquidity'],
