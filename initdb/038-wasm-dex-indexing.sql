@@ -1,5 +1,5 @@
--- initdb/070-zigchain-wasm-analytics.sql
--- Enhanced WASM DEX Analytics for Zigchain
+-- initdb/038-wasm-dex-indexing.sql
+-- WASM DEX Indexing for Zigchain
 -- Tracks detailed swap data from CosmWasm AMM contracts
 
 -- ============================================================================

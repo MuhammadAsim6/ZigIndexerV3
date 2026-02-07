@@ -78,6 +78,8 @@ import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js'
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
 // ✅ Gov ABCI Helper (for fetching proposal data via RPC)
 import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
+// ✅ WASM ABCI Helper (for fetching contract data via RPC)
+import { fetchContractInfoViaAbci } from './pg/helpers/wasm_abci.js';
 // ✅ RPC Client and ProtoRoot for ABCI queries
 import { createRpcClientFromConfig, RpcClient } from '../rpc/client.js';
 import { loadProtoRoot } from '../decode/dynamicProto.js';
@@ -129,6 +131,7 @@ export class PostgresSink implements Sink {
   private rpc: RpcClient | null = null;
   private protoRoot: Root | null = null;
   private govTimestampsCache = new Map<string, any>();
+  private wasmContractsCache = new Map<string, any>();
   private isShuttingDown = false;
 
   // Standard Buffers
@@ -1038,33 +1041,13 @@ export class PostgresSink implements Sink {
           }
         }
 
+        // ✅ REDUNDANT: Native MsgSwap is now handled via 'token_swapped' events in the event loop for better accuracy (analytics parity).
+        /*
         if (type.endsWith('.MsgSwapExactIn') || type.endsWith('.MsgSwapExactOut') || type.endsWith('.MsgSwap')) {
           let priceImpact = null;
-          // Try to extract price_impact from event or calculate from amounts
-          if (msgLog) {
-            for (const e of msgLog.events) {
-              const pairs = attrsToPairs(e.attributes);
-              const pi = findAttr(pairs, 'price_impact');
-              if (pi) {
-                priceImpact = pi;
-                break;
-              }
-            }
-          }
-
-          dexSwapsRows.push({
-            tx_hash,
-            msg_index: i,
-            pool_id: m.pool_id,
-            sender_address: m.signer || m.creator || firstSigner,
-            token_in_denom: m.incoming?.denom || m.incoming_max?.denom,
-            token_in_amount: m.incoming?.amount || m.incoming_max?.amount,
-            token_out_denom: m.outgoing?.denom || m.outgoing_min?.denom,
-            token_out_amount: m.outgoing?.amount || m.outgoing_min?.amount,
-            price_impact: priceImpact,
-            block_height: height
-          });
+          // ... (moved to event-based indexing)
         }
+        */
 
         if (type.endsWith('.MsgAddLiquidity') || type.endsWith('.MsgRemoveLiquidity')) {
           let poolId = m.pool_id;
@@ -1514,7 +1497,7 @@ export class PostgresSink implements Sink {
                 (isNaN(feeShareNum) ? 0 : feeShareNum);
               const totalFee = feeSum > 0 ? feeSum.toString() : '0';
 
-              wasmSwapsRows.push({
+              const swapRow = {
                 tx_hash,
                 msg_index,
                 event_index: ei,
@@ -1530,14 +1513,37 @@ export class PostgresSink implements Sink {
                 maker_fee_amount: toBigIntStr(makerFeeAmount),
                 fee_share_amount: toBigIntStr(feeShareAmount),
                 reserves,
-                // Analytics columns
                 pair_id: pairId,
                 effective_price: effectivePrice,
                 price_impact: priceImpact,
                 total_fee: totalFee,
                 block_height: height,
                 timestamp: time
-              });
+              };
+
+              if (isNativeSwap) {
+                // Route Native Zigchain Swaps to zigchain schema
+                dexSwapsRows.push({
+                  tx_hash: swapRow.tx_hash,
+                  msg_index: swapRow.msg_index,
+                  pool_id: swapRow.contract, // For native, contractAddr is the pool_id
+                  sender_address: swapRow.sender,
+                  token_in_denom: swapRow.offer_asset,
+                  token_in_amount: swapRow.offer_amount,
+                  token_out_denom: swapRow.ask_asset,
+                  token_out_amount: swapRow.return_amount,
+                  pair_id: swapRow.pair_id,
+                  effective_price: swapRow.effective_price,
+                  total_fee: swapRow.total_fee,
+                  price_impact: swapRow.price_impact ? swapRow.price_impact.toString() : null,
+                  block_height: swapRow.block_height,
+                  timestamp: swapRow.timestamp
+                });
+              } else {
+                // Route Smart Contract Swaps to wasm schema
+                wasmSwapsRows.push(swapRow);
+              }
+            }
 
 
               // ✅ Track factory tokens discovered in swaps
@@ -1558,7 +1564,6 @@ export class PostgresSink implements Sink {
                     });
                   }
                 }
-              }
             }
           }
 
@@ -2215,20 +2220,43 @@ export class PostgresSink implements Sink {
       await flushIbcDenoms(client, snapshot.ibcDenoms);
       await flushIbcConnections(client, snapshot.ibcConnections);
 
-      if (snapshot.balanceDeltas.length > 0) {
-        await flushBalanceDeltas(client, snapshot.balanceDeltas);
+      // WASM Registry and Enrichment (RPC Fallback)
+      // ✅ ENHANCEMENT: Enrich missing contract metadata via ABCI fallback
+      if (snapshot.wasmContracts.length > 0 && this.rpc && this.protoRoot) {
+        for (const row of snapshot.wasmContracts) {
+          if (!row.admin || !row.label) {
+            try {
+              let info = this.wasmContractsCache.get(row.address);
+              if (!info) {
+                info = await fetchContractInfoViaAbci(this.rpc, this.protoRoot, row.address);
+                if (info) this.wasmContractsCache.set(row.address, info);
+              }
+
+              if (info) {
+                if (!row.admin) row.admin = info.admin;
+                if (!row.label) row.label = info.label;
+                if (!row.creator && info.creator) row.creator = info.creator;
+              }
+            } catch (err: any) {
+              log.debug(`[flush] Metadata enrichment failed for ${row.address}: ${err.message}`);
+            }
+          }
+        }
       }
 
-      if (snapshot.wasmCodes.length > 0 || snapshot.wasmContracts.length > 0 || snapshot.wasmMigrations.length > 0 || snapshot.wasmInstantiateConfigs.length > 0) {
-        await flushWasmRegistry(client, {
-          codes: snapshot.wasmCodes,
-          contracts: snapshot.wasmContracts,
-          migrations: snapshot.wasmMigrations,
-          configs: snapshot.wasmInstantiateConfigs
-        });
-      }
+      await flushWasmRegistry(client, {
+        codes: snapshot.wasmCodes,
+        contracts: snapshot.wasmContracts,
+        migrations: snapshot.wasmMigrations,
+        configs: snapshot.wasmInstantiateConfigs
+      });
+
       if (snapshot.wasmAdminChanges.length > 0) {
         await flushWasmAdminChanges(client, snapshot.wasmAdminChanges);
+      }
+
+      if (snapshot.balanceDeltas.length > 0) {
+        await flushBalanceDeltas(client, snapshot.balanceDeltas);
       }
 
       // Core WASM Data

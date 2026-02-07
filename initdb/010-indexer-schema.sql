@@ -442,42 +442,9 @@ CREATE TABLE IF NOT EXISTS wasm.events (
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS wasm.events_p0 PARTITION OF wasm.events FOR VALUES FROM (0) TO (1000000);
 
--- ✅ FIXED: Added missing DEX Swaps table
-CREATE TABLE IF NOT EXISTS wasm.dex_swaps (
-    tx_hash           TEXT NOT NULL,
-    msg_index         INT NOT NULL,
-    event_index       INT NOT NULL,
-    contract          TEXT NOT NULL,
-    sender            TEXT NULL,
-    receiver          TEXT NULL,
-    offer_asset       TEXT NULL,
-    ask_asset         TEXT NULL,
-    offer_amount      NUMERIC(80, 0) NULL,
-    return_amount     NUMERIC(80, 0) NULL,
-    spread_amount     NUMERIC(80, 0) NULL,
-    commission_amount NUMERIC(80, 0) NULL,
-    maker_fee_amount  NUMERIC(80, 0) NULL,
-    fee_share_amount  NUMERIC(80, 0) NULL,
-    reserves          JSONB NULL,
-    pair_id           TEXT NULL,
-    effective_price   NUMERIC(40, 18) NULL,
-    price_impact      NUMERIC(40, 18) NULL,
-    total_fee         NUMERIC(80, 0) NULL,
-    block_height      BIGINT NOT NULL,
-    timestamp         TIMESTAMPTZ NULL,
-    PRIMARY KEY (block_height, tx_hash, msg_index, event_index)
-) PARTITION BY RANGE (block_height);
-CREATE TABLE IF NOT EXISTS wasm.dex_swaps_p0 PARTITION OF wasm.dex_swaps FOR VALUES FROM (0) TO (1000000);
+-- ✅ REMOVED: Redundant wasm.dex_swaps (Moved to specialized analytics files)
 
--- ✅ FIXED: Added missing Factory Tokens table (no partitioning needed usually, but safe to keep unpartitioned for small cardinality)
-CREATE TABLE IF NOT EXISTS tokens.factory_tokens (
-    denom             TEXT PRIMARY KEY,
-    base_denom        TEXT NULL,
-    creator           TEXT NULL,
-    symbol            TEXT NULL,
-    first_seen_height BIGINT NULL,
-    first_seen_tx     TEXT NULL
-);
+-- ✅ REMOVED: Duplicate tokens.factory_tokens definition
 
 CREATE TABLE IF NOT EXISTS wasm.event_attrs (
     contract    TEXT NOT NULL,
@@ -621,37 +588,8 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_pools (
     tx_hash          TEXT NULL
 );
 
--- Zigchain DEX Swaps
-CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
-    tx_hash          TEXT NOT NULL,
-    msg_index        INT NOT NULL,
-    pool_id          TEXT NOT NULL,
-    sender_address   TEXT NULL,
-    token_in_denom   TEXT NULL,
-    token_in_amount  NUMERIC(80, 0) NULL,
-    token_out_denom  TEXT NULL,
-    token_out_amount NUMERIC(80, 0) NULL,
-    price_impact     NUMERIC(40, 18) NULL,
-    block_height     BIGINT NOT NULL,
-    PRIMARY KEY (block_height, tx_hash, msg_index)
-) PARTITION BY RANGE (block_height);
-CREATE TABLE IF NOT EXISTS zigchain.dex_swaps_p0 PARTITION OF zigchain.dex_swaps FOR VALUES FROM (0) TO (1000000);
+-- ✅ REMOVED: Redundant zigchain.dex_swaps and dex_liquidity (Moved to 035-zigchain-schema.sql)
 
--- Zigchain DEX Liquidity
-CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity (
-    tx_hash              TEXT NOT NULL,
-    msg_index            INT NOT NULL,
-    pool_id              TEXT NOT NULL,
-    sender_address       TEXT NULL,
-    action_type          TEXT NOT NULL, -- 'mint' or 'burn'
-    amount_0             NUMERIC(80, 0) NULL,
-    amount_1             NUMERIC(80, 0) NULL,
-    shares_minted_burned NUMERIC(80, 0) NULL,
-    block_height         BIGINT NOT NULL,
-
-    PRIMARY KEY (block_height, tx_hash, msg_index)
-) PARTITION BY RANGE (block_height);
-CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity_p0 PARTITION OF zigchain.dex_liquidity FOR VALUES FROM (0) TO (1000000);
 
 -- Zigchain Wrapper Settings
 CREATE TABLE IF NOT EXISTS zigchain.wrapper_settings (
