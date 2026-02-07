@@ -1559,7 +1559,7 @@ export class PostgresSink implements Sink {
             const coins = parseCoins(amountStr);
             for (const coin of coins) {
               transfersRows.push({
-                tx_hash, msg_index, from_addr: sender, to_addr: recipient,
+                tx_hash, msg_index, event_index: ei, from_addr: sender, to_addr: recipient,
                 denom: coin.denom, amount: coin.amount, height
               });
             }
