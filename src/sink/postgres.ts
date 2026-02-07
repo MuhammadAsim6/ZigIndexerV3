@@ -72,7 +72,8 @@ import { flushUnknownMessages } from './pg/flushers/unknown_msgs.js';
 
 // ✅ Zigchain Factory Supply Tracking
 import { flushFactorySupplyEvents } from './pg/flushers/factory_supply.js';
-import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js'; // ✅ ADDED
+import { flushWasmSwaps, flushFactoryTokens } from './pg/flushers/wasm_swaps.js';
+import { flushTokenRegistry } from './pg/flushers/tokens.js'; // ✅ ADDED
 
 // ✅ Gov Params Helper (for timestamp calculation)
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
@@ -189,6 +190,7 @@ export class PostgresSink implements Sink {
   // ✅ WASM DEX Swap Analytics
   private bufWasmSwaps: any[] = [];
   private bufFactoryTokens: any[] = [];
+  private bufTokenRegistry: any[] = []; // ✅ NEW
   private bufWrapperEvents: any[] = [];
 
   // ✅ Unknown Messages Quarantine
@@ -383,6 +385,7 @@ export class PostgresSink implements Sink {
     // ✅ WASM DEX Swaps Analytics
     const wasmSwapsRows: any[] = [];
     const factoryTokensRows: any[] = [];
+    const tokenRegistryRows: any[] = []; // ✅ NEW
 
     // ✅ Unknown Messages Quarantine
     const unknownMsgsRows: any[] = [];
@@ -428,6 +431,41 @@ export class PostgresSink implements Sink {
         }
       }
     };
+ 
+    // 🟢 TOKEN REGISTRY HELPER 🟢
+    const registerToken = (denom: string, type: 'native' | 'factory' | 'cw20' | 'ibc', metadata: any = {}, tx_h?: string | null) => {
+      if (!denom) return;
+      let symbol = metadata.symbol;
+      let baseDenom = metadata.base_denom;
+      
+      if (type === 'factory' && !symbol) {
+        // Handle standard factory/creator/subdenom or legacy formats
+        const parts = denom.replace(/\s/g, '').split(/[\/\.]/);
+        symbol = parts.pop();
+        baseDenom = symbol;
+      } else if (type === 'ibc' && !symbol) {
+        symbol = denom.slice(0, 12); // Fallback to start of hash
+      } else if (type === 'native' && !symbol) {
+        symbol = denom.startsWith('u') ? denom.slice(1).toUpperCase() : denom.toUpperCase();
+        baseDenom = denom;
+      }
+ 
+      tokenRegistryRows.push({
+        denom,
+        type,
+        base_denom: baseDenom || symbol,
+        symbol: symbol || denom,
+        decimals: metadata.decimals || 6,
+        creator: metadata.creator || null,
+        contract_address: type === 'cw20' ? denom : null,
+        first_seen_height: height,
+        first_seen_tx: tx_h || null,
+        metadata: metadata.full_meta || {},
+      });
+    };
+ 
+    // Initial core registration (no TX hash for genesis/native)
+    registerToken('uzig', 'native', { symbol: 'ZIG', base_denom: 'uzig', decimals: 6 }, null);
 
     const vSet = blockLine.validator_set;
     if (vSet?.validators) {
@@ -917,7 +955,7 @@ export class PostgresSink implements Sink {
         // 🟢 ZIGCHAIN LOGIC 🟢
         if (type.endsWith('.MsgCreateDenom')) {
           const event = msgLog?.events.find((e: any) => e.type === 'create_denom');
-          let finalDenom = event ? findAttr(attrsToPairs(event.attributes), 'denom') : `factory / ${m.creator}/${m.sub_denom}`;
+          let finalDenom = event ? findAttr(attrsToPairs(event.attributes), 'denom') : `factory/${m.creator}/${m.sub_denom}`;
 
           factoryDenomsRows.push({
             denom: finalDenom,
@@ -930,6 +968,9 @@ export class PostgresSink implements Sink {
             creation_tx_hash: tx_hash,
             block_height: height
           });
+ 
+          // ✅ Register in Token Registry
+          registerToken(finalDenom, 'factory', { creator: m.creator }, tx_hash as string | null);
         }
 
         if (type.endsWith('.MsgMintAndSendTokens') || type.endsWith('.MsgBurnTokens')) {
@@ -1546,25 +1587,18 @@ export class PostgresSink implements Sink {
             }
 
 
-              // ✅ Track factory tokens discovered in swaps
+              // ✅ Register assets discovered in swaps in Universal Token Registry
               for (const denom of [offerAsset, askAsset]) {
-                if (denom && denom.startsWith('coin.zig')) {
-                  // Parse factory token format: coin.zigCREATOR.SYMBOL
-                  const parts = denom.split('.');
-                  if (parts.length >= 3) {
-                    const creator = parts[1]; // e.g., "zig109f7g2rzl2aqee7z6gffn8kfe9cpqx0mjkk7ethmx8m2hq4xpe9snmaam2"
-                    const symbol = parts.slice(2).join('.'); // e.g., "stzig"
-                    factoryTokensRows.push({
-                      denom,
-                      base_denom: symbol,
-                      creator,
-                      symbol,
-                      first_seen_height: height,
-                      first_seen_tx: tx_hash
-                    });
-                  }
+                if (denom) {
+                  const isFactory = denom.includes('factory') || denom.startsWith('coin.zig');
+                  const isCw20 = denom.startsWith('zig1');
+                  const type = isFactory ? 'factory' : (isCw20 ? 'cw20' : 'native');
+
+                  registerToken(denom, type as any, { 
+                    creator: isCw20 ? denom : (isFactory ? (denom.includes('/') ? denom.split('/')[1] : denom.split('.')[1]) : null) 
+                  }, tx_hash);
                 }
-            }
+              }
           }
 
 
@@ -1757,6 +1791,11 @@ export class PostgresSink implements Sink {
               }
 
               ibcPacketsRows.push(packetRow);
+ 
+              // ✅ Register in Token Registry
+              if (denom) {
+                registerToken(denom, 'ibc', {}, tx_hash);
+              }
 
               // ✅ FIX: Always record transfers for ALL lifecycle events (not just when denom/amount present)
               // This ensures ack/timeout statuses are properly recorded
@@ -1962,6 +2001,7 @@ export class PostgresSink implements Sink {
       balanceDeltasRows, wasmCodesRows, wasmContractsRows, wasmMigrationsRows, wasmAdminChangesRows, networkParamsRows,
       wasmEventAttrsRows,
       wasmSwapsRows, factoryTokensRows, // ✅ WASM DEX Swaps Analytics
+      tokenRegistryRows, // ✅ Universal Token Registry
       unknownMsgsRows, // ✅ Unknown Messages Quarantine
       factorySupplyEventsRows,
       wasmInstantiateConfigsRows,
@@ -2033,6 +2073,7 @@ export class PostgresSink implements Sink {
     // ✅ WASM DEX Swaps Analytics (Pushing to Buffer)
     this.bufWasmSwaps.push(...data.wasmSwapsRows);
     this.bufFactoryTokens.push(...data.factoryTokensRows);
+    this.bufTokenRegistry.push(...data.tokenRegistryRows); // ✅ NEW
 
     // ✅ Unknown Messages Quarantine (Pushing to Buffer)
     this.bufUnknownMsgs.push(...data.unknownMsgsRows);
@@ -2101,6 +2142,7 @@ export class PostgresSink implements Sink {
       cw20Transfers: this.bufCw20Transfers,
       wasmSwaps: this.bufWasmSwaps,
       factoryTokens: this.bufFactoryTokens,
+      tokenRegistry: this.bufTokenRegistry, // ✅ NEW
       unknownMsgs: this.bufUnknownMsgs,
       factorySupplyEvents: this.bufFactorySupplyEvents,
     };
@@ -2118,7 +2160,7 @@ export class PostgresSink implements Sink {
     this.bufIbcPackets = []; this.bufIbcChannels = []; this.bufIbcTransfers = [];
     this.bufIbcClients = []; this.bufIbcDenoms = []; this.bufIbcConnections = [];
     this.bufAuthzGrants = []; this.bufFeeGrants = []; this.bufCw20Transfers = [];
-    this.bufWasmSwaps = []; this.bufFactoryTokens = []; this.bufUnknownMsgs = [];
+    this.bufWasmSwaps = []; this.bufFactoryTokens = []; this.bufTokenRegistry = []; this.bufUnknownMsgs = [];
     this.bufFactorySupplyEvents = [];
 
     const pool = getPgPool();
@@ -2278,6 +2320,7 @@ export class PostgresSink implements Sink {
       // 3. Zigchain
       await flushWasmSwaps(client, snapshot.wasmSwaps); // ✅ FIX: Flush WASM Swaps
       await flushFactoryTokens(client, snapshot.factoryTokens); // ✅ FIX: Flush Factory Tokens
+      await flushTokenRegistry(client, snapshot.tokenRegistry); // ✅ NEW
 
       await flushZigchainData(client, {
         factoryDenoms: snapshot.factoryDenoms,
