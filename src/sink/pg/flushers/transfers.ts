@@ -13,13 +13,13 @@ export async function flushTransfers(client: PoolClient, rows: any[]): Promise<v
   if (!rows.length) return;
   await client.query(`SET LOCAL statement_timeout = '30s'`);
   await client.query(`SET LOCAL lock_timeout = '5s'`);
-  const cols = ['tx_hash', 'msg_index', 'from_addr', 'to_addr', 'denom', 'amount', 'height'];
+  const cols = ['tx_hash', 'msg_index', 'event_index', 'from_addr', 'to_addr', 'denom', 'amount', 'height'];
   await execBatchedInsert(
     client,
     'bank.transfers',
     cols,
     rows,
-    'ON CONFLICT (height, tx_hash, msg_index, from_addr, to_addr, denom) DO NOTHING',
+    'ON CONFLICT (height, tx_hash, msg_index, event_index, from_addr, to_addr, denom) DO NOTHING',
     undefined,
     { maxRows: 5000, maxParams: 30000 },
   );

@@ -46,7 +46,7 @@ export function pickLogs(tx: any): NormalizedLog[] {
   if (Array.isArray(tx?.logsNormalized)) {
     return tx.logsNormalized as NormalizedLog[];
   }
-  if (Array.isArray(tx?.tx_response?.logs)) {
+  if (Array.isArray(tx?.tx_response?.logs) && tx.tx_response.logs.length > 0) {
     return tx.tx_response.logs.map((l: any) => ({
       msg_index: Number(l?.msg_index ?? -1),
       events: normArray(l?.events).map((ev: any) => ({
