@@ -1345,6 +1345,28 @@ export class PostgresSink implements Sink {
             new_value: params
           });
         }
+
+        // 🟢 IBC CHANNEL INTENT (INIT/TRY) 🟢
+        // Capture ordering from the message because events often miss it
+        if ((type.endsWith('MsgChannelOpenInit') || type.endsWith('MsgChannelOpenTry')) && code === 0) {
+          const channel = m.channel;
+          if (channel) {
+            // Protobuf Enum: 0=NONE, 1=UNORDERED, 2=ORDERED
+            let orderStr = 'ORDER_UNORDERED'; // Default for safety
+            if (channel.ordering === 2 || channel.ordering === 'ORDER_ORDERED') {
+              orderStr = 'ORDER_ORDERED';
+            }
+            // Store intent to be linked with events later
+            txIbcIntents.push({
+              type: 'channel_open',
+              msg_index: i,
+              port_id: m.port_id,
+              channel_id: '', // Unknown yet, will link via event
+              ordering: orderStr,
+              version: channel.version
+            });
+          }
+        }
       }
 
       // --- PROCESS LOGS (Events) ---
@@ -1851,15 +1873,32 @@ export class PostgresSink implements Sink {
             const channelId = findAttr(attrsPairs, 'channel_id') || findAttr(attrsPairs, 'packet_src_channel');
             if (portId && channelId) {
               const connectionId = findAttr(attrsPairs, 'connection_id');
+              
+              // 🛡️ ENHANCEMENT: Fallback to Msg Intent if ordering/version missing in events
+              let ordering = findAttr(attrsPairs, 'channel_ordering') || findAttr(attrsPairs, 'ordering');
+              let version = findAttr(attrsPairs, 'version');
+
+              if (!ordering) {
+                const intent = txIbcIntents.find((it: any) => 
+                  it.type === 'channel_open' && 
+                  it.msg_index === msg_index && 
+                  it.port_id === portId
+                );
+                if (intent) {
+                   ordering = intent.ordering;
+                   version = version || intent.version;
+                }
+              }
+
               ibcChannelsRows.push({
                 port_id: portId,
                 channel_id: channelId,
                 state: event_type,
-                ordering: findAttr(attrsPairs, 'channel_ordering') || findAttr(attrsPairs, 'ordering'),
+                ordering: ordering,
                 connection_hops: connectionId ? [connectionId] : null,
                 counterparty_port: findAttr(attrsPairs, 'counterparty_port_id') || findAttr(attrsPairs, 'counterparty_port'),
                 counterparty_channel: findAttr(attrsPairs, 'counterparty_channel_id') || findAttr(attrsPairs, 'counterparty_channel'),
-                version: findAttr(attrsPairs, 'version')
+                version: version
               });
             }
           }
