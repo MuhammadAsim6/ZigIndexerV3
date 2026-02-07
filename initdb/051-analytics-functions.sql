@@ -6,39 +6,16 @@
 -- [DELETED] REFRESH TRANSFER VOLUME DAILY
 -- [DELETED] REFRESH ACTIVE WALLETS DAILY
 
--- ============================================================================
--- 4. REFRESH TOKEN HOLDER COUNTS
--- ============================================================================
-CREATE OR REPLACE FUNCTION util.refresh_token_holder_counts()
-RETURNS void AS $$
-BEGIN
-    TRUNCATE analytics.token_holder_counts;
-
-    INSERT INTO analytics.token_holder_counts (denom, holder_count, total_supply, last_updated)
-    SELECT
-        key AS denom,
-        COUNT(*) FILTER (WHERE (value::NUMERIC) > 0) AS holder_count,
-        SUM((value::NUMERIC)) AS total_supply,
-        NOW() AS last_updated
-    FROM bank.balances_current, jsonb_each_text(balances)
-    GROUP BY key;
-
-    RAISE NOTICE '[analytics] Refreshed token_holder_counts';
-END;
-$$ LANGUAGE plpgsql;
-
--- [DELETED] REFRESH GAS STATS DAILY
--- [DELETED] REFRESH MESSAGE TYPE STATS DAILY
+-- [DELETED] REFRESH TOKEN HOLDER COUNTS
 
 -- ============================================================================
--- 7. MASTER REFRESH FUNCTION
+-- 7. MASTER REFRESH FUNCTION (STUB)
 -- ============================================================================
 CREATE OR REPLACE FUNCTION util.refresh_all_analytics(p_days INT DEFAULT 7)
 RETURNS void AS $$
 BEGIN
-    -- Only one analytic remains
-    PERFORM util.refresh_token_holder_counts();
-    RAISE NOTICE '[analytics] All analytics refreshed successfully.';
+    -- This function is now a stub as all analytics tables have been removed.
+    RAISE NOTICE '[analytics] All analytics logic has been decommissioned.';
 END;
 $$ LANGUAGE plpgsql;
 
