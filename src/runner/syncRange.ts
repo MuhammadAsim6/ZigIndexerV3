@@ -102,6 +102,7 @@ export async function syncRange(
   let processed = 0;
   const t0 = Date.now();
   let lastLogAt = t0;
+  let lastCountLogged = -1;
 
   /**
    * Emits a progress log line either on schedule (by block count or time) or when forced.
@@ -119,7 +120,8 @@ export async function syncRange(
     const rate = processed > 0 && elapsedSec > 0 ? processed / elapsedSec : 0;
     const remaining = Math.max(0, totalBlocks - processed);
     const etaSec = rate > 0 ? remaining / rate : Infinity;
-    const needByCount = processed > 0 && processed % progressEveryBlocks === 0;
+    const needByCount =
+      processed > 0 && processed % progressEveryBlocks === 0 && processed !== lastCountLogged;
     const needByTime = sinceLastSec >= progressIntervalSec;
     if (reportSpeed && (force || needByCount || needByTime)) {
       let msg = `[progress] ${processed}/${totalBlocks} blocks | currentHeight ${h} | elapsed ${formatDuration(
@@ -131,6 +133,7 @@ export async function syncRange(
       msg += ` | inFlight=${inFlight} retryQ=${retryQ} next=${nextH}`;
       log.info(msg);
       lastLogAt = now;
+      lastCountLogged = processed;
     }
   }
 
@@ -218,17 +221,20 @@ export async function syncRange(
   await new Promise<void>((resolve) => {
     const maybeSpawn = async () => {
       while (inFlight < concurrency && (nextHeight <= to || retryQueue.length > 0)) {
+        const hasRetryWork = retryQueue.length > 0;
         // 🛡️ MEMORY BACKPRESSURE: 
         // If the 'ready' buffer is too large (twice the concurrency), 
         // it means we are waiting for a slow block at the head of the line.
-        // We pause fetching to prevent JS memory overflow.
-        if (ready.size > concurrency * 2) {
+        // We pause forward fetching to prevent JS memory overflow, but still allow retries
+        // so stalled head heights can be retried and unblock ordered flushing.
+        if (ready.size > concurrency * 2 && !hasRetryWork) {
           log.debug(`[backpressure] ready buffer is full (${ready.size}), waiting…`);
+          maybeReportProgress(false, nextHeight - 1, inFlight, retryQueue.length, nextHeight);
           await new Promise(r => setTimeout(r, 500));
           continue;
         }
 
-        const h = retryQueue.length > 0 ? (retryQueue.shift() as number) : nextHeight++;
+        const h = hasRetryWork ? (retryQueue.shift() as number) : nextHeight++;
         inFlight++;
         processHeight(h).finally(() => {
           inFlight--;

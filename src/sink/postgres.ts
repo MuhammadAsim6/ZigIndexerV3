@@ -98,6 +98,23 @@ function extractExpiration(val: any): Date | null {
   return toDateFromTimestamp(nested);
 }
 
+function normalizeNonEmptyString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function pickFirstNonEmptyAttr(
+  attrsPairs: Array<{ key: string; value: string | null }>,
+  keys: string[],
+): string | null {
+  for (const key of keys) {
+    const value = normalizeNonEmptyString(findAttr(attrsPairs, key));
+    if (value) return value;
+  }
+  return null;
+}
+
 export interface PostgresSinkConfig extends SinkConfig {
   pg: {
     connectionString?: string;
@@ -333,6 +350,7 @@ export class PostgresSink implements Sink {
     const evRows: any[] = [];
     const attrRows: any[] = [];
     const transfersRows: any[] = [];
+    let droppedTransferRows = 0;
 
     // Zigchain
     const factoryDenomsRows: any[] = [];
@@ -1624,11 +1642,19 @@ export class PostgresSink implements Sink {
           }
 
           if (event_type === 'transfer') {
-            const sender = findAttr(attrsPairs, 'sender');
-            const recipient = findAttr(attrsPairs, 'recipient');
+            const sender = pickFirstNonEmptyAttr(attrsPairs, ['sender', 'from', 'from_address']);
+            const recipient = pickFirstNonEmptyAttr(attrsPairs, ['recipient', 'receiver', 'to', 'to_address']);
             const amountStr = findAttr(attrsPairs, 'amount');
             const coins = parseCoins(amountStr);
+            if (!sender || !recipient) {
+              droppedTransferRows += coins.length > 0 ? coins.length : 1;
+              continue;
+            }
             for (const coin of coins) {
+              if (!normalizeNonEmptyString(coin?.denom) || !/^\d+$/.test(String(coin?.amount ?? ''))) {
+                droppedTransferRows += 1;
+                continue;
+              }
               transfersRows.push({
                 tx_hash, msg_index, event_index: ei, from_addr: sender, to_addr: recipient,
                 denom: coin.denom, amount: coin.amount, height
@@ -1979,6 +2005,10 @@ export class PostgresSink implements Sink {
       // ✅ FIX: Pass 'i' as event_index to prevent dedup collisions (defaults to -1 otherwise)
       // tx_hash and msg_index are undefined for block events
       extractBalanceDeltas(evType, attrsPairs, undefined, undefined, i);
+    }
+
+    if (droppedTransferRows > 0) {
+      log.warn(`[transfer] dropped ${droppedTransferRows} malformed transfer row(s) at height=${height}`);
     }
 
 

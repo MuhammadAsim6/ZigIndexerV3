@@ -3,6 +3,7 @@ export type ArgMap = Record<string, string | boolean>;
 
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'silent';
 export type PgMode = 'block-atomic' | 'batch-insert';
+export type ReconcileMode = 'off' | 'negative-only' | 'full-once-then-negative';
 
 /**
  * Global application configuration resolved from CLI args, environment variables, and defaults.
@@ -57,6 +58,16 @@ export type Config = {
   followIntervalMs?: number;
   /** Interval in milliseconds to retry missing blocks in follow mode (0 disables). */
   missingRetryIntervalMs?: number;
+  /** Reconciliation mode for bank balances. */
+  reconcileMode?: ReconcileMode;
+  /** Reconciliation scheduler interval in milliseconds. */
+  reconcileIntervalMs?: number;
+  /** Maximum allowed lag (latest - indexed) to run reconciliation. */
+  reconcileMaxLagBlocks?: number;
+  /** Batch size (accounts) for one-time full reconciliation pass. */
+  reconcileFullBatchSize?: number;
+  /** Reconciliation state identifier for DB-persisted full-pass marker. */
+  reconcileStateId?: string;
 
   /** Postgres connection and batching settings (present only for postgres sink). */
   pg?: {

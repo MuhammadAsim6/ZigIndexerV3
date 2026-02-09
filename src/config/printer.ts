@@ -17,6 +17,13 @@ export function printConfig(cfg: Config): void {
       followIntervalMs: cfg.followIntervalMs ?? 5000,
       missingRetryIntervalMs: cfg.missingRetryIntervalMs ?? 600000,
     },
+    reconcile: {
+      mode: cfg.reconcileMode ?? 'full-once-then-negative',
+      intervalMs: cfg.reconcileIntervalMs ?? 300000,
+      maxLagBlocks: cfg.reconcileMaxLagBlocks ?? 10000,
+      fullBatchSize: cfg.reconcileFullBatchSize ?? 200,
+      stateId: cfg.reconcileStateId ?? 'default',
+    },
     parallel: {
       shards: `${cfg.shardId + 1}/${cfg.shards}`,
       concurrency: cfg.concurrency,

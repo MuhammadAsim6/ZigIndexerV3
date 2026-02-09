@@ -22,6 +22,7 @@ const PgConfigSchema = z.object({
 const LogLevelEnum = z.enum(['debug', 'info', 'warn', 'error', 'trace', 'silent']);
 const CaseModeEnum = z.enum(['snake', 'camel']);
 const SinkKindEnum = z.enum(['stdout', 'postgres']);
+const ReconcileModeEnum = z.enum(['off', 'negative-only', 'full-once-then-negative']);
 
 export const ConfigSchema = z
   .object({
@@ -48,6 +49,12 @@ export const ConfigSchema = z
     firstBlock: z.number().int().positive(),
     follow: z.boolean(),
     followIntervalMs: z.number().int().min(100),
+    missingRetryIntervalMs: z.number().int().min(0),
+    reconcileMode: ReconcileModeEnum,
+    reconcileIntervalMs: z.number().int().min(1000),
+    reconcileMaxLagBlocks: z.number().int().min(0),
+    reconcileFullBatchSize: z.number().int().min(1),
+    reconcileStateId: z.string().min(1),
     pg: PgConfigSchema,
   })
   .refine((c) => !(c.from !== undefined && c.to !== undefined && c.to < c.from), {

@@ -1,6 +1,6 @@
 // src/config.ts
 import { SinkKind } from './sink/types.js';
-import { ArgMap, Config } from './types.js';
+import { ArgMap, Config, ReconcileMode } from './types.js';
 import { loadDotEnvIfPresent } from './config/dotenv.js';
 import { parseArgv } from './config/argv.js';
 import { asBool, asLogLevel, asPgMode, asPositiveInt, asString } from './config/parsers.js';
@@ -103,6 +103,42 @@ export function getConfig(): Config {
     throw new Error(`missing-retry-interval-ms must be >= 0, got ${missingRetryIntervalRaw}`);
   }
 
+  const reconcileModeRaw = String(
+    (args['reconcile-mode'] as string | undefined) ?? process.env.RECONCILE_MODE ?? 'full-once-then-negative',
+  )
+    .trim()
+    .toLowerCase();
+  const reconcileModeMap: Record<string, ReconcileMode> = {
+    off: 'off',
+    'negative-only': 'negative-only',
+    negative: 'negative-only',
+    'full-once-then-negative': 'full-once-then-negative',
+    full: 'full-once-then-negative',
+  };
+  const reconcileMode = reconcileModeMap[reconcileModeRaw];
+  if (!reconcileMode) {
+    throw new Error(
+      `reconcile-mode must be one of: off, negative-only, full-once-then-negative (got "${reconcileModeRaw}")`,
+    );
+  }
+
+  const reconcileIntervalMs = asPositiveInt(
+    'reconcile-interval-ms',
+    (args['reconcile-interval-ms'] as string | undefined) ?? process.env.RECONCILE_INTERVAL_MS ?? 300_000,
+  );
+  const reconcileMaxLagBlocks = asPositiveInt(
+    'reconcile-max-lag-blocks',
+    (args['reconcile-max-lag-blocks'] as string | undefined) ?? process.env.RECONCILE_MAX_LAG_BLOCKS ?? 10_000,
+  );
+  const reconcileFullBatchSize = asPositiveInt(
+    'reconcile-full-batch-size',
+    (args['reconcile-full-batch-size'] as string | undefined) ?? process.env.RECONCILE_FULL_BATCH_SIZE ?? 200,
+  );
+  const reconcileStateId = asString(
+    'reconcile-state-id',
+    (args['reconcile-state-id'] as string | undefined) ?? process.env.RECONCILE_STATE_ID ?? 'default',
+  );
+
   const raw = {
     rpcUrl,
     from,
@@ -128,6 +164,11 @@ export function getConfig(): Config {
     follow,
     followIntervalMs,
     missingRetryIntervalMs,
+    reconcileMode,
+    reconcileIntervalMs,
+    reconcileMaxLagBlocks,
+    reconcileFullBatchSize,
+    reconcileStateId,
     pg: {
       host: (args['pg-host'] as string | undefined) ?? process.env.PG_HOST,
       port: args['pg-port'] ? Number(args['pg-port']) : Number(process.env.PG_PORT ?? 5432),
