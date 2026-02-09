@@ -218,17 +218,20 @@ export async function syncRange(
   await new Promise<void>((resolve) => {
     const maybeSpawn = async () => {
       while (inFlight < concurrency && (nextHeight <= to || retryQueue.length > 0)) {
+        const hasRetryWork = retryQueue.length > 0;
         // 🛡️ MEMORY BACKPRESSURE: 
         // If the 'ready' buffer is too large (twice the concurrency), 
         // it means we are waiting for a slow block at the head of the line.
-        // We pause fetching to prevent JS memory overflow.
-        if (ready.size > concurrency * 2) {
+        // We pause forward fetching to prevent JS memory overflow, but still allow retries
+        // so stalled head heights can be retried and unblock ordered flushing.
+        if (ready.size > concurrency * 2 && !hasRetryWork) {
           log.debug(`[backpressure] ready buffer is full (${ready.size}), waiting…`);
+          maybeReportProgress(false, nextHeight - 1, inFlight, retryQueue.length, nextHeight);
           await new Promise(r => setTimeout(r, 500));
           continue;
         }
 
-        const h = retryQueue.length > 0 ? (retryQueue.shift() as number) : nextHeight++;
+        const h = hasRetryWork ? (retryQueue.shift() as number) : nextHeight++;
         inFlight++;
         processHeight(h).finally(() => {
           inFlight--;

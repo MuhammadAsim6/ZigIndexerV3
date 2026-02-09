@@ -36,17 +36,23 @@ export async function reconcileNegativeBalances(client: PoolClient, rpc: RpcClie
     // Query max height for insertion
     const hRes = await client.query('SELECT max(height) as h FROM core.blocks');
     const currentHeight = Number(hRes.rows[0]?.h || 0);
+    if (!Number.isFinite(currentHeight) || currentHeight <= 0) {
+        log.warn('[reconcile] Skipping reconciliation: no indexed block height available yet.');
+        return;
+    }
 
     for (const row of res.rows) {
         const { account, denom, current_balance_str } = row;
 
         try {
-            const trueBalance = await fetchBalanceViaAbci(rpc, protoRoot, account, denom);
+            const trueBalance = await fetchBalanceViaAbci(rpc, protoRoot, account, denom, currentHeight);
             const currentDbBalance = BigInt(current_balance_str);
             const diff = trueBalance - currentDbBalance;
 
             if (diff !== 0n) {
-                log.info(`[reconcile] Correcting ${account} (${denom}): DB=${currentDbBalance}, RPC=${trueBalance}, Delta=${diff}`);
+                log.info(
+                    `[reconcile] Correcting ${account} (${denom}) at height ${currentHeight}: DB=${currentDbBalance}, RPC=${trueBalance}, Delta=${diff}`,
+                );
 
                 correctionDeltas.push({
                     height: currentHeight,
@@ -60,7 +66,7 @@ export async function reconcileNegativeBalances(client: PoolClient, rpc: RpcClie
             }
 
         } catch (err: any) {
-            log.error(`[reconcile] Failed to reconcile ${account}: ${err.message}`);
+            log.error(`[reconcile] Failed to reconcile ${account} (${denom}) at height ${currentHeight}: ${err.message}`);
         }
     }
 
@@ -72,7 +78,13 @@ export async function reconcileNegativeBalances(client: PoolClient, rpc: RpcClie
 }
 
 // Helper to fetch specific denom balance using ABCI Query (works on Tendermint RPC port)
-async function fetchBalanceViaAbci(rpc: RpcClient, root: Root, address: string, denom: string): Promise<bigint> {
+async function fetchBalanceViaAbci(
+    rpc: RpcClient,
+    root: Root,
+    address: string,
+    denom: string,
+    height: number,
+): Promise<bigint> {
     const ReqType = root.lookupType('cosmos.bank.v1beta1.QueryBalanceRequest');
     const ResType = 'cosmos.bank.v1beta1.QueryBalanceResponse'; // String for decodeAnyWithRoot
 
@@ -90,13 +102,14 @@ async function fetchBalanceViaAbci(rpc: RpcClient, root: Root, address: string, 
     try {
         const params = {
             path: `"${path}"`,
-            data: reqHex
+            data: reqHex,
+            height: String(height),
         };
         const j = await rpc.getJson('/abci_query', params);
         response = j.result?.response ?? j;
     } catch (err: any) {
         // Fallback to quoted (standard) if raw fails (defensive)
-        response = await rpc.queryAbci(path, reqHex);
+        response = await rpc.queryAbci(path, reqHex, height);
     }
 
     // ✅ FIX: Simplified response validation logic

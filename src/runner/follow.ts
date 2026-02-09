@@ -49,35 +49,42 @@ export async function followLoop(
   let lastMissingRetryAt = 0;
   const retryIntervalMs = opts.missingRetryIntervalMs ?? 600_000;
   log.info(`[follow] entering live mode from height ${next}, poll=${opts.pollMs}ms`);
-  for (;;) {
-    const st = await rpc.fetchStatus();
-    const latest = Number(st['sync_info']['latest_block_height']);
-    if (next <= latest) {
-      const to = latest;
-      const live = await syncRange(rpc, decodePool, sink, {
-        from: next,
-        to,
-        concurrency: Math.min(opts.concurrency, 16),
-        progressEveryBlocks: 25,
-        progressIntervalSec: 2,
-        caseMode: opts.caseMode,
-        reportSpeed: false,
-      });
-      next = to + 1;
-      log.info(`[follow] caught up ${live.processed} blocks → next=${next}, latest=${latest}`);
-      await sink.flush?.();
-    } else {
-      const jitter = 0.8 + Math.random() * 0.4;
-      await sleep(Math.floor(opts.pollMs * jitter));
-    }
-    if (retryIntervalMs > 0 && Date.now() - lastMissingRetryAt >= retryIntervalMs) {
-      if (typeof (sink as any).recordMissingBlock === 'function') {
-        await retryMissingBlocks(rpc, decodePool, sink, {
-          concurrency: Math.max(1, Math.min(opts.concurrency, 8)),
+  for (; ;) {
+    try {
+      const st = await rpc.fetchStatus();
+      const latest = Number(st['sync_info']['latest_block_height']);
+      if (next <= latest) {
+        const to = latest;
+        const live = await syncRange(rpc, decodePool, sink, {
+          from: next,
+          to,
+          concurrency: Math.min(opts.concurrency, 16),
+          progressEveryBlocks: 25,
+          progressIntervalSec: 2,
           caseMode: opts.caseMode,
+          reportSpeed: false,
         });
+        next = to + 1;
+        log.info(`[follow] caught up ${live.processed} blocks → next=${next}, latest=${latest}`);
+        await sink.flush?.();
+      } else {
+        const jitter = 0.8 + Math.random() * 0.4;
+        await sleep(Math.floor(opts.pollMs * jitter));
       }
-      lastMissingRetryAt = Date.now();
+      if (retryIntervalMs > 0 && Date.now() - lastMissingRetryAt >= retryIntervalMs) {
+        if (typeof (sink as any).recordMissingBlock === 'function') {
+          await retryMissingBlocks(rpc, decodePool, sink, {
+            concurrency: Math.max(1, Math.min(opts.concurrency, 8)),
+            caseMode: opts.caseMode,
+          });
+        }
+        lastMissingRetryAt = Date.now();
+      }
+    } catch (err: any) {
+      // 🛡️ Prevent follow loop from crashing on transient errors
+      log.error(`[follow] Error in follow loop: ${err?.message ?? err}`);
+      log.warn(`[follow] Waiting 10s before retrying...`);
+      await sleep(10_000);
     }
   }
 }
