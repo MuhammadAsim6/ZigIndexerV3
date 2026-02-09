@@ -19,7 +19,7 @@ import { syncRange } from './runner/syncRange.ts';
 import { retryMissingBlocks } from './runner/retryMissing.ts';
 import { followLoop } from './runner/follow.ts';
 import { bootstrapGenesis } from './scripts/genesis-bootstrap.ts';
-import { reconcileNegativeBalances } from './sink/pg/reconcile.ts';
+import { runReconcileCycle } from './sink/pg/reconcile.ts';
 import { ensureCorePartitions } from './db/partitions.js';
 
 EventEmitter.defaultMaxListeners = 0;
@@ -228,20 +228,33 @@ async function main() {
 
     // 🛡️ RECONCILIATION LOOP (Balance only - Gov timestamps now handled inline)
     if (cfg.sinkKind === 'postgres') {
+      let reconcileRunning = false;
       setInterval(async () => {
+        if (reconcileRunning) {
+          log.warn('[reconcile] previous cycle still running, skipping this tick');
+          return;
+        }
+        reconcileRunning = true;
         try {
           const pool = getPgPool();
           const client = await pool.connect();
           try {
             const protoRoot = await loadProtoRoot(protoDir);
-            await reconcileNegativeBalances(client, rpc, protoRoot);
+            await runReconcileCycle(client, rpc, protoRoot, {
+              mode: cfg.reconcileMode ?? 'full-once-then-negative',
+              maxLagBlocks: cfg.reconcileMaxLagBlocks ?? 10_000,
+              fullBatchSize: cfg.reconcileFullBatchSize ?? 200,
+              stateId: cfg.reconcileStateId ?? 'default',
+            });
           } finally {
             client.release();
           }
         } catch (err) {
           log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
+        } finally {
+          reconcileRunning = false;
         }
-      }, 5 * 60 * 1000);
+      }, cfg.reconcileIntervalMs ?? 5 * 60 * 1000);
 
     }
 

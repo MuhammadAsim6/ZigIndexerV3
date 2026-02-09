@@ -3,13 +3,16 @@ import { makeMultiInsert } from '../batch.js';
 import { getLogger } from '../../../utils/logger.js';
 
 const log = getLogger('sink/pg/inserters/bank');
+type InsertMode = 'idempotent' | 'merge';
+type InsertOpts = { mode?: InsertMode };
 
 /**
  * Inserts balance deltas into bank.balance_deltas.
  * Supports height-based range partitioning.
  */
-export async function insertBalanceDeltas(client: PoolClient, rows: any[]): Promise<void> {
+export async function insertBalanceDeltas(client: PoolClient, rows: any[], opts?: InsertOpts): Promise<void> {
     if (!rows?.length) return;
+    const mode: InsertMode = opts?.mode ?? 'idempotent';
 
     // ✅ Aggregator to avoid "ON CONFLICT DO UPDATE command cannot affect row a second time"
     const aggregated = new Map<string, any>();
@@ -57,19 +60,21 @@ export async function insertBalanceDeltas(client: PoolClient, rows: any[]): Prom
         'bank.balance_deltas',
         cols,
         uniqueRows,
-        // Idempotency guarantee: if the same (height, account, denom) is replayed,
-        // keep the first computed delta and skip duplicates.
-        'ON CONFLICT (height, account, denom) DO NOTHING'
+        mode === 'merge'
+            ? 'ON CONFLICT (height, account, denom) DO UPDATE SET delta = COALESCE(bank.balance_deltas.delta, 0) + COALESCE(EXCLUDED.delta, 0)'
+            : 'ON CONFLICT (height, account, denom) DO NOTHING'
     );
     const res = await client.query(text, values);
 
     const inserted = Number(res.rowCount ?? 0);
     const conflicts = Math.max(0, uniqueRows.length - inserted);
-    if (conflicts > 0) {
+    if (mode === 'idempotent' && conflicts > 0) {
         log.warn(
             `[bank] idempotent conflict skip: input=${rows.length} aggregated=${uniqueRows.length} inserted=${inserted} skipped=${conflicts}`,
         );
     } else {
-        log.debug(`[bank] inserted balance deltas: input=${rows.length} aggregated=${uniqueRows.length} inserted=${inserted}`);
+        log.debug(
+            `[bank] inserted balance deltas (${mode}): input=${rows.length} aggregated=${uniqueRows.length} affected=${inserted}`,
+        );
     }
 }
