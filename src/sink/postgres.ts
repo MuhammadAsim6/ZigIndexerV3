@@ -115,6 +115,25 @@ function pickFirstNonEmptyAttr(
   return null;
 }
 
+function parseFeeCoins(fee: any): Array<{ denom: string; amount: string }> {
+  if (!fee) return [];
+  const raw = fee?.amount ?? fee?.Amount ?? fee;
+  if (Array.isArray(raw)) {
+    return raw
+      .map((c: any) => ({ denom: String(c?.denom ?? '').trim(), amount: String(c?.amount ?? '').trim() }))
+      .filter((c) => c.denom.length > 0 && /^\d+$/.test(c.amount));
+  }
+  if (raw && typeof raw === 'object') {
+    const denom = String((raw as any)?.denom ?? '').trim();
+    const amount = String((raw as any)?.amount ?? '').trim();
+    return denom.length > 0 && /^\d+$/.test(amount) ? [{ denom, amount }] : [];
+  }
+  if (typeof raw === 'string') {
+    return parseCoins(raw);
+  }
+  return [];
+}
+
 export interface PostgresSinkConfig extends SinkConfig {
   pg: {
     connectionString?: string;
@@ -411,7 +430,13 @@ export class PostgresSink implements Sink {
     const wrapperEventsRows: any[] = [];
 
     // 🟢 BANK BALANCE DELTAS (Helper)
-    const extractBalanceDeltas = (evType: string, attrsPairs: { key: string, value: string | null }[], tx_hash?: string, msg_index?: number, event_index?: number) => {
+    const extractBalanceDeltas = (
+      evType: string,
+      attrsPairs: { key: string; value: string | null }[],
+      tx_hash?: string,
+      msg_index?: number,
+      event_index?: number,
+    ): number => {
       // ✅ FIX: Support multiple attribute keys
       const getReceiver = () =>
         findAttr(attrsPairs, 'receiver') ||
@@ -430,11 +455,12 @@ export class PostgresSink implements Sink {
 
         // ✅ FIX: Strict Null Guard - Critical for preventing corrupt aggregates
         if (!acc || acc.trim() === '') {
-          return;
+          return 0;
         }
 
         const amountStr = findAttr(attrsPairs, 'amount');
         const coins = parseCoins(amountStr);
+        let added = 0;
         for (const coin of coins) {
           balanceDeltasRows.push({
             height,
@@ -446,8 +472,11 @@ export class PostgresSink implements Sink {
             msg_index: (typeof msg_index !== 'undefined') ? msg_index : -1,
             event_index: (typeof event_index !== 'undefined') ? event_index : -1 // ✅ FIX: Use param, not 'ei'
           });
+          added++;
         }
+        return added;
       }
+      return 0;
     };
  
     // 🟢 TOKEN REGISTRY HELPER 🟢
@@ -597,6 +626,7 @@ export class PostgresSink implements Sink {
       });
 
       const logs = pickLogs(tx);
+      let txBankDeltaCount = 0;
       // 🚀 PERFORMANCE: Map-based log lookup (O(1) instead of O(N))
       const logMap = new Map<number, any>();
       for (const l of logs) {
@@ -1960,7 +1990,7 @@ export class PostgresSink implements Sink {
 
 
           // 🟢 BANK BALANCE DELTAS 🟢
-          extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
+          txBankDeltaCount += extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
 
 
           // 🟢 NETWORK PARAMS 🟢
@@ -1987,6 +2017,32 @@ export class PostgresSink implements Sink {
             if (!attr) continue;
             const { key, value } = attr;
             attrRows.push({ tx_hash, msg_index, event_index: ei, attr_index: ai, key, value, height });
+          }
+        }
+      }
+
+      if (code !== 0 && txBankDeltaCount === 0) {
+        const payer = normalizeNonEmptyString(fee?.payer) || normalizeNonEmptyString(firstSigner);
+        if (payer) {
+          const feeCoins = parseFeeCoins(fee);
+          if (feeCoins.length > 0) {
+            const syntheticTxHash = tx_hash ?? `failed_tx_${height}_${tx_index}`;
+            for (let fi = 0; fi < feeCoins.length; fi++) {
+              const coin = feeCoins[fi];
+              if (!coin) continue;
+              balanceDeltasRows.push({
+                height,
+                account: payer,
+                denom: coin.denom,
+                delta: `-${coin.amount}`,
+                tx_hash: syntheticTxHash,
+                msg_index: -1,
+                event_index: -100 - fi,
+              });
+            }
+            log.warn(
+              `[bank] failed-tx fee fallback applied tx=${syntheticTxHash} code=${code} payer=${payer} feeCoins=${feeCoins.length}`,
+            );
           }
         }
       }

@@ -257,6 +257,8 @@ export type BlockJson = {
     begin_block_events: AbciEvent[];
     /** Events at the end of the block */
     end_block_events: AbciEvent[];
+    /** Optional finalize events on newer nodes (mapped to end_block_events by assembler fallback) */
+    finalize_block_events?: AbciEvent[];
     /** Results for each transaction */
     txs_results: TxsResult[];
     /** Optional validator updates */

@@ -39,7 +39,9 @@ export function buildCombinedLogs(
   const msgLevel = parseRawLogToStructured(rawLog);
   const txLevel = normalizeEvents(txLevelEvents);
   const combined: Array<{ msg_index: number | null; events: AbciEvent[] }> = [...msgLevel];
-  if (txLevel.length > 0) {
+  // Avoid double counting:
+  // if per-message logs exist, they are the primary source; append tx-level only as fallback.
+  if (msgLevel.length === 0 && txLevel.length > 0) {
     combined.push({ msg_index: null, events: txLevel });
   }
   return combined;

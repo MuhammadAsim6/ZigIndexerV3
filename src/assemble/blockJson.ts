@@ -163,10 +163,21 @@ export async function assembleBlockJsonFromParts(
   const meta = getMeta(blockResp);
   const txsB64 = getTxsBase64(blockResp);
   const txObjs = await assembleTxObjects(meta.time, txsB64, decodedTxs, blockResultsResp, caseMode);
+  const blockResults = stripLarge(blockResultsResp);
+  const beginEvents = Array.isArray(blockResults?.begin_block_events) ? blockResults.begin_block_events : [];
+  const endEvents = Array.isArray(blockResults?.end_block_events) ? blockResults.end_block_events : [];
+  const finalizeEvents = Array.isArray(blockResults?.finalize_block_events) ? blockResults.finalize_block_events : [];
+
+  if (beginEvents.length === 0 && endEvents.length === 0 && finalizeEvents.length > 0) {
+    // Backward-compatibility for nodes exposing finalize_block_events instead of begin/end block events.
+    blockResults.end_block_events = finalizeEvents;
+    log.debug(`mapped finalize_block_events -> end_block_events at height=${meta.height}`);
+  }
+
   return {
     meta: { chain_id: meta.chain_id, height: meta.height, time: meta.time },
     block: stripLarge(blockResp),
-    block_results: stripLarge(blockResultsResp),
+    block_results: blockResults,
     txs: txObjs,
     validator_set: {
       proposer_address: blockResp?.block?.header?.proposer_address,
