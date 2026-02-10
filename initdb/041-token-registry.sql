@@ -8,7 +8,6 @@ CREATE TABLE IF NOT EXISTS tokens.registry (
     symbol            TEXT,              -- Display symbol
     decimals          INT DEFAULT 6,     -- Precision
     creator           TEXT,              -- Contract address or wallet
-    contract_address  TEXT,              -- Mandatory for 'cw20'
     first_seen_height BIGINT,
     first_seen_tx     TEXT,
     metadata          JSONB,             -- For extra info like URI, description, or IBC path

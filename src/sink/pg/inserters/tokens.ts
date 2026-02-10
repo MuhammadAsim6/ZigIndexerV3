@@ -14,7 +14,6 @@ export async function insertTokenRegistry(client: PoolClient, rows: any[]): Prom
         'symbol',
         'decimals',
         'creator',
-        'contract_address',
         'first_seen_height',
         'first_seen_tx',
         'metadata'
@@ -32,11 +31,14 @@ export async function insertTokenRegistry(client: PoolClient, rows: any[]): Prom
         cols,
         uniqueRows,
         'ON CONFLICT (denom) DO UPDATE SET ' +
+        // Allow correcting older misclassified rows (e.g., native -> ibc/cw20/factory).
+        'type = CASE ' +
+        'WHEN tokens.registry.type = \'native\' AND EXCLUDED.type <> \'native\' THEN EXCLUDED.type ' +
+        'ELSE tokens.registry.type END, ' +
         'base_denom = COALESCE(EXCLUDED.base_denom, tokens.registry.base_denom), ' +
         'symbol = COALESCE(EXCLUDED.symbol, tokens.registry.symbol), ' +
         'decimals = COALESCE(EXCLUDED.decimals, tokens.registry.decimals), ' +
         'creator = COALESCE(EXCLUDED.creator, tokens.registry.creator), ' +
-        'contract_address = COALESCE(EXCLUDED.contract_address, tokens.registry.contract_address), ' +
         'metadata = tokens.registry.metadata || EXCLUDED.metadata, ' +
         'updated_at = NOW()'
     );

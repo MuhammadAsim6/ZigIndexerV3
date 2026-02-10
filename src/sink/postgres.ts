@@ -482,29 +482,43 @@ export class PostgresSink implements Sink {
     // 🟢 TOKEN REGISTRY HELPER 🟢
     const registerToken = (denom: string, type: 'native' | 'factory' | 'cw20' | 'ibc', metadata: any = {}, tx_h?: string | null) => {
       if (!denom) return;
+      const cleanDenom = String(denom).trim();
+      if (!cleanDenom) return;
       let symbol = metadata.symbol;
       let baseDenom = metadata.base_denom;
       
       if (type === 'factory' && !symbol) {
         // Handle standard factory/creator/subdenom or legacy formats
-        const parts = denom.replace(/\s/g, '').split(/[\/\.]/);
+        const parts = cleanDenom.replace(/\s/g, '').split(/[\/\.]/);
         symbol = parts.pop();
         baseDenom = symbol;
       } else if (type === 'ibc' && !symbol) {
-        symbol = denom.slice(0, 12); // Fallback to start of hash
+        // Prefer real base denom from path denoms like transfer/channel-*/uzig.
+        if (cleanDenom.startsWith('transfer/')) {
+          const parts = cleanDenom.split('/');
+          const leaf = parts[parts.length - 1];
+          symbol = leaf || cleanDenom;
+          baseDenom = leaf || cleanDenom;
+        } else if (cleanDenom.startsWith('ibc/')) {
+          const hash = cleanDenom.slice(4);
+          symbol = hash ? `ibc:${hash.slice(0, 8)}` : cleanDenom;
+          baseDenom = cleanDenom;
+        } else {
+          symbol = cleanDenom.slice(0, 24);
+          baseDenom = cleanDenom;
+        }
       } else if (type === 'native' && !symbol) {
-        symbol = denom.startsWith('u') ? denom.slice(1).toUpperCase() : denom.toUpperCase();
-        baseDenom = denom;
+        symbol = cleanDenom.startsWith('u') ? cleanDenom.slice(1).toUpperCase() : cleanDenom.toUpperCase();
+        baseDenom = cleanDenom;
       }
  
       tokenRegistryRows.push({
-        denom,
+        denom: cleanDenom,
         type,
         base_denom: baseDenom || symbol,
-        symbol: symbol || denom,
+        symbol: symbol || cleanDenom,
         decimals: metadata.decimals || 6,
         creator: metadata.creator || null,
-        contract_address: type === 'cw20' ? denom : null,
         first_seen_height: height,
         first_seen_tx: tx_h || null,
         metadata: metadata.full_meta || {},
@@ -606,6 +620,7 @@ export class PostgresSink implements Sink {
       const txIbcIntents: any[] = [];
       const tx_index = Number(tx.index ?? tx.tx_index ?? tx?.tx_response?.index ?? 0);
       const code = Number(tx.code ?? tx?.tx_response?.code ?? 0);
+      const isSuccess = code === 0;
       const gas_wanted = toNum(tx.gas_wanted ?? tx?.tx_response?.gas_wanted);
       const gas_used = toNum(tx.gas_used ?? tx?.tx_response?.gas_used);
       const fee = tx.fee ?? buildFeeFromDecodedFee(tx?.decoded?.auth_info?.fee);
@@ -660,10 +675,10 @@ export class PostgresSink implements Sink {
 
         const msgLog = logMap.get(i) || logMap.get(-1); // Fallback to flat log if per-msg missing
 
-        // 🟢 GOVERNANCE LOGIC (INCLUDED FAILED TXS) 🟢
+        // 🟢 GOVERNANCE LOGIC 🟢
 
         // 1. VOTE (Simple and Weighted)
-        if (type === '/cosmos.gov.v1beta1.MsgVote' || type === '/cosmos.gov.v1.MsgVote') {
+        if (isSuccess && (type === '/cosmos.gov.v1beta1.MsgVote' || type === '/cosmos.gov.v1.MsgVote')) {
           govVotesRows.push({
             proposal_id: m.proposal_id,
             voter: m.voter,
@@ -682,7 +697,7 @@ export class PostgresSink implements Sink {
         }
 
         // 1b. WEIGHTED VOTE
-        if (type === '/cosmos.gov.v1beta1.MsgVoteWeighted' || type === '/cosmos.gov.v1.MsgVoteWeighted') {
+        if (isSuccess && (type === '/cosmos.gov.v1beta1.MsgVoteWeighted' || type === '/cosmos.gov.v1.MsgVoteWeighted')) {
           const options = Array.isArray(m.options) ? m.options : [];
           for (const opt of options) {
             govVotesRows.push({
@@ -704,7 +719,7 @@ export class PostgresSink implements Sink {
         }
 
         // 2. DEPOSIT
-        if (type === '/cosmos.gov.v1beta1.MsgDeposit' || type === '/cosmos.gov.v1.MsgDeposit') {
+        if (isSuccess && (type === '/cosmos.gov.v1beta1.MsgDeposit' || type === '/cosmos.gov.v1.MsgDeposit')) {
           const amounts = Array.isArray(m.amount) ? m.amount : [m.amount];
           for (const coin of amounts) {
             if (!coin) continue;
@@ -743,7 +758,7 @@ export class PostgresSink implements Sink {
         }
 
         // 3. PROPOSAL (Only Success - ID is generated on-chain)
-        if ((type === '/cosmos.gov.v1beta1.MsgSubmitProposal' || type === '/cosmos.gov.v1.MsgSubmitProposal') && code === 0) {
+        if ((type === '/cosmos.gov.v1beta1.MsgSubmitProposal' || type === '/cosmos.gov.v1.MsgSubmitProposal') && isSuccess) {
           const event = msgLog?.events.find((e: any) => e.type === 'submit_proposal');
           const pid = findAttr(attrsToPairs(event?.attributes), 'proposal_id');
 
@@ -836,7 +851,7 @@ export class PostgresSink implements Sink {
 
         // 🟢 AUTHZ / FEEGRANT (SUCCESS ONLY) 🟢
         if (
-          code === 0 &&
+          isSuccess &&
           (type === '/cosmos.authz.v1beta1.MsgGrant' || type === '/cosmos.authz.v1.MsgGrant')
         ) {
           const grant = m?.grant ?? {};
@@ -855,7 +870,7 @@ export class PostgresSink implements Sink {
         }
 
         if (
-          code === 0 &&
+          isSuccess &&
           (type === '/cosmos.authz.v1beta1.MsgRevoke' || type === '/cosmos.authz.v1.MsgRevoke')
         ) {
           if (m?.granter && m?.grantee && m?.msg_type_url) {
@@ -871,7 +886,7 @@ export class PostgresSink implements Sink {
         }
 
         if (
-          code === 0 &&
+          isSuccess &&
           (type === '/cosmos.feegrant.v1beta1.MsgGrantAllowance' || type === '/cosmos.feegrant.v1.MsgGrantAllowance')
         ) {
           const allowance = m?.allowance ?? null;
@@ -888,7 +903,7 @@ export class PostgresSink implements Sink {
         }
 
         if (
-          code === 0 &&
+          isSuccess &&
           (type === '/cosmos.feegrant.v1beta1.MsgRevokeAllowance' ||
             type === '/cosmos.feegrant.v1.MsgRevokeAllowance')
         ) {
@@ -905,9 +920,12 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 WASM REGISTRY (STORE/INSTANTIATE) 🟢
-        if (type.endsWith('.MsgStoreCode') ||
-          type.endsWith('.MsgStoreAndInstantiateContract') ||
-          type.endsWith('.MsgStoreAndMigrateContract')) {
+        if (
+          isSuccess &&
+          (type.endsWith('.MsgStoreCode') ||
+            type.endsWith('.MsgStoreAndInstantiateContract') ||
+            type.endsWith('.MsgStoreAndMigrateContract'))
+        ) {
           const event = msgLog?.events.find((e: any) => e.type === 'store_code');
           const attrs = attrsToPairs(event?.attributes);
           const codeId = findAttr(attrs, 'code_id');
@@ -942,7 +960,7 @@ export class PostgresSink implements Sink {
           }
 
           // If it's a "StoreAndInstantiate", we also capture the contract creation if it succeeded
-          if (type.endsWith('.MsgStoreAndInstantiateContract') && code === 0) {
+          if (type.endsWith('.MsgStoreAndInstantiateContract') && isSuccess) {
             const instEvent = msgLog?.events.find((e: any) => e.type === 'instantiate');
             const addr = findAttr(attrsToPairs(instEvent?.attributes), '_contract_address') || findAttr(attrsToPairs(instEvent?.attributes), 'contract_address');
             if (addr) {
@@ -959,7 +977,7 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type.endsWith('.MsgUpdateInstantiateConfig') && code === 0) {
+        if (type.endsWith('.MsgUpdateInstantiateConfig') && isSuccess) {
           wasmInstantiateConfigsRows.push({
             code_id: m.code_id,
             instantiate_permission: m.new_instantiate_permission || m.newInstantiatePermission || m.instantiate_permission || m.instantiatePermission,
@@ -968,8 +986,11 @@ export class PostgresSink implements Sink {
           });
         }
 
-        if (type.endsWith('.MsgInstantiateContract') ||
-          type.endsWith('.MsgInstantiateContract2')) {
+        if (
+          isSuccess &&
+          (type.endsWith('.MsgInstantiateContract') ||
+            type.endsWith('.MsgInstantiateContract2'))
+        ) {
           const event = msgLog?.events.find((e: any) => e.type === 'instantiate');
           const addr = findAttr(attrsToPairs(event?.attributes), '_contract_address') || findAttr(attrsToPairs(event?.attributes), 'contract_address');
           if (addr) {
@@ -985,7 +1006,7 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type.endsWith('.MsgMigrateContract')) {
+        if (type.endsWith('.MsgMigrateContract') && isSuccess) {
           // Extract from_code_id from migrate event (contains old code_id)
           const migrateEvent = msgLog?.events.find((e: any) => e.type === 'migrate');
           const migrateAttrs = attrsToPairs(migrateEvent?.attributes);
@@ -1001,7 +1022,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 ZIGCHAIN LOGIC 🟢
-        if (type.endsWith('.MsgCreateDenom')) {
+        if (type.endsWith('.MsgCreateDenom') && isSuccess) {
           const event = msgLog?.events.find((e: any) => e.type === 'create_denom');
           let finalDenom = event ? findAttr(attrsToPairs(event.attributes), 'denom') : `factory/${m.creator}/${m.sub_denom}`;
 
@@ -1021,7 +1042,7 @@ export class PostgresSink implements Sink {
           registerToken(finalDenom, 'factory', { creator: m.creator }, tx_hash as string | null);
         }
 
-        if (type.endsWith('.MsgMintAndSendTokens') || type.endsWith('.MsgBurnTokens')) {
+        if (isSuccess && (type.endsWith('.MsgMintAndSendTokens') || type.endsWith('.MsgBurnTokens'))) {
           const denom = m.token?.denom || m.amount?.denom || m.denom;
           if (denom) {
             factorySupplyEventsRows.push({
@@ -1038,7 +1059,7 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type.endsWith('.MsgSetDenomMetadata')) {
+        if (type.endsWith('.MsgSetDenomMetadata') && isSuccess) {
           if (m.metadata?.base) {
             factorySupplyEventsRows.push({
               height,
@@ -1054,7 +1075,7 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type.endsWith('.MsgFundModuleWallet') || type.endsWith('.MsgWithdrawFromModuleWallet')) {
+        if (isSuccess && (type.endsWith('.MsgFundModuleWallet') || type.endsWith('.MsgWithdrawFromModuleWallet'))) {
           const coins = Array.isArray(m.amount) ? m.amount : (m.amount ? [m.amount] : []);
           for (const coin of coins) {
             wrapperEventsRows.push({
@@ -1070,7 +1091,7 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type.endsWith('.MsgUpdateIbcSettings')) {
+        if (type.endsWith('.MsgUpdateIbcSettings') && isSuccess) {
           wrapperEventsRows.push({
             height,
             tx_hash,
@@ -1090,7 +1111,7 @@ export class PostgresSink implements Sink {
           });
         }
 
-        if (type.endsWith('.MsgCreatePool')) {
+        if (type.endsWith('.MsgCreatePool') && isSuccess) {
           let poolId = null;
           let lpToken = null;
           let pairId = null;
@@ -1138,7 +1159,7 @@ export class PostgresSink implements Sink {
         }
         */
 
-        if (type.endsWith('.MsgAddLiquidity') || type.endsWith('.MsgRemoveLiquidity')) {
+        if (isSuccess && (type.endsWith('.MsgAddLiquidity') || type.endsWith('.MsgRemoveLiquidity'))) {
           let poolId = m.pool_id;
           if (!poolId && msgLog) {
             for (const e of msgLog.events) {
@@ -1165,7 +1186,7 @@ export class PostgresSink implements Sink {
           }
         }
 
-        if (type.endsWith('.MsgUpdateIbcSettings')) {
+        if (type.endsWith('.MsgUpdateIbcSettings') && isSuccess) {
           wrapperSettingsRows.push({
             denom: m.denom,
             native_client_id: m.native_client_id,
@@ -1225,7 +1246,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 STAKING LOGIC 🟢
-        if (type === '/cosmos.staking.v1beta1.MsgCreateValidator' || type === '/cosmos.staking.v1beta1.MsgEditValidator') {
+        if (isSuccess && (type === '/cosmos.staking.v1beta1.MsgCreateValidator' || type === '/cosmos.staking.v1beta1.MsgEditValidator')) {
           validatorsRows.push({
             operator_address: m.validator_address || m.operator_address,
             moniker: m.description?.moniker,
@@ -1241,7 +1262,7 @@ export class PostgresSink implements Sink {
           });
         }
 
-        if (type === '/cosmos.staking.v1beta1.MsgDelegate' || type === '/cosmos.staking.v1beta1.MsgUndelegate') {
+        if (isSuccess && (type === '/cosmos.staking.v1beta1.MsgDelegate' || type === '/cosmos.staking.v1beta1.MsgUndelegate')) {
           const coin = m.amount;
           const isUndelegate = type.includes('Undelegate');
 
@@ -1265,7 +1286,7 @@ export class PostgresSink implements Sink {
             completion_time: completionTime
           });
         }
-        if (type === '/cosmos.staking.v1beta1.MsgBeginRedelegate') {
+        if (type === '/cosmos.staking.v1beta1.MsgBeginRedelegate' && isSuccess) {
           const coin = m.amount;
 
           // ✅ FIX: Extract completion_time from redelegate event
@@ -1290,7 +1311,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 DISTRIBUTION LOGIC 🟢
-        if (type === '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward') {
+        if (type === '/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward' && isSuccess) {
           const event = msgLog?.events.find((e: any) => e.type === 'withdraw_rewards');
           const eventAttrs = attrsToPairs(event?.attributes);
           const amountStr = findAttr(eventAttrs, 'amount');
@@ -1313,7 +1334,7 @@ export class PostgresSink implements Sink {
             });
           }
         }
-        if (type === '/cosmos.distribution.v1beta1.MsgSetWithdrawAddress') {
+        if (type === '/cosmos.distribution.v1beta1.MsgSetWithdrawAddress' && isSuccess) {
           stakeDistrRows.push({
             height, tx_hash, msg_index: i,
             event_type: 'set_withdraw_address',
@@ -1324,7 +1345,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 IBC MSG_TRANSFER INTENT (OUTGOING) 🟢
-        if (type === '/ibc.applications.transfer.v1.MsgTransfer') {
+        if (type === '/ibc.applications.transfer.v1.MsgTransfer' && isSuccess) {
           txIbcIntents.push({
             msg_index: i,
             port: m.source_port,
@@ -1338,7 +1359,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 IBC CLIENT CREATION - Extract chain_id from client_state 🟢
-        if (type === '/ibc.core.client.v1.MsgCreateClient' && code === 0) {
+        if (type === '/ibc.core.client.v1.MsgCreateClient' && isSuccess) {
           const clientState = m.client_state || m.clientState;
           let chainId = clientState?.chain_id || clientState?.chainId;
 
@@ -1379,7 +1400,7 @@ export class PostgresSink implements Sink {
         }
 
         // 🟢 MSG_UPDATE_PARAMS (GENERIC) 🟢
-        if (type.endsWith('.MsgUpdateParams') && code === 0) {
+        if (type.endsWith('.MsgUpdateParams') && isSuccess) {
           const moduleMatch = type.match(/^\/([^.]+)\./);
           const module = moduleMatch ? moduleMatch[1] : 'unknown';
           const params = m.params || {};
@@ -1462,7 +1483,7 @@ export class PostgresSink implements Sink {
                 (!action && !method && hasFromTo && findAttr(attrsPairs, 'amount'));
 
 
-              if (isCw20Transfer) {
+              if (isSuccess && isCw20Transfer) {
                 const fromAddr =
                   findAttr(attrsPairs, 'sender') ||
                   findAttr(attrsPairs, 'from') ||
@@ -1484,6 +1505,10 @@ export class PostgresSink implements Sink {
                     height,
                     tx_hash
                   });
+                  // Register CW20 token contracts once they are observed emitting transfer semantics.
+                  if (contract) {
+                    registerToken(contract, 'cw20', {}, tx_hash);
+                  }
                 }
               }
 
@@ -1638,12 +1663,15 @@ export class PostgresSink implements Sink {
               // ✅ Register assets discovered in swaps in Universal Token Registry
               for (const denom of [offerAsset, askAsset]) {
                 if (denom) {
-                  const isFactory = denom.includes('factory') || denom.startsWith('coin.zig');
-                  const isCw20 = denom.startsWith('zig1');
-                  const type = isFactory ? 'factory' : (isCw20 ? 'cw20' : 'native');
+                  const cleanDenom = String(denom).trim();
+                  const lowerDenom = cleanDenom.toLowerCase();
+                  const isFactory = lowerDenom.startsWith('factory/') || lowerDenom.startsWith('coin.zig');
+                  const isIbc = lowerDenom.startsWith('ibc/') || lowerDenom.startsWith('transfer/');
+                  const isCw20 = cleanDenom.startsWith('zig1') && !cleanDenom.includes('/');
+                  const type = isFactory ? 'factory' : (isIbc ? 'ibc' : (isCw20 ? 'cw20' : 'native'));
 
-                  registerToken(denom, type as any, { 
-                    creator: isCw20 ? denom : (isFactory ? (denom.includes('/') ? denom.split('/')[1] : denom.split('.')[1]) : null) 
+                  registerToken(cleanDenom, type as any, {
+                    creator: isCw20 ? cleanDenom : (isFactory ? (cleanDenom.includes('/') ? cleanDenom.split('/')[1] : cleanDenom.split('.')[1]) : null) 
                   }, tx_hash);
                 }
               }
@@ -1671,7 +1699,7 @@ export class PostgresSink implements Sink {
             }
           }
 
-          if (event_type === 'transfer') {
+          if (isSuccess && event_type === 'transfer') {
             const sender = pickFirstNonEmptyAttr(attrsPairs, ['sender', 'from', 'from_address']);
             const recipient = pickFirstNonEmptyAttr(attrsPairs, ['recipient', 'receiver', 'to', 'to_address']);
             const amountStr = findAttr(attrsPairs, 'amount');
@@ -2468,6 +2496,7 @@ export class PostgresSink implements Sink {
       this.bufAuthzGrants = [...snapshot.authzGrants, ...this.bufAuthzGrants];
       this.bufFeeGrants = [...snapshot.feeGrants, ...this.bufFeeGrants];
       this.bufCw20Transfers = [...snapshot.cw20Transfers, ...this.bufCw20Transfers];
+      this.bufTokenRegistry = [...snapshot.tokenRegistry, ...this.bufTokenRegistry];
 
       this.bufUnknownMsgs = [...snapshot.unknownMsgs, ...this.bufUnknownMsgs];
       this.bufFactorySupplyEvents = [...snapshot.factorySupplyEvents, ...this.bufFactorySupplyEvents];
