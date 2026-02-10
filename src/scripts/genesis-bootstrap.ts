@@ -124,6 +124,36 @@ export async function bootstrapGenesis(genesisPath: string) {
             }
         }
 
+        // 4b. Seed supply baseline for tokens.factory_supply_current via events table trigger
+        if (Array.isArray(totalSupply) && totalSupply.length > 0) {
+            const validSupplyRows = totalSupply
+                .map((s: any) => ({
+                    denom: typeof s?.denom === 'string' ? s.denom.trim() : '',
+                    amount: typeof s?.amount === 'string' ? s.amount.trim() : String(s?.amount ?? '').trim(),
+                }))
+                .filter((s: any) => s.denom.length > 0 && /^\d+$/.test(s.amount));
+
+            if (validSupplyRows.length > 0) {
+                const supplyValues: any[] = [];
+                const supplyPlaceholders: string[] = [];
+                let p = 1;
+                for (const s of validSupplyRows) {
+                    supplyPlaceholders.push(`($${p}, 'genesis_supply', 0, 0, $${p + 1}, 'mint', $${p + 2}::numeric, 'genesis', NULL, NULL)`);
+                    supplyValues.push(0, s.denom, s.amount);
+                    p += 3;
+                }
+
+                await client.query(`
+        INSERT INTO tokens.factory_supply_events
+          (height, tx_hash, msg_index, event_index, denom, action, amount, sender, recipient, metadata)
+        VALUES ${supplyPlaceholders.join(', ')}
+        ON CONFLICT (height, tx_hash, msg_index, event_index, denom, action) DO NOTHING
+      `, supplyValues);
+
+                log.info(`Seeded ${validSupplyRows.length} genesis supply rows into tokens.factory_supply_events.`);
+            }
+        }
+
         if (rows.length === 0) {
             log.warn('No balances found to insert.');
             await client.query('ROLLBACK');

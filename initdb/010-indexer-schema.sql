@@ -609,12 +609,13 @@ CREATE TABLE IF NOT EXISTS zigchain.wrapper_events (
     height    BIGINT NOT NULL,
     tx_hash   TEXT NOT NULL,
     msg_index INT NOT NULL,
-    sender    TEXT NULL,
+    event_index INT NOT NULL DEFAULT -1,
+    sender    TEXT NOT NULL,
     action    TEXT NOT NULL,
     amount    NUMERIC(80, 0) NULL,
     denom     TEXT NULL,
     metadata  JSONB NULL,
-    PRIMARY KEY (height, tx_hash, msg_index, action)
+    PRIMARY KEY (height, tx_hash, msg_index, event_index, action)
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS zigchain.wrapper_events_p0 PARTITION OF zigchain.wrapper_events FOR VALUES FROM (0) TO (1000000);
 
@@ -623,15 +624,22 @@ CREATE TABLE IF NOT EXISTS tokens.factory_supply_events (
     height    BIGINT NOT NULL,
     tx_hash   TEXT NOT NULL,
     msg_index INT NOT NULL,
+    event_index INT NOT NULL DEFAULT -1,
     denom     TEXT NOT NULL,
     action    TEXT NOT NULL,
     amount    NUMERIC(80, 0) NULL,
     sender    TEXT NULL,
     recipient TEXT NULL,
     metadata  JSONB NULL,
-    PRIMARY KEY (height, tx_hash, msg_index, denom, action)
+    CONSTRAINT chk_factory_supply_action
+        CHECK (action IN ('mint', 'burn', 'set_metadata')),
+    CONSTRAINT chk_factory_supply_amount
+        CHECK (
+            (action IN ('mint', 'burn') AND amount IS NOT NULL AND amount >= 0)
+            OR (action = 'set_metadata' AND amount IS NULL)
+        ),
+    CONSTRAINT chk_factory_supply_denom_non_empty
+        CHECK (length(trim(denom)) > 0),
+    PRIMARY KEY (height, tx_hash, msg_index, event_index, denom, action)
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS tokens.factory_supply_events_p0 PARTITION OF tokens.factory_supply_events FOR VALUES FROM (0) TO (1000000);
-
-
-

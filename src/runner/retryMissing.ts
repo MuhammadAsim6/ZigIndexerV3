@@ -5,6 +5,7 @@ import { assembleBlockJsonFromParts } from '../assemble/blockJson.ts';
 import { listMissingBlocks } from '../db/missing_blocks.js';
 import { getPgPool } from '../db/pg.js';
 import { getLogger } from '../utils/logger.ts';
+import { fetchCometValidatorsAtHeight } from './validators.ts';
 
 const log = getLogger('runner/retryMissing');
 
@@ -57,12 +58,19 @@ export async function retryMissingBlocks(
         withTimeout(rpc.fetchBlock(h), blockTimeoutMs, `fetchBlock@${h}`),
         withTimeout(rpc.fetchBlockResults(h), blockTimeoutMs, `fetchBlockResults@${h}`),
       ]);
+      const validatorsPromise = fetchCometValidatorsAtHeight(rpc as any, h, blockTimeoutMs);
       const txsB64: string[] = b?.block?.data?.txs ?? [];
       const decoded = await Promise.all(
         txsB64.map((x, i) => withTimeout(pool.submit(x), blockTimeoutMs, `decode#${i}@${h}`)),
       );
+      let validators: any[] = [];
+      try {
+        validators = await validatorsPromise;
+      } catch (err: any) {
+        log.warn(`[missing] validators fetch failed for height ${h}: ${String(err?.message ?? err)}`);
+      }
       const assembled = await withTimeout(
-        assembleBlockJsonFromParts(rpc, b, br, decoded, caseMode),
+        assembleBlockJsonFromParts(rpc, b, br, decoded, caseMode, validators),
         blockTimeoutMs,
         `assemble@${h}`,
       );

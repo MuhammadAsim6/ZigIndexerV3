@@ -104,6 +104,12 @@ function normalizeNonEmptyString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function normalizeUintAmount(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  return /^\d+$/.test(s) ? s : null;
+}
+
 function pickFirstNonEmptyAttr(
   attrsPairs: Array<{ key: string; value: string | null }>,
   keys: string[],
@@ -477,6 +483,65 @@ export class PostgresSink implements Sink {
         return added;
       }
       return 0;
+    };
+
+    const extractFactorySupplyFromEvent = (
+      evType: string,
+      attrsPairs: { key: string; value: string | null }[],
+      txHashInput?: string,
+      msgIndexInput?: number,
+      eventIndexInput?: number,
+    ): number => {
+      const action = evType === 'coinbase' ? 'mint' : (evType === 'burn' ? 'burn' : null);
+      if (!action) return 0;
+
+      const amountStr = findAttr(attrsPairs, 'amount');
+      const parsedCoins = parseCoins(amountStr);
+      const fallbackDenom = normalizeNonEmptyString(
+        findAttr(attrsPairs, 'denom') || findAttr(attrsPairs, 'token_denom'),
+      );
+      const fallbackAmount = normalizeUintAmount(amountStr);
+
+      const aggregated = new Map<string, bigint>();
+      const addCoin = (denomRaw: unknown, amountRaw: unknown) => {
+        const denom = normalizeNonEmptyString(denomRaw);
+        const amount = normalizeUintAmount(amountRaw);
+        if (!denom || !amount) return;
+        const prev = aggregated.get(denom) ?? 0n;
+        aggregated.set(denom, prev + BigInt(amount));
+      };
+
+      for (const c of parsedCoins) {
+        addCoin(c?.denom, c?.amount);
+      }
+      if (aggregated.size === 0 && fallbackDenom && fallbackAmount) {
+        addCoin(fallbackDenom, fallbackAmount);
+      }
+      if (aggregated.size === 0) return 0;
+
+      const txHash = normalizeNonEmptyString(txHashInput) ?? `block_supply_${height}`;
+      const msgIndex = typeof msgIndexInput === 'number'
+        ? msgIndexInput
+        : -1000000 - Math.max(0, Number(eventIndexInput ?? 0));
+
+      let added = 0;
+      for (const [denom, amount] of aggregated.entries()) {
+        if (amount <= 0n) continue;
+        factorySupplyEventsRows.push({
+          height,
+          tx_hash: txHash,
+          msg_index: msgIndex,
+          event_index: (typeof eventIndexInput === 'number') ? eventIndexInput : -1,
+          denom,
+          action,
+          amount: amount.toString(),
+          sender: pickFirstNonEmptyAttr(attrsPairs, ['sender', 'spender', 'from', 'from_address', 'minter']),
+          recipient: pickFirstNonEmptyAttr(attrsPairs, ['recipient', 'receiver', 'to', 'to_address']),
+          metadata: null,
+        });
+        added += 1;
+      }
+      return added;
     };
  
     // 🟢 TOKEN REGISTRY HELPER 🟢
@@ -1043,15 +1108,17 @@ export class PostgresSink implements Sink {
         }
 
         if (isSuccess && (type.endsWith('.MsgMintAndSendTokens') || type.endsWith('.MsgBurnTokens'))) {
-          const denom = m.token?.denom || m.amount?.denom || m.denom;
-          if (denom) {
+          const denom = normalizeNonEmptyString(m.token?.denom || m.amount?.denom || m.denom);
+          const amount = normalizeUintAmount(m.token?.amount || m.amount?.amount || m.amount);
+          if (denom && amount && tx_hash) {
             factorySupplyEventsRows.push({
               height,
               tx_hash,
               msg_index: i,
+              event_index: -1,
               denom,
               action: type.endsWith('.MsgMintAndSendTokens') ? 'mint' : 'burn',
-              amount: m.token?.amount || m.amount?.amount || m.amount || null,
+              amount,
               sender: m.signer || m.sender || m.creator,
               recipient: m.recipient || null,
               metadata: null
@@ -1065,6 +1132,7 @@ export class PostgresSink implements Sink {
               height,
               tx_hash,
               msg_index: i,
+              event_index: -1,
               denom: m.metadata.base,
               action: 'set_metadata',
               amount: null,
@@ -1077,12 +1145,15 @@ export class PostgresSink implements Sink {
 
         if (isSuccess && (type.endsWith('.MsgFundModuleWallet') || type.endsWith('.MsgWithdrawFromModuleWallet'))) {
           const coins = Array.isArray(m.amount) ? m.amount : (m.amount ? [m.amount] : []);
-          for (const coin of coins) {
+          const wrapperSender = normalizeNonEmptyString(m.signer || m.sender || firstSigner) || 'unknown';
+          for (let wi = 0; wi < coins.length; wi++) {
+            const coin = coins[wi];
             wrapperEventsRows.push({
               height,
               tx_hash,
               msg_index: i,
-              sender: m.signer || m.sender,
+              event_index: wi,
+              sender: wrapperSender,
               action: type.endsWith('.MsgFundModuleWallet') ? 'fund_module' : 'withdraw_module',
               amount: coin?.amount || null,
               denom: coin?.denom || null,
@@ -1096,7 +1167,8 @@ export class PostgresSink implements Sink {
             height,
             tx_hash,
             msg_index: i,
-            sender: m.sender,
+            event_index: -1,
+            sender: normalizeNonEmptyString(m.sender || m.signer || firstSigner) || 'unknown',
             action: 'update_ibc_settings',
             amount: null,
             denom: null,
@@ -1640,6 +1712,7 @@ export class PostgresSink implements Sink {
                 dexSwapsRows.push({
                   tx_hash: swapRow.tx_hash,
                   msg_index: swapRow.msg_index,
+                  event_index: swapRow.event_index,
                   pool_id: swapRow.contract, // For native, contractAddr is the pool_id
                   sender_address: swapRow.sender,
                   token_in_denom: swapRow.offer_asset,
@@ -2019,6 +2092,10 @@ export class PostgresSink implements Sink {
 
           // 🟢 BANK BALANCE DELTAS 🟢
           txBankDeltaCount += extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
+          // 🟢 SUPPLY TRACKING FROM BANK/MODULE EVENTS 🟢
+          if (isSuccess) {
+            extractFactorySupplyFromEvent(event_type, attrsPairs, tx_hash ?? undefined, msg_index, ei);
+          }
 
 
           // 🟢 NETWORK PARAMS 🟢
@@ -2089,6 +2166,38 @@ export class PostgresSink implements Sink {
       // ✅ FIX: Pass 'i' as event_index to prevent dedup collisions (defaults to -1 otherwise)
       // tx_hash and msg_index are undefined for block events
       extractBalanceDeltas(evType, attrsPairs, undefined, undefined, i);
+      extractFactorySupplyFromEvent(evType, attrsPairs, `block_${height}_events`, undefined, i);
+    }
+
+    // Prefer event-derived mint/burn rows over message-derived fallback rows for the same tx/msg/denom/action.
+    if (factorySupplyEventsRows.length > 1) {
+      const preferredKeys = new Set<string>();
+      for (const row of factorySupplyEventsRows) {
+        if (row?.action !== 'mint' && row?.action !== 'burn') continue;
+        if (typeof row?.event_index !== 'number' || row.event_index < 0) continue;
+        preferredKeys.add(`${String(row.tx_hash)}|${String(row.msg_index)}|${String(row.denom)}|${String(row.action)}`);
+      }
+      if (preferredKeys.size > 0) {
+        let dropped = 0;
+        const filtered: any[] = [];
+        for (const row of factorySupplyEventsRows) {
+          const isFallback = (row?.action === 'mint' || row?.action === 'burn')
+            && (typeof row?.event_index !== 'number' || row.event_index < 0);
+          if (isFallback) {
+            const key = `${String(row.tx_hash)}|${String(row.msg_index)}|${String(row.denom)}|${String(row.action)}`;
+            if (preferredKeys.has(key)) {
+              dropped += 1;
+              continue;
+            }
+          }
+          filtered.push(row);
+        }
+        if (dropped > 0) {
+          factorySupplyEventsRows.length = 0;
+          factorySupplyEventsRows.push(...filtered);
+          log.debug(`[factory_supply] dropped ${dropped} fallback mint/burn row(s) at height=${height}`);
+        }
+      }
     }
 
     if (droppedTransferRows > 0) {

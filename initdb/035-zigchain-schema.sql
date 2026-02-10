@@ -50,6 +50,7 @@ CREATE INDEX IF NOT EXISTS idx_dex_pools_assets ON zigchain.dex_pools(base_denom
 CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
     tx_hash           TEXT NOT NULL,
     msg_index         INT NOT NULL,
+    event_index       INT NOT NULL DEFAULT -1,
     pool_id           TEXT NOT NULL,  -- Removed FK: pool may not exist if indexing from later block
     sender_address    TEXT NOT NULL,
     token_in_denom    TEXT,
@@ -64,7 +65,7 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
     block_height      BIGINT NOT NULL,
     timestamp         TIMESTAMPTZ DEFAULT NOW(),
     -- Composite Primary Key (tx uniqueness + partition key)
-    PRIMARY KEY (tx_hash, msg_index, block_height) 
+    PRIMARY KEY (tx_hash, msg_index, event_index, block_height)
 ) PARTITION BY RANGE (block_height);
 
 -- Auto-Partition: 0 to 1M Blocks

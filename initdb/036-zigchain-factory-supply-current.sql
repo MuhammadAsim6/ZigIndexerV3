@@ -12,12 +12,13 @@ RETURNS TRIGGER AS $$
 DECLARE
     minted   NUMERIC(80, 0) := 0;
     burned   NUMERIC(80, 0) := 0;
+    safe_amount NUMERIC(80, 0) := COALESCE(NEW.amount, 0);
 BEGIN
     -- Determine delta based on action
     IF NEW.action = 'mint' THEN
-        minted := NEW.amount;
+        minted := safe_amount;
     ELSIF NEW.action = 'burn' THEN
-        burned := NEW.amount;
+        burned := safe_amount;
     ELSE
         -- Ignore other actions like set_metadata for supply calculation
         RETURN NEW;
@@ -30,8 +31,11 @@ BEGIN
     SET total_minted = tokens.factory_supply_current.total_minted + minted,
         total_burned = tokens.factory_supply_current.total_burned + burned,
         net_supply = tokens.factory_supply_current.net_supply + (minted - burned),
-        updated_at_height = NEW.height,
-        updated_at_tx_hash = NEW.tx_hash;
+        updated_at_height = GREATEST(tokens.factory_supply_current.updated_at_height, NEW.height),
+        updated_at_tx_hash = CASE
+            WHEN NEW.height >= tokens.factory_supply_current.updated_at_height THEN NEW.tx_hash
+            ELSE tokens.factory_supply_current.updated_at_tx_hash
+        END;
     
     RETURN NEW;
 END;

@@ -4,7 +4,7 @@ import { execBatchedInsert } from '../batch.js';
 export async function insertFactorySupplyEvents(client: PoolClient, rows: any[]): Promise<void> {
     if (!rows?.length) return;
     const cols = [
-        'height', 'tx_hash', 'msg_index', 'denom', 'action',
+        'height', 'tx_hash', 'msg_index', 'event_index', 'denom', 'action',
         'amount', 'sender', 'recipient', 'metadata'
     ];
     await execBatchedInsert(
@@ -12,6 +12,6 @@ export async function insertFactorySupplyEvents(client: PoolClient, rows: any[])
         'tokens.factory_supply_events',
         cols,
         rows,
-        'ON CONFLICT (height, tx_hash, msg_index, denom, action) DO NOTHING'
+        'ON CONFLICT (height, tx_hash, msg_index, event_index, denom, action) DO NOTHING'
     );
 }

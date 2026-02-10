@@ -51,4 +51,9 @@ export async function flushZigchainData(
   if (data.wrapperSettings?.length) {
     await insertWrapperSettings(client, data.wrapperSettings);
   }
+
+  // 6. Wrapper Events
+  if (data.wrapperEvents?.length) {
+    await insertWrapperEvents(client, data.wrapperEvents);
+  }
 }

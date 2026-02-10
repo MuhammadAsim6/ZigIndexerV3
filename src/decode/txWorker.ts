@@ -144,17 +144,7 @@ function makeFriendly(val: any): any {
   for (const [key, v] of Object.entries(val)) {
     // 3. camelCase -> snake_case
     const snake = key.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`);
-
-    // 4. Large raw decimals: "20000000000000000" (10^18) -> "0.02000..."
-    let formattedValue = makeFriendly(v);
-    if (typeof formattedValue === 'string' && /^\d{15,}$/.test(formattedValue)) {
-      // Very crude but effective check for sdk.Dec (18 decimal places)
-      const s = formattedValue.padStart(19, '0');
-      const pivot = s.length - 18;
-      formattedValue = `${s.slice(0, pivot)}.${s.slice(pivot)}`;
-    }
-
-    out[snake] = formattedValue;
+    out[snake] = makeFriendly(v);
   }
   return out;
 }

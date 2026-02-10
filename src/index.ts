@@ -25,6 +25,47 @@ import { ensureCorePartitions } from './db/partitions.js';
 EventEmitter.defaultMaxListeners = 0;
 const log = getLogger('index');
 
+async function fetchAllStakingValidatorsViaAbci(rpc: any, protoRoot: any): Promise<any[]> {
+  const requestType = protoRoot.lookupType('cosmos.staking.v1beta1.QueryValidatorsRequest');
+  const responseType = 'cosmos.staking.v1beta1.QueryValidatorsResponse';
+  const path = '/cosmos.staking.v1beta1.Query/Validators';
+  const out: any[] = [];
+  const seen = new Set<string>();
+  let nextKey: string | null = null;
+  const maxPages = 200;
+
+  for (let page = 0; page < maxPages; page++) {
+    const payload: any = {
+      status: 'BOND_STATUS_UNSPECIFIED',
+      pagination: { limit: 500 },
+    };
+    if (nextKey) payload.pagination.key = base64ToBytes(nextKey);
+
+    const req = requestType.create(payload);
+    const reqHex = '0x' + Buffer.from(requestType.encode(req).finish()).toString('hex');
+    const abciRes = await rpc.queryAbci(path, reqHex);
+    if (!abciRes?.value) break;
+
+    const decoded = decodeAnyWithRoot(responseType, base64ToBytes(abciRes.value), protoRoot) as any;
+    const validators = Array.isArray(decoded?.validators) ? decoded.validators : [];
+    for (const v of validators) {
+      const op = String(v?.operator_address || v?.operatorAddress || v?.address || v?.operator_addr || '');
+      if (!op || seen.has(op)) continue;
+      seen.add(op);
+      out.push(v);
+    }
+
+    const nk = decoded?.pagination?.next_key ?? decoded?.pagination?.nextKey ?? null;
+    if (typeof nk === 'string' && nk.length > 0) {
+      nextKey = nk;
+    } else {
+      break;
+    }
+  }
+
+  return out;
+}
+
 async function main() {
   const cfg = getConfig();
   log.info(`[start] Cosmos Indexer v1.1.0-reconcile-refactor starting...`);
@@ -123,17 +164,13 @@ async function main() {
         const pool = getPgPool();
         const client = await pool.connect();
         try {
-          const stakingRes = await rpc.queryAbci('/cosmos.staking.v1beta1.Query/Validators');
-          if (stakingRes?.value) {
-            const decoded = decodeAnyWithRoot('cosmos.staking.v1beta1.QueryValidatorsResponse', base64ToBytes(stakingRes.value), protoRoot);
-            const stakingVals = Array.isArray(decoded.validators) ? decoded.validators : [];
+          const stakingVals = await fetchAllStakingValidatorsViaAbci(rpc, protoRoot);
+          if (stakingVals.length > 0) {
+            log.info(`[start] found ${stakingVals.length} staking validators`);
+          }
 
-            if (stakingVals.length > 0) {
-              log.info(`[start] found ${stakingVals.length} staking validators`);
-            }
-
-            const rows = [];
-            for (const v of (stakingVals as any[])) {
+          const rows = [];
+          for (const v of (stakingVals as any[])) {
               const opAddr = v.operator_address || v.operatorAddress || v.address || v.operator_addr;
               if (!opAddr) continue;
 
@@ -193,30 +230,29 @@ async function main() {
                 } catch (e) { /* ignore */ }
               }
 
-              rows.push({
-                operator_address: opAddr,
-                consensus_address: consAddr,
-                consensus_pubkey: rawPubkeyB64,
-                moniker: v.description?.moniker || `Validator ${String(opAddr).slice(-8)}`,
-                website: v.description?.website,
-                details: v.description?.details,
-                commission_rate: toDecimal(commRates?.rate || commRates?.Rate),
-                max_commission_rate: toDecimal(commRates?.maxRate || commRates?.max_rate || commRates?.MaxRate),
-                max_change_rate: toDecimal(commRates?.maxChangeRate || commRates?.max_change_rate || commRates?.MaxChangeRate),
-                min_self_delegation: v.min_self_delegation || v.minSelfDelegation,
-                status: v.status,
-                updated_at_height: startFrom,
-                updated_at_time: new Date()
-              });
-            }
+            rows.push({
+              operator_address: opAddr,
+              consensus_address: consAddr,
+              consensus_pubkey: rawPubkeyB64,
+              moniker: v.description?.moniker || `Validator ${String(opAddr).slice(-8)}`,
+              website: v.description?.website,
+              details: v.description?.details,
+              commission_rate: toDecimal(commRates?.rate || commRates?.Rate),
+              max_commission_rate: toDecimal(commRates?.maxRate || commRates?.max_rate || commRates?.MaxRate),
+              max_change_rate: toDecimal(commRates?.maxChangeRate || commRates?.max_change_rate || commRates?.MaxChangeRate),
+              min_self_delegation: v.min_self_delegation || v.minSelfDelegation,
+              status: v.status,
+              updated_at_height: startFrom,
+              updated_at_time: new Date()
+            });
+          }
 
-            if (rows.length > 0) {
-              await client.query('BEGIN');
-              await client.query('DELETE FROM core.validators');
-              await upsertValidators(client, rows);
-              await client.query('COMMIT');
-              log.info(`[start] synced ${rows.length} validators`);
-            }
+          if (rows.length > 0) {
+            await client.query('BEGIN');
+            await client.query('DELETE FROM core.validators');
+            await upsertValidators(client, rows);
+            await client.query('COMMIT');
+            log.info(`[start] synced ${rows.length} validators`);
           }
         } finally {
           client.release();

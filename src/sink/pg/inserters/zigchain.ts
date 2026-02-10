@@ -54,7 +54,7 @@ export async function insertDexPools(client: PoolClient, rows: any[]): Promise<v
 export async function insertDexSwaps(client: PoolClient, rows: any[]): Promise<void> {
   if (!rows?.length) return;
   const cols = [
-    'tx_hash', 'msg_index', 'pool_id', 'sender_address', 'token_in_denom',
+    'tx_hash', 'msg_index', 'event_index', 'pool_id', 'sender_address', 'token_in_denom',
     'token_in_amount', 'token_out_denom', 'token_out_amount', 
     'pair_id', 'effective_price', 'total_fee', 'price_impact', 
     'block_height', 'timestamp'
@@ -64,7 +64,7 @@ export async function insertDexSwaps(client: PoolClient, rows: any[]): Promise<v
     'zigchain.dex_swaps',
     cols,
     rows,
-    'ON CONFLICT (tx_hash, msg_index, block_height) DO NOTHING'
+    'ON CONFLICT (tx_hash, msg_index, event_index, block_height) DO NOTHING'
   );
 }
 
@@ -113,7 +113,7 @@ export async function insertWrapperSettings(client: PoolClient, rows: any[]): Pr
 export async function insertWrapperEvents(client: PoolClient, rows: any[]): Promise<void> {
   if (!rows?.length) return;
   const cols = [
-    'height', 'tx_hash', 'msg_index', 'sender', 'action',
+    'height', 'tx_hash', 'msg_index', 'event_index', 'sender', 'action',
     'amount', 'denom', 'metadata'
   ];
   await execBatchedInsert(
@@ -121,6 +121,6 @@ export async function insertWrapperEvents(client: PoolClient, rows: any[]): Prom
     'zigchain.wrapper_events',
     cols,
     rows,
-    'ON CONFLICT (height, tx_hash, msg_index, action) DO NOTHING'
+    'ON CONFLICT (height, tx_hash, msg_index, event_index, action) DO NOTHING'
   );
 }

@@ -11,6 +11,7 @@ import { getLogger } from '../utils/logger.ts';
 import { createRpcClientFromConfig } from '../rpc/client.ts';
 import { createTxDecodePool } from '../decode/txPool.ts';
 import { createSink } from '../sink/index.ts';
+import { fetchCometValidatorsAtHeight } from './validators.ts';
 
 const log = getLogger('runner/syncRange');
 
@@ -185,17 +186,24 @@ export async function syncRange(
    */
   async function processHeight(h: number) {
     try {
-      const [b, br, vs] = await Promise.all([
+      const [b, br] = await Promise.all([
         withTimeout(rpc.fetchBlock(h), blockTimeoutMs, `fetchBlock@${h}`),
         withTimeout(rpc.fetchBlockResults(h), blockTimeoutMs, `fetchBlockResults@${h}`),
-        withTimeout(rpc.getJson('/validators', { height: h }), blockTimeoutMs, `fetchValidators@${h}`),
       ]);
+
+      const validatorsPromise = fetchCometValidatorsAtHeight(rpc as any, h, blockTimeoutMs);
       const txsB64: string[] = b?.block?.data?.txs ?? [];
       const decoded = await Promise.all(
         txsB64.map((x, i) => withTimeout(pool.submit(x), blockTimeoutMs, `decode#${i}@${h}`)),
       );
+      let validators: any[] = [];
+      try {
+        validators = await validatorsPromise;
+      } catch (err: any) {
+        log.warn(`[validators] fetch failed at height=${h}: ${String(err?.message ?? err)}`);
+      }
       const assembled = await withTimeout(
-        assembleBlockJsonFromParts(rpc, b, br, decoded, caseMode, vs?.result?.validators || vs?.validators),
+        assembleBlockJsonFromParts(rpc, b, br, decoded, caseMode, validators),
         blockTimeoutMs,
         `assemble@${h}`,
       );

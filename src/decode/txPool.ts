@@ -33,6 +33,7 @@ export type TxDecodePool = {
 };
 
 const INIT_TIMEOUT_MS = 30000;
+const WAIT_IDLE_TIMEOUT_MS = 30000;
 const log = getLogger('decode/txPool');
 
 /**
@@ -46,11 +47,13 @@ const log = getLogger('decode/txPool');
 export function createTxDecodePool(size: number, opts?: { protoDir?: string }): TxDecodePool {
   const workers: Worker[] = [];
   const idle: number[] = [];
-  const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void }>();
+  const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) => void; workerId: number }>();
   const readyFlags: boolean[] = Array(size).fill(false);
-  const readyResolvers: Array<() => void> = [];
   const readyPromises: Array<Promise<void>> = [];
+  const workerAlive: boolean[] = Array(size).fill(true);
   const perWorkerProgress: Record<number, { loaded: number; total: number }> = {};
+  let nextJobId = 1;
+  let readySettled = false;
 
   log.info(`[txPool] creating ${size} worker(s)`);
 
@@ -68,16 +71,16 @@ export function createTxDecodePool(size: number, opts?: { protoDir?: string }): 
     workers.push(w);
 
     let resolveReady!: () => void;
-    let rejectReady!: (e?: any) => void;
-    const p = new Promise<void>((resolve, reject) => ((resolveReady = resolve), (rejectReady = reject)));
+    const p = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
     readyPromises.push(p);
-    readyResolvers.push(resolveReady);
 
     const timer = setTimeout(() => {
       if (!readyFlags[i]) {
         log.error(`[txPool] worker #${i} init timeout after ${INIT_TIMEOUT_MS}ms`);
-        readyFlags[i] = true;
-        idle.push(i);
+        workerAlive[i] = false;
+        void w.terminate().catch(() => undefined);
         resolveReady();
       }
     }, INIT_TIMEOUT_MS);
@@ -107,7 +110,7 @@ export function createTxDecodePool(size: number, opts?: { protoDir?: string }): 
           } else {
             log.warn(`[txPool] worker #${i} init not-ok: ${(m as ReadyMsg).detail ?? ''}`);
           }
-          idle.push(i);
+          if (workerAlive[i]) idle.push(i);
           resolveReady();
         }
         return;
@@ -116,8 +119,9 @@ export function createTxDecodePool(size: number, opts?: { protoDir?: string }): 
       if (typeof (m as OkMsg | ErrMsg)?.id === 'number') {
         const entry = pending.get((m as OkMsg | ErrMsg).id);
         if (!entry) return;
+        if (entry.workerId !== i) return;
         pending.delete((m as OkMsg | ErrMsg).id);
-        idle.push(i);
+        if (workerAlive[i]) idle.push(i);
         if ((m as OkMsg).ok) entry.resolve((m as OkMsg).decoded);
         else entry.reject(new Error((m as ErrMsg).error));
         return;
@@ -126,13 +130,14 @@ export function createTxDecodePool(size: number, opts?: { protoDir?: string }): 
 
     w.on('error', (e) => {
       log.error(`[txPool] worker #${i} error: ${e?.message ?? e}`);
-      if (!readyFlags[i]) {
-        clearTimeout(timer);
-        readyFlags[i] = true;
-        idle.push(i);
-        resolveReady();
+      clearTimeout(timer);
+      workerAlive[i] = false;
+      if (!readyFlags[i]) resolveReady();
+      for (let k = idle.length - 1; k >= 0; k--) {
+        if (idle[k] === i) idle.splice(k, 1);
       }
       for (const [id, p] of pending) {
+        if (p.workerId !== i) continue;
         p.reject(e);
         pending.delete(id);
       }
@@ -140,24 +145,63 @@ export function createTxDecodePool(size: number, opts?: { protoDir?: string }): 
 
     w.on('exit', (code) => {
       log.warn(`[txPool] worker #${i} exited with code ${code}`);
+      clearTimeout(timer);
+      workerAlive[i] = false;
+      if (!readyFlags[i]) resolveReady();
+      for (let k = idle.length - 1; k >= 0; k--) {
+        if (idle[k] === i) idle.splice(k, 1);
+      }
+      for (const [id, p] of pending) {
+        if (p.workerId !== i) continue;
+        p.reject(new Error(`worker ${i} exited with code ${code}`));
+        pending.delete(id);
+      }
     });
 
     w.postMessage({ type: 'init', protoDir: opts?.protoDir });
   }
 
+  const activeWorkers = () => readyFlags.filter((v, idx) => v && workerAlive[idx]).length;
+
   async function waitAllReady() {
-    await Promise.all(readyPromises);
+    if (!readySettled) {
+      await Promise.allSettled(readyPromises);
+      readySettled = true;
+      const active = activeWorkers();
+      if (active === 0) {
+        throw new Error('No decode workers are ready');
+      }
+      if (active < size) {
+        log.warn(`[txPool] running in degraded mode: active=${active}/${size}`);
+      }
+    }
+  }
+
+  async function waitForIdleWorker(): Promise<number> {
+    const started = Date.now();
+    for (;;) {
+      if (idle.length > 0) {
+        return idle.shift() as number;
+      }
+      const active = activeWorkers();
+      if (active === 0) {
+        throw new Error('No active decode workers available');
+      }
+      if (Date.now() - started >= WAIT_IDLE_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for idle decoder worker after ${WAIT_IDLE_TIMEOUT_MS}ms`);
+      }
+      await new Promise((r) => setTimeout(r, 1));
+    }
   }
 
   async function submit(txBase64: string): Promise<any> {
     await waitAllReady();
-    while (idle.length === 0) await new Promise((r) => setTimeout(r, 0));
-    const wid = idle.shift()!;
+    const wid = await waitForIdleWorker();
     const w = workers[wid];
 
-    const id = (Math.random() * 2 ** 31) | 0;
+    const id = nextJobId++;
     const prom = new Promise<any>((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      pending.set(id, { resolve, reject, workerId: wid });
     });
 
     w?.postMessage({ type: 'decode', id, txBase64 });
@@ -166,13 +210,12 @@ export function createTxDecodePool(size: number, opts?: { protoDir?: string }): 
 
   async function decodeGeneric(typeUrl: string, base64: string): Promise<any> {
     await waitAllReady();
-    while (idle.length === 0) await new Promise((r) => setTimeout(r, 0));
-    const wid = idle.shift()!;
+    const wid = await waitForIdleWorker();
     const w = workers[wid];
 
-    const id = (Math.random() * 2 ** 31) | 0;
+    const id = nextJobId++;
     const prom = new Promise<any>((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      pending.set(id, { resolve, reject, workerId: wid });
     });
 
     w?.postMessage({ type: 'decode-generic', id, typeUrl, base64 });
