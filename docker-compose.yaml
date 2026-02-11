@@ -21,7 +21,7 @@ services:
     volumes:
       # ✅ STORAGE CONFIG: Changed to "../indexer-data" to keep data OUTSIDE the project folder.
       # This fixes the Docker build error by preventing Docker from scanning the locked database files.
-      - "/media/asim/ubuntu v21/indexer-data:/var/lib/postgresql"
+      - "/media/asim/ubuntu v2/indexer-data:/var/lib/postgresql"
       # ✅ INIT SCRIPTS: Auto-run SQL files in ./initdb on fresh start
       - ./initdb:/docker-entrypoint-initdb.d:ro
       

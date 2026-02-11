@@ -74,52 +74,11 @@ async function getRpcHeights(rpc: RpcClient): Promise<RpcHeights> {
   };
 }
 
-async function ensureReconcileStateTable(client: PoolClient): Promise<void> {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS core.reconcile_state (
-      id TEXT PRIMARY KEY,
-      full_reconcile_done BOOLEAN NOT NULL DEFAULT false,
-      full_reconcile_done_at TIMESTAMPTZ NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `);
-}
-
-async function isFullReconcileDone(client: PoolClient, stateId: string): Promise<boolean> {
-  await ensureReconcileStateTable(client);
-  await client.query(
-    `
-      INSERT INTO core.reconcile_state (id)
-      VALUES ($1)
-      ON CONFLICT (id) DO NOTHING
-    `,
-    [stateId],
-  );
-  const res = await client.query(`SELECT full_reconcile_done FROM core.reconcile_state WHERE id = $1`, [stateId]);
-  return Boolean(res.rows[0]?.full_reconcile_done);
-}
-
-async function markFullReconcileDone(client: PoolClient, stateId: string): Promise<void> {
-  await ensureReconcileStateTable(client);
-  await client.query(
-    `
-      INSERT INTO core.reconcile_state (id, full_reconcile_done, full_reconcile_done_at, updated_at)
-      VALUES ($1, true, now(), now())
-      ON CONFLICT (id)
-      DO UPDATE SET
-        full_reconcile_done = true,
-        full_reconcile_done_at = now(),
-        updated_at = now()
-    `,
-    [stateId],
-  );
-}
-
 /**
  * Entry point for reconcile scheduling.
  * - `off`: no-op
  * - `negative-only`: run fast negative-only reconcile
- * - `full-once-then-negative`: run one full pass once, then negative-only
+ * - `full-once-then-negative`: run full pass + negative reconcile for this cycle
  */
 export async function runReconcileCycle(
   client: PoolClient,
@@ -152,26 +111,14 @@ export async function runReconcileCycle(
   }
 
   if (mode === 'full-once-then-negative') {
-    const done = await isFullReconcileDone(client, opts.stateId);
-    if (!done) {
-      log.info(
-        `[reconcile/full] Starting one-time full reconciliation at height ${currentHeight} (batch=${opts.fullBatchSize}).`,
+    log.info(
+      `[reconcile/full] Starting full reconciliation at height ${currentHeight} (batch=${opts.fullBatchSize}).`,
+    );
+    const summary = await reconcileAllKnownBalances(client, rpc, protoRoot, currentHeight, opts.fullBatchSize);
+    if (summary.failedOther > 0) {
+      log.warn(
+        `[reconcile/full] completed with failed rows: failedOther=${summary.failedOther} skippedPruned=${summary.skippedPruned}`,
       );
-      const summary = await reconcileAllKnownBalances(client, rpc, protoRoot, currentHeight, opts.fullBatchSize);
-      if (summary.failedOther === 0) {
-        await markFullReconcileDone(client, opts.stateId);
-        if (summary.skippedPruned > 0) {
-          log.warn(
-            `[reconcile/full] Marked complete with pruned skips=${summary.skippedPruned} (stateId=${opts.stateId}).`,
-          );
-        } else {
-          log.info(`[reconcile/full] Marked complete (stateId=${opts.stateId}).`);
-        }
-      } else {
-        log.warn(
-          `[reconcile/full] Not marked complete due to failed rows: failedOther=${summary.failedOther} skippedPruned=${summary.skippedPruned}`,
-        );
-      }
     }
   }
 
@@ -195,66 +142,88 @@ async function reconcileAllKnownBalances(
   let skippedPruned = 0;
   let failedOther = 0;
 
-  for (;;) {
-    const res = await client.query(
-      `
-        SELECT account, balances
-        FROM bank.balances_current
-        WHERE account > $1
-        ORDER BY account ASC
-        LIMIT $2
-      `,
-      [cursor, batchSize],
-    );
-    if (!res.rowCount) break;
+  const snapshotTable = 'reconcile_balances_snapshot';
+  await client.query(`DROP TABLE IF EXISTS ${snapshotTable}`);
+  await client.query(
+    `
+      CREATE TEMP TABLE ${snapshotTable} (
+        account TEXT PRIMARY KEY,
+        balances JSONB NOT NULL
+      )
+    `,
+  );
+  await client.query(
+    `
+      INSERT INTO ${snapshotTable} (account, balances)
+      SELECT account, balances
+      FROM bank.balances_current
+    `,
+  );
 
-    const correctionDeltas: any[] = [];
-    for (const row of res.rows) {
-      const account = String(row.account);
-      cursor = account;
-      scannedAccounts++;
+  try {
+    for (;;) {
+      const res = await client.query(
+        `
+          SELECT account, balances
+          FROM ${snapshotTable}
+          WHERE account > $1
+          ORDER BY account ASC
+          LIMIT $2
+        `,
+        [cursor, batchSize],
+      );
+      if (!res.rowCount) break;
 
-      try {
-        const dbBalances = normalizeDbBalances(row.balances);
-        const rpcBalances = await fetchAllBalancesViaAbci(rpc, protoRoot, account, targetHeight);
+      const correctionDeltas: any[] = [];
+      for (const row of res.rows) {
+        const account = String(row.account);
+        cursor = account;
+        scannedAccounts++;
 
-        const denoms = new Set<string>([...dbBalances.keys(), ...rpcBalances.keys()]);
-        for (const denom of denoms) {
-          const dbBal = dbBalances.get(denom) ?? 0n;
-          const rpcBal = rpcBalances.get(denom) ?? 0n;
-          const diff = rpcBal - dbBal;
-          if (diff === 0n) continue;
-          correctionDeltas.push({
-            height: targetHeight,
-            account,
-            denom,
-            delta: diff.toString(),
-            tx_hash: 'reconcile_full_auto_heal',
-            msg_index: -1,
-            event_index: 0,
-          });
-        }
-      } catch (err: any) {
-        if (isPrunedStateError(err)) {
-          skippedPruned++;
-          log.warn(`[reconcile/full] Skipping ${account} at height ${targetHeight}: ${err.message}`);
-        } else {
-          failedOther++;
-          log.error(`[reconcile/full] Failed ${account} at height ${targetHeight}: ${err.message}`);
+        try {
+          const dbBalances = normalizeDbBalances(row.balances);
+          const rpcBalances = await fetchAllBalancesViaAbci(rpc, protoRoot, account, targetHeight);
+
+          const denoms = new Set<string>([...dbBalances.keys(), ...rpcBalances.keys()]);
+          for (const denom of denoms) {
+            const dbBal = dbBalances.get(denom) ?? 0n;
+            const rpcBal = rpcBalances.get(denom) ?? 0n;
+            const diff = rpcBal - dbBal;
+            if (diff === 0n) continue;
+            correctionDeltas.push({
+              height: targetHeight,
+              account,
+              denom,
+              delta: diff.toString(),
+              tx_hash: 'reconcile_full_auto_heal',
+              msg_index: -1,
+              event_index: 0,
+            });
+          }
+        } catch (err: any) {
+          if (isPrunedStateError(err)) {
+            skippedPruned++;
+            log.warn(`[reconcile/full] Skipping ${account} at height ${targetHeight}: ${err.message}`);
+          } else {
+            failedOther++;
+            log.error(`[reconcile/full] Failed ${account} at height ${targetHeight}: ${err.message}`);
+          }
         }
       }
+
+      if (correctionDeltas.length > 0) {
+        await insertBalanceDeltas(client, correctionDeltas, { mode: 'merge' });
+        correctedRows += correctionDeltas.length;
+      }
+
+      log.info(
+        `[reconcile/full] progress accounts=${scannedAccounts} corrected=${correctedRows} skippedPruned=${skippedPruned} failedOther=${failedOther} cursor=${cursor}`,
+      );
+
+      if (res.rows.length < batchSize) break;
     }
-
-    if (correctionDeltas.length > 0) {
-      await insertBalanceDeltas(client, correctionDeltas, { mode: 'merge' });
-      correctedRows += correctionDeltas.length;
-    }
-
-    log.info(
-      `[reconcile/full] progress accounts=${scannedAccounts} corrected=${correctedRows} skippedPruned=${skippedPruned} failedOther=${failedOther} cursor=${cursor}`,
-    );
-
-    if (res.rows.length < batchSize) break;
+  } finally {
+    await client.query(`DROP TABLE IF EXISTS ${snapshotTable}`);
   }
 
   log.info(

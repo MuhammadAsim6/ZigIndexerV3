@@ -2091,7 +2091,9 @@ export class PostgresSink implements Sink {
 
 
           // 🟢 BANK BALANCE DELTAS 🟢
-          txBankDeltaCount += extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
+          if (isSuccess) {
+            txBankDeltaCount += extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
+          }
           // 🟢 SUPPLY TRACKING FROM BANK/MODULE EVENTS 🟢
           if (isSuccess) {
             extractFactorySupplyFromEvent(event_type, attrsPairs, tx_hash ?? undefined, msg_index, ei);
@@ -2127,8 +2129,13 @@ export class PostgresSink implements Sink {
       }
 
       if (code !== 0 && txBankDeltaCount === 0) {
-        const payer = normalizeNonEmptyString(fee?.payer) || normalizeNonEmptyString(firstSigner);
-        if (payer) {
+        const feeGranter = normalizeNonEmptyString(fee?.granter);
+        const feePayer = normalizeNonEmptyString(fee?.payer);
+        const signerPayer = normalizeNonEmptyString(firstSigner);
+        const feeAccount = feeGranter || feePayer || signerPayer;
+        const feeAccountSource = feeGranter ? 'granter' : feePayer ? 'payer' : signerPayer ? 'signer' : 'none';
+
+        if (feeAccount) {
           const feeCoins = parseFeeCoins(fee);
           if (feeCoins.length > 0) {
             const syntheticTxHash = tx_hash ?? `failed_tx_${height}_${tx_index}`;
@@ -2137,7 +2144,7 @@ export class PostgresSink implements Sink {
               if (!coin) continue;
               balanceDeltasRows.push({
                 height,
-                account: payer,
+                account: feeAccount,
                 denom: coin.denom,
                 delta: `-${coin.amount}`,
                 tx_hash: syntheticTxHash,
@@ -2146,7 +2153,7 @@ export class PostgresSink implements Sink {
               });
             }
             log.warn(
-              `[bank] failed-tx fee fallback applied tx=${syntheticTxHash} code=${code} payer=${payer} feeCoins=${feeCoins.length}`,
+              `[bank] failed-tx fee fallback applied tx=${syntheticTxHash} code=${code} account=${feeAccount} source=${feeAccountSource} feeCoins=${feeCoins.length}`,
             );
           }
         }

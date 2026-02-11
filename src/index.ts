@@ -73,13 +73,14 @@ async function main() {
 
   let decodePool: any = null;
   let sink: any = null;
+  let reconcileTimer: NodeJS.Timeout | null = null;
 
   // Cleanup handler for signals and catch blocks
   let isCleaningUp = false;
   const gracefulCleanup = async (exitCode: number) => {
     if (isCleaningUp) return;
     isCleaningUp = true;
-    await cleanup(decodePool, sink);
+    await cleanup(decodePool, sink, reconcileTimer);
     process.exit(exitCode);
   };
 
@@ -106,6 +107,7 @@ async function main() {
     const status = await rpc.fetchStatus();
 
     let startFrom = cfg.from as number | undefined;
+    let lastProgress: number | null = null;
     const wantResume =
       !startFrom || cfg.resume === true || (typeof cfg.from === 'string' && cfg.from.toLowerCase() === 'resume');
 
@@ -114,6 +116,7 @@ async function main() {
         const pool = getPgPool();
         try {
           const last = await getProgress(pool, cfg.pg?.progressId ?? 'default');
+          lastProgress = last;
           const earliest = Number(status['sync_info']['earliest_block_height']);
           const explicitFrom = typeof cfg.from === 'number' ? cfg.from : (cfg.firstBlock as number | undefined);
           startFrom = last != null ? last + 1 : (explicitFrom ?? earliest);
@@ -133,6 +136,11 @@ async function main() {
     }
     if (startFrom == null || endHeight == null) throw new Error('Both startFrom and endHeight must be resolved.');
     log.info(`[start] from ${startFrom} to ${endHeight} (incl.)`);
+    if (cfg.sinkKind === 'postgres' && lastProgress == null && startFrom > 1) {
+      log.warn(
+        `[start] starting above height 1 (from=${startFrom}) with no existing progress. Historical bank/factory state before this height will be missing; prefer FIRST_BLOCK=1 for fully accurate balances.`,
+      );
+    }
 
     const protoDir = process.env.PROTO_DIR || path.join(process.cwd(), 'protos');
     log.info(`[proto] dir = ${protoDir}`);
@@ -262,38 +270,6 @@ async function main() {
       }
     }
 
-    // 🛡️ RECONCILIATION LOOP (Balance only - Gov timestamps now handled inline)
-    if (cfg.sinkKind === 'postgres') {
-      let reconcileRunning = false;
-      setInterval(async () => {
-        if (reconcileRunning) {
-          log.warn('[reconcile] previous cycle still running, skipping this tick');
-          return;
-        }
-        reconcileRunning = true;
-        try {
-          const pool = getPgPool();
-          const client = await pool.connect();
-          try {
-            const protoRoot = await loadProtoRoot(protoDir);
-            await runReconcileCycle(client, rpc, protoRoot, {
-              mode: cfg.reconcileMode ?? 'full-once-then-negative',
-              maxLagBlocks: cfg.reconcileMaxLagBlocks ?? 10_000,
-              fullBatchSize: cfg.reconcileFullBatchSize ?? 200,
-              stateId: cfg.reconcileStateId ?? 'default',
-            });
-          } finally {
-            client.release();
-          }
-        } catch (err) {
-          log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
-        } finally {
-          reconcileRunning = false;
-        }
-      }, cfg.reconcileIntervalMs ?? 5 * 60 * 1000);
-
-    }
-
     // 🛡️ INITIAL SYNC: Fetch network parameters
     try {
       const pool = getPgPool();
@@ -383,8 +359,60 @@ async function main() {
       });
     }
 
+    if (cfg.sinkKind === 'postgres' && cfg.reconcileMode !== 'off') {
+      try {
+        const pool = getPgPool();
+        const client = await pool.connect();
+        try {
+          const protoRoot = await loadProtoRoot(protoDir);
+          await runReconcileCycle(client, rpc, protoRoot, {
+            mode: cfg.reconcileMode ?? 'full-once-then-negative',
+            maxLagBlocks: cfg.reconcileMaxLagBlocks ?? 10_000,
+            fullBatchSize: cfg.reconcileFullBatchSize ?? 200,
+            stateId: cfg.reconcileStateId ?? 'default',
+          });
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        log.error('[reconcile] initial cycle error:', err instanceof Error ? err.message : String(err));
+      }
+    }
+
     if (cfg.follow !== false) {
       const pollMs = cfg.followIntervalMs ?? 1500;
+
+      if (cfg.sinkKind === 'postgres' && cfg.reconcileMode !== 'off') {
+        const periodicMode = cfg.reconcileMode === 'full-once-then-negative' ? 'negative-only' : cfg.reconcileMode;
+        let reconcileRunning = false;
+        reconcileTimer = setInterval(async () => {
+          if (reconcileRunning) {
+            log.warn('[reconcile] previous cycle still running, skipping this tick');
+            return;
+          }
+          reconcileRunning = true;
+          try {
+            const pool = getPgPool();
+            const client = await pool.connect();
+            try {
+              const protoRoot = await loadProtoRoot(protoDir);
+              await runReconcileCycle(client, rpc, protoRoot, {
+                mode: periodicMode,
+                maxLagBlocks: cfg.reconcileMaxLagBlocks ?? 10_000,
+                fullBatchSize: cfg.reconcileFullBatchSize ?? 200,
+                stateId: cfg.reconcileStateId ?? 'default',
+              });
+            } finally {
+              client.release();
+            }
+          } catch (err) {
+            log.error('[reconcile] loop error:', err instanceof Error ? err.message : String(err));
+          } finally {
+            reconcileRunning = false;
+          }
+        }, cfg.reconcileIntervalMs ?? 5 * 60 * 1000);
+      }
+
       await followLoop(rpc, decodePool, sink, {
         startNext: endHeight + 1,
         pollMs,
@@ -394,7 +422,7 @@ async function main() {
       });
     }
 
-    await cleanup(decodePool, sink);
+    await cleanup(decodePool, sink, reconcileTimer);
   } catch (e) {
     const msg = e instanceof Error ? e.stack || e.message : String(e);
     log.error(msg);
@@ -402,9 +430,12 @@ async function main() {
   }
 }
 
-async function cleanup(decodePool: any, sink: any) {
+async function cleanup(decodePool: any, sink: any, reconcileTimer: NodeJS.Timeout | null = null) {
   log.info('Shutdown initiated…');
   try {
+    if (reconcileTimer) {
+      clearInterval(reconcileTimer);
+    }
     if (decodePool) await decodePool.close();
     if (sink) {
       await sink.close?.(); // close() handles flushing internally
