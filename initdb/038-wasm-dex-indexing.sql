@@ -46,22 +46,6 @@ CREATE INDEX IF NOT EXISTS idx_wasm_swaps_pair ON wasm.dex_swaps (pair_id, block
 CREATE INDEX IF NOT EXISTS idx_wasm_swaps_timestamp ON wasm.dex_swaps (timestamp DESC);
 
 
--- ============================================================================
--- 2. FACTORY TOKENS (Track coin.zigXXX tokens)
--- ============================================================================
-CREATE TABLE IF NOT EXISTS tokens.factory_tokens (
-    denom             TEXT PRIMARY KEY,
-    base_denom        TEXT,             -- Extracted symbol (stzig, mango, etc.)
-    creator           TEXT NOT NULL,
-    symbol            TEXT,             -- Human-readable symbol
-    first_seen_height BIGINT NOT NULL,
-    first_seen_tx     TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_factory_tokens_creator ON tokens.factory_tokens (creator);
-CREATE INDEX IF NOT EXISTS idx_factory_tokens_symbol ON tokens.factory_tokens (symbol);
-
-
 
 -- ============================================================================
 -- 4. HELPER: Update Pool Reserves (Trigger for dex_pools)

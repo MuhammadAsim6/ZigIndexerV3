@@ -43,26 +43,4 @@ export async function insertWasmSwaps(client: PoolClient, rows: any[]): Promise<
     );
 }
 
-/**
- * Insert factory tokens discovered from denom patterns.
- */
-export async function insertFactoryTokens(client: PoolClient, rows: any[]): Promise<void> {
-    if (!rows?.length) return;
 
-    const cols = [
-        'denom',
-        'base_denom',
-        'creator',
-        'symbol',
-        'first_seen_height',
-        'first_seen_tx'
-    ];
-
-    await execBatchedInsert(
-        client,
-        'tokens.factory_tokens',
-        cols,
-        rows,
-        'ON CONFLICT (denom) DO NOTHING'
-    );
-}
