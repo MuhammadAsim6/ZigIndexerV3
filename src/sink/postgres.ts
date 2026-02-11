@@ -1243,26 +1243,45 @@ export class PostgresSink implements Sink {
 
         if (isSuccess && (type.endsWith('.MsgAddLiquidity') || type.endsWith('.MsgRemoveLiquidity'))) {
           let poolId = m.pool_id;
-          if (!poolId && msgLog) {
+          let evLpAmount: string | null = null;
+          let evBaseAmount: string | null = null;
+          let evQuoteAmount: string | null = null;
+
+          if (msgLog) {
             for (const e of msgLog.events) {
-              const pid = findAttr(attrsToPairs(e.attributes), 'pool_id');
-              if (pid) {
-                poolId = pid;
-                break;
-              }
+              const pairs = attrsToPairs(e.attributes);
+              const pid = findAttr(pairs, 'pool_id');
+              if (pid) poolId = poolId || pid;
+
+              // Extract LP token amount from events (covers both add/remove)
+              const lp = findAttr(pairs, 'lp_token') || findAttr(pairs, 'lptoken') || findAttr(pairs, 'lptoken_amount');
+              if (lp) evLpAmount = evLpAmount || lp;
+
+              // Extract base/quote amounts from response events (for remove liquidity)
+              const ba = findAttr(pairs, 'base_amount') || findAttr(pairs, 'actual_base') || findAttr(pairs, 'amount_0');
+              if (ba) evBaseAmount = evBaseAmount || ba;
+              const qa = findAttr(pairs, 'quote_amount') || findAttr(pairs, 'actual_quote') || findAttr(pairs, 'amount_1');
+              if (qa) evQuoteAmount = evQuoteAmount || qa;
             }
           }
 
+          // For RemoveLiquidity, pool_id is not in the request msg — derive from lptoken denom
+          if (!poolId && m.lptoken?.denom) {
+            // LP token denom IS the pool_id on zigchain
+            poolId = String(m.lptoken.denom);
+          }
+
           if (poolId) {
+            const isAdd = type.includes('Add');
             dexLiquidityRows.push({
               tx_hash,
               msg_index: i,
               pool_id: poolId,
               sender_address: m.creator || m.signer || firstSigner,
-              action_type: type.includes('Add') ? 'ADD' : 'REMOVE',
-              amount_0: m.base?.amount || m.token_0_amount || m.max_token_0,
-              amount_1: m.quote?.amount || m.token_1_amount || m.max_token_1,
-              shares_minted_burned: m.lptoken?.amount || m.share_amount || m.lp_token_out,
+              action_type: isAdd ? 'ADD' : 'REMOVE',
+              amount_0: m.base?.amount || evBaseAmount || null,
+              amount_1: m.quote?.amount || evQuoteAmount || null,
+              shares_minted_burned: m.lptoken?.amount || evLpAmount || null,
               block_height: height
             });
           }
