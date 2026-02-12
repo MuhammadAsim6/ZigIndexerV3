@@ -12,22 +12,22 @@ CREATE TABLE IF NOT EXISTS util.height_part_ranges (
 
 -- Configuration: Partition sizes (customized per table)
 INSERT INTO util.height_part_ranges (schema_name, table_name, range_size) VALUES
- ('core', 'blocks', 1000000), ('core', 'transactions', 1000000), ('core', 'messages', 1000000),
+ ('core', 'blocks', 500000), ('core', 'transactions', 500000), ('core', 'messages', 500000),
  ('core', 'events', 100000),  -- ✅ 1 lakh blocks for easier archival
- ('core', 'validator_set', 1000000), ('core', 'validator_missed_blocks', 1000000),
- ('core', 'network_params', 1000000), ('core', 'event_attrs', 100000),
- ('bank', 'transfers', 1000000), ('bank', 'balance_deltas', 1000000),
- ('stake', 'delegation_events', 1000000), ('stake', 'distribution_events', 1000000),
- ('gov', 'deposits', 1000000), ('gov', 'votes', 1000000),
- ('authz_feegrant', 'authz_grants', 1000000), ('authz_feegrant', 'fee_grants', 1000000),
- ('tokens', 'cw20_transfers', 1000000),
- ('wasm', 'executions', 1000000), ('wasm', 'events', 1000000),
- ('wasm', 'event_attrs', 1000000), ('wasm', 'contract_migrations', 1000000),
- ('wasm', 'dex_swaps', 1000000), ('wasm', 'admin_changes', 1000000),
+ ('core', 'validator_set', 500000), ('core', 'validator_missed_blocks', 500000),
+ ('core', 'network_params', 500000), ('core', 'event_attrs', 100000),
+ ('bank', 'transfers', 500000), ('bank', 'balance_deltas', 500000),
+ ('stake', 'delegation_events', 500000), ('stake', 'distribution_events', 500000),
+ ('gov', 'deposits', 500000), ('gov', 'votes', 500000),
+ ('authz_feegrant', 'authz_grants', 500000), ('authz_feegrant', 'fee_grants', 500000),
+ ('tokens', 'cw20_transfers', 500000),
+ ('wasm', 'executions', 500000), ('wasm', 'events', 500000),
+ ('wasm', 'event_attrs', 500000), ('wasm', 'contract_migrations', 500000),
+ ('wasm', 'dex_swaps', 500000), ('wasm', 'admin_changes', 500000),
  -- IBC: No longer partitioned (lifecycle merging requires simple PK)
- ('zigchain', 'dex_swaps', 1000000), ('zigchain', 'dex_liquidity', 1000000),
- ('zigchain', 'wrapper_events', 1000000),
- ('tokens', 'factory_supply_events', 1000000)
+ ('zigchain', 'dex_swaps', 500000), ('zigchain', 'dex_liquidity', 500000),
+ ('zigchain', 'wrapper_events', 500000),
+ ('tokens', 'factory_supply_events', 500000)
 ON CONFLICT (schema_name, table_name) DO UPDATE SET range_size = EXCLUDED.range_size;
 
 -- Remove unused entries
@@ -63,7 +63,7 @@ BEGIN
     SELECT range_size INTO v_range FROM util.height_part_ranges 
     WHERE schema_name = p_schema AND table_name = p_table;
     
-    IF NOT FOUND THEN v_range := 1000000; END IF;
+    IF NOT FOUND THEN v_range := 500000; END IF;
 
     -- 2. Calculate which partition implies this height
     -- e.g. Height 500 -> Start 0. Height 1,500,000 -> Start 1,000,000.

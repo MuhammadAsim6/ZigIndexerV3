@@ -14,14 +14,14 @@ export async function insertFactoryDenoms(client: PoolClient, rows: any[]): Prom
     cols,
     rows,
     'ON CONFLICT (denom) DO UPDATE SET ' +
-    'creator_address = EXCLUDED.creator_address, ' +
-    'sub_denom = EXCLUDED.sub_denom, ' +
-    'minting_cap = EXCLUDED.minting_cap, ' +
-    'uri = EXCLUDED.uri, ' +
-    'uri_hash = EXCLUDED.uri_hash, ' +
-    'description = EXCLUDED.description, ' +
-    'creation_tx_hash = EXCLUDED.creation_tx_hash, ' +
-    'block_height = EXCLUDED.block_height'
+    'creator_address = COALESCE(EXCLUDED.creator_address, zigchain.factory_denoms.creator_address), ' +
+    'sub_denom = COALESCE(EXCLUDED.sub_denom, zigchain.factory_denoms.sub_denom), ' +
+    'minting_cap = COALESCE(EXCLUDED.minting_cap, zigchain.factory_denoms.minting_cap), ' +
+    'uri = COALESCE(EXCLUDED.uri, zigchain.factory_denoms.uri), ' +
+    'uri_hash = COALESCE(EXCLUDED.uri_hash, zigchain.factory_denoms.uri_hash), ' +
+    'description = COALESCE(EXCLUDED.description, zigchain.factory_denoms.description), ' +
+    'creation_tx_hash = zigchain.factory_denoms.creation_tx_hash, ' +
+    'block_height = zigchain.factory_denoms.block_height'
   );
 }
 

@@ -42,7 +42,7 @@ export async function ensureCorePartitions(client: PoolClient, minHeight: number
       'core.events': 100000,
       'core.event_attrs': 100000,
     };
-    const DEFAULT_RANGE_SIZE = 1000000;
+    const DEFAULT_RANGE_SIZE = 500000;
 
     // Ensure Range partitions for min, max, and min-1 (safety buffer for boundary blocks)
     for (const [schema, table] of tables) {

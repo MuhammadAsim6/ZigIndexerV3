@@ -8,7 +8,7 @@ DECLARE
     h BIGINT;
     -- ✅ CHANGED: 10M -> 1M. 
     -- Sirf pehla bucket banega. Baaki "Just-in-Time" banenge.
-    v_max_bootstrap_height BIGINT := 1000000; 
+    v_max_bootstrap_height BIGINT := 500000; 
     v_range_size BIGINT;
 BEGIN
     RAISE NOTICE 'Bootstrapping initial partitions...';

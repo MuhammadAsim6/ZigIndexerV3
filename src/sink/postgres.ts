@@ -110,6 +110,94 @@ function normalizeUintAmount(value: unknown): string | null {
   return /^\d+$/.test(s) ? s : null;
 }
 
+function buildFactoryDenom(creatorRaw: unknown, subDenomRaw: unknown): string | null {
+  const creator = normalizeNonEmptyString(creatorRaw);
+  const subDenom = normalizeNonEmptyString(subDenomRaw);
+  if (!creator || !subDenom) return null;
+  return `factory/${creator}/${subDenom}`;
+}
+
+function normalizeFactoryDenom(denomRaw: unknown): string | null {
+  const denom = normalizeNonEmptyString(denomRaw);
+  if (!denom) return null;
+  const compact = denom.replace(/\s+/g, '');
+  if (!compact.startsWith('factory/')) return null;
+  const parts = compact.split('/');
+  if (parts.length < 3 || !parts[1] || !parts.slice(2).join('/')) return null;
+  return compact;
+}
+
+function splitFactoryDenom(denomRaw: unknown): { creatorAddress: string | null; subDenom: string | null } {
+  const denom = normalizeFactoryDenom(denomRaw);
+  if (!denom) return { creatorAddress: null, subDenom: null };
+  const parts = denom.split('/');
+  const creatorAddress = normalizeNonEmptyString(parts[1]);
+  const subDenom = normalizeNonEmptyString(parts.slice(2).join('/'));
+  return { creatorAddress, subDenom };
+}
+
+function normalizeFactoryUri(value: unknown): string | null {
+  const raw = normalizeNonEmptyString(value);
+  if (!raw) return null;
+
+  let uri = raw;
+  const gatewayMatch = uri.match(/^https?:\/\/[^/]+\/ipfs\/(.+)$/i);
+  if (gatewayMatch?.[1]) {
+    uri = `ipfs://${gatewayMatch[1]}`;
+  }
+
+  if (/^ipfs:\/\//i.test(uri)) {
+    let rest = uri.replace(/^ipfs:\/\//i, '').trim();
+    rest = rest.replace(/^\/+/, '');
+    rest = rest.replace(/^ipfs\//i, '');
+    rest = rest.replace(/^ipfs\.io\//i, '');
+    const nestedGatewayMatch = rest.match(/^[^/]+\/ipfs\/(.+)$/i);
+    if (nestedGatewayMatch?.[1]) rest = nestedGatewayMatch[1];
+    uri = rest ? `ipfs://${rest}` : '';
+  }
+
+  const normalized = uri.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function isValidFactoryUri(uri: string): boolean {
+  if (uri.length > 2048) return false;
+  if (/\s/.test(uri)) return false;
+  return /^(ipfs|https?):\/\/.+$/i.test(uri);
+}
+
+function normalizeFactoryUriHash(value: unknown): string | null {
+  const raw = normalizeNonEmptyString(value);
+  if (!raw) return null;
+  const stripped = raw.startsWith('0x') || raw.startsWith('0X') ? raw.slice(2) : raw;
+  return /^[A-Fa-f0-9]{64}$/.test(stripped) ? stripped : null;
+}
+
+function sanitizeFactoryUriFields(
+  uriRaw: unknown,
+  uriHashRaw: unknown,
+  context: { denom: string | null; txHash: string | null; msgType: string; height: number }
+): { uri: string | null; uri_hash: string | null } {
+  const rawUri = normalizeNonEmptyString(uriRaw);
+  const rawUriHash = normalizeNonEmptyString(uriHashRaw);
+
+  let uri = normalizeFactoryUri(uriRaw);
+  if (uri && !isValidFactoryUri(uri)) {
+    uri = null;
+  }
+  const uriHash = normalizeFactoryUriHash(uriHashRaw);
+
+  const ctx = `[factory] ${context.msgType} denom=${context.denom ?? 'unknown'} height=${context.height} tx=${context.txHash ?? 'unknown'}`;
+  if (rawUri && !uri) {
+    log.warn(`${ctx} invalid URI format ignored: ${rawUri}`);
+  }
+  if (rawUriHash && !uriHash) {
+    log.warn(`${ctx} invalid URI_hash format ignored`);
+  }
+
+  return { uri, uri_hash: uriHash };
+}
+
 function pickFirstNonEmptyAttr(
   attrsPairs: Array<{ key: string; value: string | null }>,
   keys: string[],
@@ -1088,22 +1176,78 @@ export class PostgresSink implements Sink {
         // 🟢 ZIGCHAIN LOGIC 🟢
         if (type.endsWith('.MsgCreateDenom') && isSuccess) {
           const event = msgLog?.events.find((e: any) => e.type === 'create_denom');
-          let finalDenom = event ? findAttr(attrsToPairs(event.attributes), 'denom') : `factory/${m.creator}/${m.sub_denom}`;
+          const eventDenom = event ? normalizeFactoryDenom(findAttr(attrsToPairs(event.attributes), 'denom')) : null;
+          const fallbackDenom = buildFactoryDenom(m.creator, m.sub_denom);
+          const finalDenom = eventDenom || fallbackDenom;
 
-          factoryDenomsRows.push({
-            denom: finalDenom,
-            creator_address: m.creator,
-            sub_denom: m.sub_denom,
-            minting_cap: m.minting_cap,
-            uri: m.URI ?? m.uri ?? m._u_r_i ?? null,
-            uri_hash: m.URI_hash ?? m.URIHash ?? m.uri_hash ?? m._u_r_i_hash ?? null,
-            description: m.description,
-            creation_tx_hash: tx_hash,
-            block_height: height
-          });
+          if (!finalDenom || !tx_hash) {
+            log.warn(`[factory] MsgCreateDenom skipped (invalid denom or tx hash) at height ${height}`);
+          } else {
+            const parts = splitFactoryDenom(finalDenom);
+            const creatorAddress = parts.creatorAddress || normalizeNonEmptyString(m.creator);
+            if (!creatorAddress) {
+              log.warn(`[factory] MsgCreateDenom skipped (missing creator) denom=${finalDenom} tx=${tx_hash}`);
+            } else {
+              const { uri, uri_hash } = sanitizeFactoryUriFields(
+                m.URI ?? m.uri ?? m._u_r_i ?? null,
+                m.URI_hash ?? m.URIHash ?? m.uri_hash ?? m._u_r_i_hash ?? null,
+                { denom: finalDenom, txHash: tx_hash, msgType: 'MsgCreateDenom', height },
+              );
 
-          // ✅ Register in Token Registry
-          registerToken(finalDenom, 'factory', { creator: m.creator }, tx_hash as string | null);
+              factoryDenomsRows.push({
+                denom: finalDenom,
+                creator_address: creatorAddress,
+                sub_denom: parts.subDenom || normalizeNonEmptyString(m.sub_denom),
+                minting_cap: normalizeUintAmount(m.minting_cap),
+                uri,
+                uri_hash,
+                description: normalizeNonEmptyString(m.description),
+                creation_tx_hash: tx_hash,
+                block_height: height
+              });
+
+              // ✅ Register in Token Registry
+              registerToken(finalDenom, 'factory', { creator: creatorAddress }, tx_hash as string | null);
+            }
+          }
+        }
+
+        if (type.endsWith('.MsgUpdateDenomURI') && isSuccess) {
+          const denom = normalizeFactoryDenom(m.denom);
+          if (!denom || !tx_hash) {
+            log.warn(`[factory] MsgUpdateDenomURI skipped (invalid denom or tx hash) at height ${height}`);
+          } else {
+            const parts = splitFactoryDenom(denom);
+            const creatorAddress = parts.creatorAddress;
+            if (!creatorAddress) {
+              log.warn(`[factory] MsgUpdateDenomURI skipped (cannot parse creator) denom=${denom} tx=${tx_hash}`);
+            } else {
+              const { uri, uri_hash } = sanitizeFactoryUriFields(
+                m.URI ?? m.uri ?? m._u_r_i ?? null,
+                m.URI_hash ?? m.URIHash ?? m.uri_hash ?? m._u_r_i_hash ?? null,
+                { denom, txHash: tx_hash, msgType: 'MsgUpdateDenomURI', height },
+              );
+
+              if (!uri && !uri_hash) {
+                log.warn(`[factory] MsgUpdateDenomURI ignored (no valid URI fields) denom=${denom} tx=${tx_hash}`);
+              } else {
+                // Upsert row to update URI/URI hash; inserter keeps existing non-null fields.
+                factoryDenomsRows.push({
+                  denom,
+                  creator_address: creatorAddress,
+                  sub_denom: parts.subDenom,
+                  minting_cap: null,
+                  uri,
+                  uri_hash,
+                  description: null,
+                  creation_tx_hash: tx_hash,
+                  block_height: height
+                });
+              }
+
+              registerToken(denom, 'factory', { creator: creatorAddress }, tx_hash as string | null);
+            }
+          }
         }
 
         if (isSuccess && (type.endsWith('.MsgMintAndSendTokens') || type.endsWith('.MsgBurnTokens'))) {
