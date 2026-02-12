@@ -2120,9 +2120,10 @@ export class PostgresSink implements Sink {
 
 
           // 🟢 BANK BALANCE DELTAS 🟢
-          if (isSuccess) {
-            txBankDeltaCount += extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
-          }
+          // Process for ALL txs (including failed) — SDK emits coin_spent/coin_received
+          // for ante-handler fee deduction even on failed txs. Message-level events are
+          // not emitted on failure, so this is safe and captures the actual on-chain fee.
+          txBankDeltaCount += extractBalanceDeltas(event_type, attrsPairs, tx_hash, msg_index, ei);
           // 🟢 SUPPLY TRACKING FROM BANK/MODULE EVENTS 🟢
           if (isSuccess) {
             extractFactorySupplyFromEvent(event_type, attrsPairs, tx_hash ?? undefined, msg_index, ei);
@@ -2157,36 +2158,10 @@ export class PostgresSink implements Sink {
         }
       }
 
-      if (code !== 0 && txBankDeltaCount === 0) {
-        const feeGranter = normalizeNonEmptyString(fee?.granter);
-        const feePayer = normalizeNonEmptyString(fee?.payer);
-        const signerPayer = normalizeNonEmptyString(firstSigner);
-        const feeAccount = feeGranter || feePayer || signerPayer;
-        const feeAccountSource = feeGranter ? 'granter' : feePayer ? 'payer' : signerPayer ? 'signer' : 'none';
-
-        if (feeAccount) {
-          const feeCoins = parseFeeCoins(fee);
-          if (feeCoins.length > 0) {
-            const syntheticTxHash = tx_hash ?? `failed_tx_${height}_${tx_index}`;
-            for (let fi = 0; fi < feeCoins.length; fi++) {
-              const coin = feeCoins[fi];
-              if (!coin) continue;
-              balanceDeltasRows.push({
-                height,
-                account: feeAccount,
-                denom: coin.denom,
-                delta: `-${coin.amount}`,
-                tx_hash: syntheticTxHash,
-                msg_index: -1,
-                event_index: -100 - fi,
-              });
-            }
-            log.warn(
-              `[bank] failed-tx fee fallback applied tx=${syntheticTxHash} code=${code} account=${feeAccount} source=${feeAccountSource} feeCoins=${feeCoins.length}`,
-            );
-          }
-        }
-      }
+      // NOTE: Failed-tx fee fallback removed. Bank events from failed txs are now
+      // captured directly via extractBalanceDeltas above (isSuccess guard removed).
+      // The old fallback subtracted declared fees blindly, causing phantom negatives
+      // on ante-handler failures where no fee was actually charged.
     }
 
     // ✅ FIX: Process Begin/End Block Events for Balances (e.g. Gov Refunds, Minting)
