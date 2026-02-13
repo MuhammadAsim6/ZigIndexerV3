@@ -85,7 +85,7 @@ import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
 import { fetchContractInfoViaAbci } from './pg/helpers/wasm_abci.js';
 // ✅ RPC Client and ProtoRoot for ABCI queries
 import { createRpcClientFromConfig, RpcClient } from '../rpc/client.js';
-import { loadProtoRoot } from '../decode/dynamicProto.js';
+import { decodeAnyWithRoot, loadProtoRoot } from '../decode/dynamicProto.js';
 import { Root } from 'protobufjs';
 import path from 'node:path';
 
@@ -329,6 +329,54 @@ function parseFeeCoins(fee: any): Array<{ denom: string; amount: string }> {
   return [];
 }
 
+type TokenRegistryRpcMetadata = {
+  symbol: string | null;
+  base_denom: string | null;
+  decimals: number | null;
+  full_meta: Record<string, unknown> | null;
+};
+
+function normalizePlainObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const obj = value as Record<string, unknown>;
+  return Object.keys(obj).length > 0 ? obj : null;
+}
+
+function extractDecimalsFromBankMetadata(meta: Record<string, unknown>): number | null {
+  const display = normalizeNonEmptyString(meta['display']);
+  const denomUnitsRaw = meta['denom_units'] ?? meta['denomUnits'];
+  if (!Array.isArray(denomUnitsRaw) || denomUnitsRaw.length === 0) return null;
+
+  let maxExponent: number | null = null;
+  for (const unitRaw of denomUnitsRaw) {
+    const unit = normalizePlainObject(unitRaw);
+    if (!unit) continue;
+
+    const unitDenom = normalizeNonEmptyString(unit['denom']);
+    const exponent = normalizeNonNegativeInt(unit['exponent']);
+    if (exponent === null) continue;
+
+    if (display && unitDenom === display) {
+      return exponent;
+    }
+    maxExponent = maxExponent === null ? exponent : Math.max(maxExponent, exponent);
+  }
+
+  return maxExponent;
+}
+
+function extractTokenRegistryMetadataFromBankResponse(decoded: any): TokenRegistryRpcMetadata | null {
+  const metadataObj = normalizePlainObject(decoded?.metadata ?? decoded?.metadatas?.[0]);
+  if (!metadataObj) return null;
+
+  return {
+    symbol: normalizeNonEmptyString(metadataObj['symbol']) ?? normalizeNonEmptyString(metadataObj['display']) ?? null,
+    base_denom: normalizeNonEmptyString(metadataObj['base']),
+    decimals: extractDecimalsFromBankMetadata(metadataObj),
+    full_meta: metadataObj,
+  };
+}
+
 export interface PostgresSinkConfig extends SinkConfig {
   pg: {
     connectionString?: string;
@@ -364,6 +412,7 @@ export class PostgresSink implements Sink {
   private protoRoot: Root | null = null;
   private govTimestampsCache = new Map<string, any>();
   private wasmContractsCache = new Map<string, any>();
+  private tokenRegistryMetadataCache = new Map<string, TokenRegistryRpcMetadata | null>();
   private isShuttingDown = false;
 
   // Standard Buffers
@@ -533,6 +582,104 @@ export class PostgresSink implements Sink {
       await resolveMissingBlock(client, height);
     } finally {
       client.release();
+    }
+  }
+
+  private async fetchTokenRegistryMetadataViaAbci(denom: string): Promise<TokenRegistryRpcMetadata | null> {
+    if (this.tokenRegistryMetadataCache.has(denom)) {
+      return this.tokenRegistryMetadataCache.get(denom) ?? null;
+    }
+    if (!this.rpc || !this.protoRoot) {
+      this.tokenRegistryMetadataCache.set(denom, null);
+      return null;
+    }
+
+    try {
+      const ReqType = this.protoRoot.lookupType('cosmos.bank.v1beta1.QueryDenomMetadataRequest');
+      const ResType = 'cosmos.bank.v1beta1.QueryDenomMetadataResponse';
+      const reqMsg = ReqType.create({ denom });
+      const reqBytes = ReqType.encode(reqMsg).finish();
+      const reqHex = '0x' + Buffer.from(reqBytes).toString('hex');
+      const response = await this.rpc.queryAbci('/cosmos.bank.v1beta1.Query/DenomMetadata', reqHex);
+
+      if (!response || response.code !== 0 || !response.value) {
+        this.tokenRegistryMetadataCache.set(denom, null);
+        return null;
+      }
+
+      const decoded = decodeAnyWithRoot(ResType, Buffer.from(response.value, 'base64'), this.protoRoot) as any;
+      const parsed = extractTokenRegistryMetadataFromBankResponse(decoded);
+      this.tokenRegistryMetadataCache.set(denom, parsed);
+      return parsed;
+    } catch (err: any) {
+      this.tokenRegistryMetadataCache.set(denom, null);
+      log.debug(`[token-registry] skip denom metadata fetch for ${denom}: ${err.message}`);
+      return null;
+    }
+  }
+
+  private applyTokenRegistryRpcMetadata(row: any, metadata: TokenRegistryRpcMetadata): void {
+    if (metadata.decimals !== null) {
+      row.decimals = metadata.decimals;
+    }
+    if (metadata.symbol) {
+      row.symbol = metadata.symbol;
+    }
+    if (metadata.base_denom) {
+      row.base_denom = metadata.base_denom;
+    }
+    if (metadata.full_meta) {
+      const existing = normalizePlainObject(row?.metadata);
+      row.metadata = existing
+        ? { ...existing, ...metadata.full_meta }
+        : { ...metadata.full_meta };
+    }
+  }
+
+  private async enrichTokenRegistryRowsFromRpc(rows: any[]): Promise<void> {
+    if (!rows?.length || !this.rpc || !this.protoRoot) return;
+
+    const rowsByDenom = new Map<string, any[]>();
+    for (const row of rows) {
+      const denom = normalizeNonEmptyString(row?.denom);
+      if (!denom) continue;
+      const bucket = rowsByDenom.get(denom);
+      if (bucket) {
+        bucket.push(row);
+      } else {
+        rowsByDenom.set(denom, [row]);
+      }
+    }
+
+    const denoms = Array.from(rowsByDenom.keys());
+    if (denoms.length === 0) return;
+
+    const pendingDenoms = denoms.filter((denom) => !this.tokenRegistryMetadataCache.has(denom));
+    if (pendingDenoms.length > 0) {
+      const concurrency = Math.min(8, pendingDenoms.length);
+      let cursor = 0;
+      const workers = Array.from({ length: concurrency }, async () => {
+        while (true) {
+          const idx = cursor++;
+          if (idx >= pendingDenoms.length) break;
+          await this.fetchTokenRegistryMetadataViaAbci(pendingDenoms[idx]);
+        }
+      });
+      await Promise.all(workers);
+    }
+
+    let enrichedRowCount = 0;
+    for (const [denom, denomRows] of rowsByDenom.entries()) {
+      const metadata = this.tokenRegistryMetadataCache.get(denom) ?? null;
+      if (!metadata) continue;
+      for (const row of denomRows) {
+        this.applyTokenRegistryRpcMetadata(row, metadata);
+        enrichedRowCount += 1;
+      }
+    }
+
+    if (enrichedRowCount > 0) {
+      log.debug(`[token-registry] RPC metadata enriched rows=${enrichedRowCount} denoms=${denoms.length}`);
     }
   }
 
@@ -2695,6 +2842,9 @@ export class PostgresSink implements Sink {
     this.bufAuthzGrants = []; this.bufFeeGrants = []; this.bufCw20Transfers = [];
     this.bufWasmSwaps = []; this.bufTokenRegistry = []; this.bufUnknownMsgs = [];
     this.bufFactorySupplyEvents = [];
+
+    // Enrich token registry rows once per denom from chain metadata (cached per process).
+    await this.enrichTokenRegistryRowsFromRpc(snapshot.tokenRegistry);
 
     const pool = getPgPool();
     const client = await pool.connect();

@@ -118,17 +118,17 @@ export async function bootstrapGenesis(genesisPath: string) {
                 if (denom) registryDenoms.add(denom);
             }
         }
-        if (wrapperDenomForRegistry) {
-            registryDenoms.add(wrapperDenomForRegistry);
-        }
-
-        const registryRows = Array.from(registryDenoms)
-            .map((denom) => buildTokenRegistryRow({
+        const registryRowsByDenom = new Map<string, NonNullable<ReturnType<typeof buildTokenRegistryRow>>>();
+        for (const denom of registryDenoms) {
+            const row = buildTokenRegistryRow({
                 denom,
                 height: 0,
                 txHash: 'genesis_bootstrap',
-            }))
-            .filter((row): row is NonNullable<typeof row> => !!row);
+            });
+            if (row) {
+                registryRowsByDenom.set(row.denom, row);
+            }
+        }
 
         if (wrapperDenomForRegistry) {
             const wrapperRegistryRow = buildTokenRegistryRow({
@@ -138,9 +138,12 @@ export async function bootstrapGenesis(genesisPath: string) {
                 source: 'wrapper_settings',
             });
             if (wrapperRegistryRow) {
-                registryRows.push(wrapperRegistryRow);
+                // Ensure wrapper-specific classification wins without creating duplicates.
+                registryRowsByDenom.set(wrapperRegistryRow.denom, wrapperRegistryRow);
             }
         }
+
+        const registryRows = Array.from(registryRowsByDenom.values());
 
         if (registryRows.length > 0) {
             await insertTokenRegistry(client, registryRows);
