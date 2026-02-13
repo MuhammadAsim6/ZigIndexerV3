@@ -110,6 +110,105 @@ function normalizeUintAmount(value: unknown): string | null {
   return /^\d+$/.test(s) ? s : null;
 }
 
+function normalizeNonNegativeInt(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  if (!/^\d+$/.test(s)) return null;
+  const n = Number(s);
+  if (!Number.isSafeInteger(n) || n < 0 || n > 2147483647) return null;
+  return n;
+}
+
+function isLikelyChannelId(value: string | null): boolean {
+  return !!value && /^channel-\d+$/i.test(value);
+}
+
+function isLikelyPortId(value: string | null): boolean {
+  return !!value && /^(transfer|[a-z][a-z0-9._-]{1,63})$/i.test(value);
+}
+
+function isLikelyClientId(value: string | null): boolean {
+  return !!value && /^\d{2,}-[a-z0-9-]+-\d+$/i.test(value);
+}
+
+function isLikelyDenom(value: string | null): boolean {
+  if (!value) return false;
+  if (isLikelyChannelId(value) || isLikelyClientId(value)) return false;
+  return /^[a-z][a-z0-9/:._-]{1,127}$/i.test(value);
+}
+
+type WrapperIbcSettingsNormalized = {
+  denom: string | null;
+  native_client_id: string | null;
+  counterparty_client_id: string | null;
+  native_port: string | null;
+  counterparty_port: string | null;
+  native_channel: string | null;
+  counterparty_channel: string | null;
+  decimal_difference: number | null;
+  legacy_shift_mapped: boolean;
+};
+
+function normalizeWrapperIbcSettingsMessage(
+  msg: any,
+  context: { height: number; txHash: string | null; msgIndex: number },
+): WrapperIbcSettingsNormalized {
+  const nativeClientId = normalizeNonEmptyString(msg?.native_client_id);
+  const counterpartyClientId = normalizeNonEmptyString(msg?.counterparty_client_id);
+  const nativePort = normalizeNonEmptyString(msg?.native_port);
+  const counterpartyPort = normalizeNonEmptyString(msg?.counterparty_port);
+  const nativeChannel = normalizeNonEmptyString(msg?.native_channel);
+  const counterpartyChannel = normalizeNonEmptyString(msg?.counterparty_channel);
+  const denom = normalizeNonEmptyString(msg?.denom);
+  const decimalDifference = normalizeNonNegativeInt(msg?.decimal_difference);
+  const decimalRaw =
+    msg?.decimal_difference === null || msg?.decimal_difference === undefined
+      ? null
+      : String(msg.decimal_difference).trim();
+
+  const looksLegacyShifted =
+    !denom &&
+    isLikelyDenom(counterpartyPort) &&
+    isLikelyChannelId(nativePort) &&
+    isLikelyPortId(counterpartyClientId) &&
+    !isLikelyClientId(counterpartyClientId);
+
+  if (looksLegacyShifted) {
+    log.warn(
+      `[wrapper] legacy-shifted MsgUpdateIbcSettings remapped: height=${context.height} tx=${context.txHash ?? 'unknown'} msg_index=${context.msgIndex}`,
+    );
+    return {
+      denom: counterpartyPort,
+      native_client_id: nativeClientId,
+      counterparty_client_id: null,
+      native_port: counterpartyClientId,
+      counterparty_port: null,
+      native_channel: nativePort,
+      counterparty_channel: null,
+      decimal_difference: decimalDifference,
+      legacy_shift_mapped: true,
+    };
+  }
+
+  if (decimalRaw && decimalRaw.length > 0 && decimalDifference === null) {
+    log.warn(
+      `[wrapper] invalid decimal_difference ignored: height=${context.height} tx=${context.txHash ?? 'unknown'} msg_index=${context.msgIndex} raw=${decimalRaw}`,
+    );
+  }
+
+  return {
+    denom,
+    native_client_id: nativeClientId,
+    counterparty_client_id: counterpartyClientId,
+    native_port: nativePort,
+    counterparty_port: counterpartyPort,
+    native_channel: nativeChannel,
+    counterparty_channel: counterpartyChannel,
+    decimal_difference: decimalDifference,
+    legacy_shift_mapped: false,
+  };
+}
+
 function buildFactoryDenom(creatorRaw: unknown, subDenomRaw: unknown): string | null {
   const creator = normalizeNonEmptyString(creatorRaw);
   const subDenom = normalizeNonEmptyString(subDenomRaw);
@@ -1306,6 +1405,11 @@ export class PostgresSink implements Sink {
         }
 
         if (type.endsWith('.MsgUpdateIbcSettings') && isSuccess) {
+          const normalizedWrapper = normalizeWrapperIbcSettingsMessage(m, {
+            height,
+            txHash: tx_hash,
+            msgIndex: i,
+          });
           wrapperEventsRows.push({
             height,
             tx_hash,
@@ -1314,16 +1418,36 @@ export class PostgresSink implements Sink {
             sender: normalizeNonEmptyString(m.sender || m.signer || firstSigner) || 'unknown',
             action: 'update_ibc_settings',
             amount: null,
-            denom: null,
+            denom: normalizedWrapper.denom,
             metadata: {
-              native_client_id: m.native_client_id,
-              counterparty_client_id: m.counterparty_client_id,
-              native_port: m.native_port,
-              counterparty_port: m.counterparty_port,
-              native_channel: m.native_channel,
-              counterparty_channel: m.counterparty_channel
+              native_client_id: normalizedWrapper.native_client_id,
+              counterparty_client_id: normalizedWrapper.counterparty_client_id,
+              native_port: normalizedWrapper.native_port,
+              counterparty_port: normalizedWrapper.counterparty_port,
+              native_channel: normalizedWrapper.native_channel,
+              counterparty_channel: normalizedWrapper.counterparty_channel,
+              decimal_difference: normalizedWrapper.decimal_difference,
+              legacy_shift_mapped: normalizedWrapper.legacy_shift_mapped,
             }
           });
+
+          if (!normalizedWrapper.denom) {
+            log.warn(
+              `[wrapper] MsgUpdateIbcSettings skipped for wrapper_settings (missing denom): height=${height} tx=${tx_hash ?? 'unknown'} msg_index=${i}`,
+            );
+          } else {
+            wrapperSettingsRows.push({
+              denom: normalizedWrapper.denom,
+              native_client_id: normalizedWrapper.native_client_id,
+              counterparty_client_id: normalizedWrapper.counterparty_client_id,
+              native_port: normalizedWrapper.native_port,
+              counterparty_port: normalizedWrapper.counterparty_port,
+              native_channel: normalizedWrapper.native_channel,
+              counterparty_channel: normalizedWrapper.counterparty_channel,
+              decimal_difference: normalizedWrapper.decimal_difference,
+              updated_at_height: height
+            });
+          }
         }
 
         if (type.endsWith('.MsgCreatePool') && isSuccess) {
@@ -1429,20 +1553,6 @@ export class PostgresSink implements Sink {
               block_height: height
             });
           }
-        }
-
-        if (type.endsWith('.MsgUpdateIbcSettings') && isSuccess) {
-          wrapperSettingsRows.push({
-            denom: m.denom,
-            native_client_id: m.native_client_id,
-            counterparty_client_id: m.counterparty_client_id,
-            native_port: m.native_port,
-            counterparty_port: m.counterparty_port,
-            native_channel: m.native_channel,
-            counterparty_channel: m.counterparty_channel,
-            decimal_difference: m.decimal_difference,
-            updated_at_height: height
-          });
         }
 
         // 🟢 WASM LOGIC 🟢

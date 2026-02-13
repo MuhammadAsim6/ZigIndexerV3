@@ -3,8 +3,24 @@ import path from 'node:path';
 import { getPgPool, closePgPool, createPgPool } from '../db/pg.js';
 import { getLogger } from '../utils/logger.js';
 import { getConfig } from '../config.js';
+import { insertWrapperSettings } from '../sink/pg/inserters/zigchain.js';
 
 const log = getLogger('scripts/genesis-bootstrap');
+
+function normalizeNonEmptyString(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeNonNegativeInt(value: unknown): number | null {
+    if (value === null || value === undefined) return null;
+    const s = String(value).trim();
+    if (!/^\d+$/.test(s)) return null;
+    const n = Number(s);
+    if (!Number.isSafeInteger(n) || n < 0 || n > 2147483647) return null;
+    return n;
+}
 
 /**
  * Enhanced Genesis Bootstrap Script
@@ -41,6 +57,7 @@ export async function bootstrapGenesis(genesisPath: string) {
         (acc: any) => acc['@type']?.includes('Vesting') || acc.base_vesting_account
     ) ?? [];
     const totalSupply = genesis.app_state?.bank?.supply ?? [];
+    const tokenWrapperState = genesis.app_state?.tokenwrapper ?? null;
 
     if (!Array.isArray(bankBalances) || bankBalances.length === 0) {
         log.error('Invalid genesis format: app_state.bank.balances is missing or empty');
@@ -62,6 +79,28 @@ export async function bootstrapGenesis(genesisPath: string) {
         }
 
         await client.query('BEGIN');
+
+        // 0. Tokenwrapper settings baseline from genesis
+        if (tokenWrapperState && typeof tokenWrapperState === 'object') {
+            const wrapperRow = {
+                denom: normalizeNonEmptyString(tokenWrapperState.denom),
+                native_client_id: normalizeNonEmptyString(tokenWrapperState.native_client_id ?? tokenWrapperState.client_id),
+                counterparty_client_id: normalizeNonEmptyString(tokenWrapperState.counterparty_client_id),
+                native_port: normalizeNonEmptyString(tokenWrapperState.native_port ?? tokenWrapperState.source_port),
+                counterparty_port: normalizeNonEmptyString(tokenWrapperState.counterparty_port),
+                native_channel: normalizeNonEmptyString(tokenWrapperState.native_channel ?? tokenWrapperState.source_channel),
+                counterparty_channel: normalizeNonEmptyString(tokenWrapperState.counterparty_channel),
+                decimal_difference: normalizeNonNegativeInt(tokenWrapperState.decimal_difference),
+                updated_at_height: 0,
+            };
+
+            if (wrapperRow.denom) {
+                await insertWrapperSettings(client, [wrapperRow]);
+                log.info(`[genesis] seeded tokenwrapper settings for denom=${wrapperRow.denom}`);
+            } else {
+                log.warn('[genesis] tokenwrapper state present but denom missing; skipping wrapper_settings seed');
+            }
+        }
 
         // 1. Bank Balances (liquid balances)
         const rows: any[] = [];

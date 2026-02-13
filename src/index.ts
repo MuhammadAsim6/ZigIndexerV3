@@ -10,6 +10,7 @@ import { createSink } from './sink/index.ts';
 import { closePgPool, createPgPool, getPgPool } from './db/pg.ts';
 import { getProgress } from './db/progress.ts';
 import { upsertValidators } from './sink/pg/flushers/validators.ts';
+import { insertWrapperSettings } from './sink/pg/inserters/zigchain.ts';
 import { deriveConsensusAddress } from './utils/crypto.ts';
 import { loadProtoRoot, decodeAnyWithRoot } from './decode/dynamicProto.ts';
 import { base64ToBytes } from './utils/bytes.ts';
@@ -24,6 +25,21 @@ import { ensureCorePartitions } from './db/partitions.js';
 
 EventEmitter.defaultMaxListeners = 0;
 const log = getLogger('index');
+
+function normalizeNonEmptyString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeNonNegativeInt(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  if (!/^\d+$/.test(s)) return null;
+  const n = Number(s);
+  if (!Number.isSafeInteger(n) || n < 0 || n > 2147483647) return null;
+  return n;
+}
 
 async function fetchAllStakingValidatorsViaAbci(rpc: any, protoRoot: any): Promise<any[]> {
   const requestType = protoRoot.lookupType('cosmos.staking.v1beta1.QueryValidatorsRequest');
@@ -338,6 +354,45 @@ async function main() {
       }
     } catch (err) {
       log.warn('[start] params sync failed');
+    }
+
+    // 🛡️ INITIAL SYNC: Fetch tokenwrapper module info snapshot
+    try {
+      const pool = getPgPool();
+      const client = await pool.connect();
+      try {
+        const abci = await rpc.queryAbci('/zigchain.tokenwrapper.Query/ModuleInfo');
+        if (abci?.value) {
+          const decoded = await decodePool.decodeGeneric('zigchain.tokenwrapper.QueryModuleInfoResponse', abci.value);
+          const row = {
+            denom: normalizeNonEmptyString(decoded?.denom),
+            native_client_id: normalizeNonEmptyString(decoded?.native_client_id),
+            counterparty_client_id: normalizeNonEmptyString(decoded?.counterparty_client_id),
+            native_port: normalizeNonEmptyString(decoded?.native_port),
+            counterparty_port: normalizeNonEmptyString(decoded?.counterparty_port),
+            native_channel: normalizeNonEmptyString(decoded?.native_channel),
+            counterparty_channel: normalizeNonEmptyString(decoded?.counterparty_channel),
+            decimal_difference: normalizeNonNegativeInt(decoded?.decimal_difference),
+            updated_at_height: startFrom,
+          };
+
+          if (!row.denom) {
+            log.warn('[start] tokenwrapper module info returned empty denom; skipping wrapper_settings bootstrap');
+          } else {
+            await client.query('BEGIN');
+            await insertWrapperSettings(client, [row]);
+            await client.query('COMMIT');
+            log.info(`[start] synced tokenwrapper settings for denom=${row.denom}`);
+          }
+        }
+      } catch (e) {
+        try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+        throw e;
+      } finally {
+        client.release();
+      }
+    } catch (err) {
+      log.warn('[start] tokenwrapper module info sync failed');
     }
 
 

@@ -104,13 +104,13 @@ CREATE INDEX IF NOT EXISTS idx_dex_liq_sender ON zigchain.dex_liquidity(sender_a
 -- 5. TOKEN WRAPPER (Bridge/Wrap)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS zigchain.wrapper_settings (
-    denom              TEXT PRIMARY KEY,
+    denom              TEXT PRIMARY KEY CHECK (btrim(denom) <> ''),
     native_client_id   TEXT,
     counterparty_client_id TEXT,
     native_port        TEXT,
     counterparty_port  TEXT,
     native_channel     TEXT,
     counterparty_channel TEXT,
-    decimal_difference INT,
+    decimal_difference INT CHECK (decimal_difference IS NULL OR decimal_difference >= 0),
     updated_at_height  BIGINT
 );

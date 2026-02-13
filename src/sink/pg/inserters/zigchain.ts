@@ -98,14 +98,19 @@ export async function insertWrapperSettings(client: PoolClient, rows: any[]): Pr
     cols,
     rows,
     'ON CONFLICT (denom) DO UPDATE SET ' +
-    'native_client_id = EXCLUDED.native_client_id, ' +
-    'counterparty_client_id = EXCLUDED.counterparty_client_id, ' +
-    'native_port = EXCLUDED.native_port, ' +
-    'counterparty_port = EXCLUDED.counterparty_port, ' +
-    'native_channel = EXCLUDED.native_channel, ' +
-    'counterparty_channel = EXCLUDED.counterparty_channel, ' +
-    'decimal_difference = EXCLUDED.decimal_difference, ' +
-    'updated_at_height = EXCLUDED.updated_at_height'
+    'native_client_id = COALESCE(NULLIF(EXCLUDED.native_client_id, \'\'), zigchain.wrapper_settings.native_client_id), ' +
+    'counterparty_client_id = COALESCE(NULLIF(EXCLUDED.counterparty_client_id, \'\'), zigchain.wrapper_settings.counterparty_client_id), ' +
+    'native_port = COALESCE(NULLIF(EXCLUDED.native_port, \'\'), zigchain.wrapper_settings.native_port), ' +
+    'counterparty_port = COALESCE(NULLIF(EXCLUDED.counterparty_port, \'\'), zigchain.wrapper_settings.counterparty_port), ' +
+    'native_channel = COALESCE(NULLIF(EXCLUDED.native_channel, \'\'), zigchain.wrapper_settings.native_channel), ' +
+    'counterparty_channel = COALESCE(NULLIF(EXCLUDED.counterparty_channel, \'\'), zigchain.wrapper_settings.counterparty_channel), ' +
+    'decimal_difference = COALESCE(EXCLUDED.decimal_difference, zigchain.wrapper_settings.decimal_difference), ' +
+    'updated_at_height = CASE ' +
+    'WHEN EXCLUDED.updated_at_height IS NULL THEN zigchain.wrapper_settings.updated_at_height ' +
+    'WHEN zigchain.wrapper_settings.updated_at_height IS NULL THEN EXCLUDED.updated_at_height ' +
+    'ELSE GREATEST(zigchain.wrapper_settings.updated_at_height, EXCLUDED.updated_at_height) ' +
+    'END ' +
+    'WHERE COALESCE(EXCLUDED.updated_at_height, -1) >= COALESCE(zigchain.wrapper_settings.updated_at_height, -1)'
   );
 }
 

@@ -593,14 +593,14 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_pools (
 
 -- Zigchain Wrapper Settings
 CREATE TABLE IF NOT EXISTS zigchain.wrapper_settings (
-    denom                  TEXT PRIMARY KEY,
+    denom                  TEXT PRIMARY KEY CHECK (btrim(denom) <> ''),
     native_client_id       TEXT NULL,
     counterparty_client_id TEXT NULL,
     native_port            TEXT NULL,
     counterparty_port      TEXT NULL,
     native_channel         TEXT NULL,
     counterparty_channel   TEXT NULL,
-    decimal_difference     INT NULL,
+    decimal_difference     INT NULL CHECK (decimal_difference IS NULL OR decimal_difference >= 0),
     updated_at_height      BIGINT NULL
 );
 
