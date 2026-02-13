@@ -77,6 +77,8 @@ import { flushTokenRegistry } from './pg/flushers/tokens.js'; // ✅ ADDED
 
 // ✅ Gov Params Helper (for timestamp calculation)
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
+import { buildTokenRegistryRow, inferTokenType } from '../utils/token-registry.js';
+import type { TokenRegistrySource, TokenRegistryType } from '../utils/token-registry.js';
 // ✅ Gov ABCI Helper (for fetching proposal data via RPC)
 import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
 // ✅ WASM ABCI Helper (for fetching contract data via RPC)
@@ -614,12 +616,85 @@ export class PostgresSink implements Sink {
 
     // ✅ WASM DEX Swaps Analytics
     const wasmSwapsRows: any[] = [];
-    const tokenRegistryRows: any[] = []; // ✅ NEW
+    const tokenRegistryByDenom = new Map<string, any>();
 
     // ✅ Unknown Messages Quarantine
     const unknownMsgsRows: any[] = [];
     const factorySupplyEventsRows: any[] = [];
     const wrapperEventsRows: any[] = [];
+
+    // 🟢 TOKEN REGISTRY HELPER 🟢
+    function registerToken(
+      denom: unknown,
+      type?: TokenRegistryType,
+      metadata: any = {},
+      tx_h?: string | null,
+      source: TokenRegistrySource = 'default',
+    ): void {
+      if (denom === null || denom === undefined) return;
+      if (typeof denom !== 'string' && typeof denom !== 'number' && typeof denom !== 'bigint') return;
+      const rawDenom = String(denom);
+      if (typeof denom === 'string' && rawDenom.trim().length === 0) {
+        log.warn(`[token-registry] skipped empty/invalid denom at height=${height} tx=${tx_h ?? 'unknown'}`);
+        return;
+      }
+      const row = buildTokenRegistryRow({
+        denom: rawDenom,
+        type: type ?? inferTokenType(rawDenom),
+        source,
+        height,
+        txHash: tx_h ?? null,
+        metadata,
+      });
+      if (!row) {
+        log.warn(`[token-registry] skipped empty/invalid denom at height=${height} tx=${tx_h ?? 'unknown'}`);
+        return;
+      }
+
+      const existing = tokenRegistryByDenom.get(row.denom);
+      if (!existing) {
+        tokenRegistryByDenom.set(row.denom, row);
+        return;
+      }
+
+      const hasExistingHeight = Number.isFinite(existing.first_seen_height);
+      const hasIncomingHeight = Number.isFinite(row.first_seen_height);
+      let firstSeenHeight = existing.first_seen_height;
+      let firstSeenTx = existing.first_seen_tx ?? row.first_seen_tx ?? null;
+
+      if (!hasExistingHeight && hasIncomingHeight) {
+        firstSeenHeight = row.first_seen_height;
+        firstSeenTx = row.first_seen_tx ?? existing.first_seen_tx ?? null;
+      } else if (
+        hasExistingHeight &&
+        hasIncomingHeight &&
+        Number(row.first_seen_height) < Number(existing.first_seen_height)
+      ) {
+        firstSeenHeight = row.first_seen_height;
+        firstSeenTx = row.first_seen_tx ?? existing.first_seen_tx ?? null;
+      } else if (
+        hasExistingHeight &&
+        hasIncomingHeight &&
+        Number(row.first_seen_height) === Number(existing.first_seen_height)
+      ) {
+        firstSeenTx = existing.first_seen_tx ?? row.first_seen_tx ?? null;
+      }
+
+      tokenRegistryByDenom.set(row.denom, {
+        ...existing,
+        type: existing.type === 'native' && row.type !== 'native' ? row.type : existing.type,
+        base_denom: row.base_denom ?? existing.base_denom,
+        symbol: row.symbol ?? existing.symbol,
+        decimals: row.decimals ?? existing.decimals,
+        creator: row.creator ?? existing.creator,
+        first_seen_height: firstSeenHeight,
+        first_seen_tx: firstSeenTx,
+        metadata:
+          (existing.metadata || row.metadata)
+            ? { ...(existing.metadata || {}), ...(row.metadata || {}) }
+            : null,
+      });
+    }
 
     // 🟢 BANK BALANCE DELTAS (Helper)
     const extractBalanceDeltas = (
@@ -664,6 +739,7 @@ export class PostgresSink implements Sink {
             msg_index: (typeof msg_index !== 'undefined') ? msg_index : -1,
             event_index: (typeof event_index !== 'undefined') ? event_index : -1 // ✅ FIX: Use param, not 'ei'
           });
+          registerToken(coin?.denom, undefined, {}, tx_hash ?? null);
           added++;
         }
         return added;
@@ -725,55 +801,10 @@ export class PostgresSink implements Sink {
           recipient: pickFirstNonEmptyAttr(attrsPairs, ['recipient', 'receiver', 'to', 'to_address']),
           metadata: null,
         });
+        registerToken(denom, undefined, {}, txHash);
         added += 1;
       }
       return added;
-    };
-
-    // 🟢 TOKEN REGISTRY HELPER 🟢
-    const registerToken = (denom: string, type: 'native' | 'factory' | 'cw20' | 'ibc', metadata: any = {}, tx_h?: string | null) => {
-      if (!denom) return;
-      const cleanDenom = String(denom).trim();
-      if (!cleanDenom) return;
-      let symbol = metadata.symbol;
-      let baseDenom = metadata.base_denom;
-
-      if (type === 'factory' && !symbol) {
-        // Handle standard factory/creator/subdenom or legacy formats
-        const parts = cleanDenom.replace(/\s/g, '').split(/[\/\.]/);
-        symbol = parts.pop();
-        baseDenom = symbol;
-      } else if (type === 'ibc' && !symbol) {
-        // Prefer real base denom from path denoms like transfer/channel-*/uzig.
-        if (cleanDenom.startsWith('transfer/')) {
-          const parts = cleanDenom.split('/');
-          const leaf = parts[parts.length - 1];
-          symbol = leaf || cleanDenom;
-          baseDenom = leaf || cleanDenom;
-        } else if (cleanDenom.startsWith('ibc/')) {
-          const hash = cleanDenom.slice(4);
-          symbol = hash ? `ibc:${hash.slice(0, 8)}` : cleanDenom;
-          baseDenom = cleanDenom;
-        } else {
-          symbol = cleanDenom.slice(0, 24);
-          baseDenom = cleanDenom;
-        }
-      } else if (type === 'native' && !symbol) {
-        symbol = cleanDenom.startsWith('u') ? cleanDenom.slice(1).toUpperCase() : cleanDenom.toUpperCase();
-        baseDenom = cleanDenom;
-      }
-
-      tokenRegistryRows.push({
-        denom: cleanDenom,
-        type,
-        base_denom: baseDenom || symbol,
-        symbol: symbol || cleanDenom,
-        decimals: metadata.decimals || 6,
-        creator: metadata.creator || null,
-        first_seen_height: height,
-        first_seen_tx: tx_h || null,
-        metadata: metadata.full_meta || {},
-      });
     };
 
     // Initial core registration (no TX hash for genesis/native)
@@ -974,6 +1005,7 @@ export class PostgresSink implements Sink {
           const amounts = Array.isArray(m.amount) ? m.amount : [m.amount];
           for (const coin of amounts) {
             if (!coin) continue;
+            registerToken(coin.denom, undefined, {}, tx_hash);
             govDepositsRows.push({
               proposal_id: m.proposal_id,
               depositor: m.depositor || m.signer || firstSigner,
@@ -1030,6 +1062,7 @@ export class PostgresSink implements Sink {
               const deposits = Array.isArray(initialDeposit) ? initialDeposit : [initialDeposit];
               for (const coin of deposits) {
                 if (!coin) continue;
+                registerToken(coin.denom, undefined, {}, tx_hash);
                 govDepositsRows.push({
                   proposal_id: pid,
                   depositor: submitter,
@@ -1353,6 +1386,7 @@ export class PostgresSink implements Sink {
           const denom = normalizeNonEmptyString(m.token?.denom || m.amount?.denom || m.denom);
           const amount = normalizeUintAmount(m.token?.amount || m.amount?.amount || m.amount);
           if (denom && amount && tx_hash) {
+            registerToken(denom, undefined, {}, tx_hash);
             factorySupplyEventsRows.push({
               height,
               tx_hash,
@@ -1370,6 +1404,7 @@ export class PostgresSink implements Sink {
 
         if (type.endsWith('.MsgSetDenomMetadata') && isSuccess) {
           if (m.metadata?.base) {
+            registerToken(m.metadata.base, 'factory', { full_meta: m.metadata }, tx_hash);
             factorySupplyEventsRows.push({
               height,
               tx_hash,
@@ -1447,6 +1482,7 @@ export class PostgresSink implements Sink {
               decimal_difference: normalizedWrapper.decimal_difference,
               updated_at_height: height
             });
+            registerToken(normalizedWrapper.denom, undefined, {}, tx_hash, 'wrapper_settings');
           }
         }
 
@@ -1498,6 +1534,9 @@ export class PostgresSink implements Sink {
               block_height: height,
               tx_hash: tx_hash
             });
+            registerToken(m.base?.denom, undefined, {}, tx_hash);
+            registerToken(m.quote?.denom, undefined, {}, tx_hash);
+            registerToken(lpToken, undefined, {}, tx_hash);
           }
         }
 
@@ -1552,6 +1591,9 @@ export class PostgresSink implements Sink {
               shares_minted_burned: m.lptoken?.amount || evLpAmount || null,
               block_height: height
             });
+            registerToken(m.base?.denom, undefined, {}, tx_hash);
+            registerToken(m.quote?.denom, undefined, {}, tx_hash);
+            registerToken(m.lptoken?.denom || poolId, undefined, {}, tx_hash);
           }
         }
 
@@ -1620,6 +1662,7 @@ export class PostgresSink implements Sink {
         if (isSuccess && (type === '/cosmos.staking.v1beta1.MsgDelegate' || type === '/cosmos.staking.v1beta1.MsgUndelegate')) {
           const coin = m.amount;
           const isUndelegate = type.includes('Undelegate');
+          registerToken(coin?.denom, undefined, {}, tx_hash);
 
           // ✅ FIX: Extract completion_time from unbond event for undelegations
           let completionTime: Date | null = null;
@@ -1643,6 +1686,7 @@ export class PostgresSink implements Sink {
         }
         if (type === '/cosmos.staking.v1beta1.MsgBeginRedelegate' && isSuccess) {
           const coin = m.amount;
+          registerToken(coin?.denom, undefined, {}, tx_hash);
 
           // ✅ FIX: Extract completion_time from redelegate event
           let completionTime: Date | null = null;
@@ -1679,6 +1723,7 @@ export class PostgresSink implements Sink {
             m.delegator_address; // Fallback to delegator (default behavior)
 
           for (const coin of coins) {
+            registerToken(coin.denom, undefined, {}, tx_hash);
             stakeDistrRows.push({
               height, tx_hash, msg_index: i,
               event_type: 'withdraw_reward',
@@ -2022,11 +2067,9 @@ export class PostgresSink implements Sink {
                 const cleanDenom = String(denom).trim();
                 const lowerDenom = cleanDenom.toLowerCase();
                 const isFactory = lowerDenom.startsWith('factory/') || lowerDenom.startsWith('coin.zig');
-                const isIbc = lowerDenom.startsWith('ibc/') || lowerDenom.startsWith('transfer/');
                 const isCw20 = cleanDenom.startsWith('zig1') && !cleanDenom.includes('/');
-                const type = isFactory ? 'factory' : (isIbc ? 'ibc' : (isCw20 ? 'cw20' : 'native'));
 
-                registerToken(cleanDenom, type as any, {
+                registerToken(cleanDenom, undefined, {
                   creator: isCw20 ? cleanDenom : (isFactory ? (cleanDenom.includes('/') ? cleanDenom.split('/')[1] : cleanDenom.split('.')[1]) : null)
                 }, tx_hash);
               }
@@ -2069,6 +2112,7 @@ export class PostgresSink implements Sink {
                 droppedTransferRows += 1;
                 continue;
               }
+              registerToken(coin.denom, undefined, {}, tx_hash);
               transfersRows.push({
                 tx_hash, msg_index, event_index: ei, from_addr: sender, to_addr: recipient,
                 denom: coin.denom, amount: coin.amount, height
@@ -2356,6 +2400,8 @@ export class PostgresSink implements Sink {
               // Prepend ibc/ to hash if not already present
               const ibcHash = hash.startsWith('ibc/') ? hash : `ibc/${hash}`;
               ibcDenomsRows.push({ hash: ibcHash, full_path: fullPath, base_denom: baseDenom });
+              registerToken(ibcHash, 'ibc', { base_denom: baseDenom, symbol: baseDenom }, tx_hash);
+              registerToken(fullPath, 'ibc', { base_denom: baseDenom, symbol: baseDenom }, tx_hash);
             }
           }
 
@@ -2469,6 +2515,7 @@ export class PostgresSink implements Sink {
       log.warn(`[transfer] dropped ${droppedTransferRows} malformed transfer row(s) at height=${height}`);
     }
 
+    const tokenRegistryRows = Array.from(tokenRegistryByDenom.values());
 
     return {
       blockRow, txRows, msgRows, evRows, attrRows,

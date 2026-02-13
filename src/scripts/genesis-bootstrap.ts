@@ -4,6 +4,8 @@ import { getPgPool, closePgPool, createPgPool } from '../db/pg.js';
 import { getLogger } from '../utils/logger.js';
 import { getConfig } from '../config.js';
 import { insertWrapperSettings } from '../sink/pg/inserters/zigchain.js';
+import { insertTokenRegistry } from '../sink/pg/inserters/tokens.js';
+import { buildTokenRegistryRow } from '../utils/token-registry.js';
 
 const log = getLogger('scripts/genesis-bootstrap');
 
@@ -81,6 +83,7 @@ export async function bootstrapGenesis(genesisPath: string) {
         await client.query('BEGIN');
 
         // 0. Tokenwrapper settings baseline from genesis
+        let wrapperDenomForRegistry: string | null = null;
         if (tokenWrapperState && typeof tokenWrapperState === 'object') {
             const wrapperRow = {
                 denom: normalizeNonEmptyString(tokenWrapperState.denom),
@@ -95,11 +98,53 @@ export async function bootstrapGenesis(genesisPath: string) {
             };
 
             if (wrapperRow.denom) {
+                wrapperDenomForRegistry = wrapperRow.denom;
                 await insertWrapperSettings(client, [wrapperRow]);
                 log.info(`[genesis] seeded tokenwrapper settings for denom=${wrapperRow.denom}`);
             } else {
                 log.warn('[genesis] tokenwrapper state present but denom missing; skipping wrapper_settings seed');
             }
+        }
+
+        // 0b. Seed tokens.registry baseline from genesis denom sources
+        const registryDenoms = new Set<string>();
+        for (const supply of totalSupply) {
+            const denom = normalizeNonEmptyString(supply?.denom);
+            if (denom) registryDenoms.add(denom);
+        }
+        for (const bal of bankBalances) {
+            for (const coin of bal?.coins ?? []) {
+                const denom = normalizeNonEmptyString(coin?.denom);
+                if (denom) registryDenoms.add(denom);
+            }
+        }
+        if (wrapperDenomForRegistry) {
+            registryDenoms.add(wrapperDenomForRegistry);
+        }
+
+        const registryRows = Array.from(registryDenoms)
+            .map((denom) => buildTokenRegistryRow({
+                denom,
+                height: 0,
+                txHash: 'genesis_bootstrap',
+            }))
+            .filter((row): row is NonNullable<typeof row> => !!row);
+
+        if (wrapperDenomForRegistry) {
+            const wrapperRegistryRow = buildTokenRegistryRow({
+                denom: wrapperDenomForRegistry,
+                height: 0,
+                txHash: 'genesis_bootstrap',
+                source: 'wrapper_settings',
+            });
+            if (wrapperRegistryRow) {
+                registryRows.push(wrapperRegistryRow);
+            }
+        }
+
+        if (registryRows.length > 0) {
+            await insertTokenRegistry(client, registryRows);
+            log.info(`[genesis] seeded ${registryRows.length} token registry rows`);
         }
 
         // 1. Bank Balances (liquid balances)

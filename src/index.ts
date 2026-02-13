@@ -11,9 +11,11 @@ import { closePgPool, createPgPool, getPgPool } from './db/pg.ts';
 import { getProgress } from './db/progress.ts';
 import { upsertValidators } from './sink/pg/flushers/validators.ts';
 import { insertWrapperSettings } from './sink/pg/inserters/zigchain.ts';
+import { insertTokenRegistry } from './sink/pg/inserters/tokens.ts';
 import { deriveConsensusAddress } from './utils/crypto.ts';
 import { loadProtoRoot, decodeAnyWithRoot } from './decode/dynamicProto.ts';
 import { base64ToBytes } from './utils/bytes.ts';
+import { buildTokenRegistryRow } from './utils/token-registry.js';
 import path from 'node:path';
 import { getLogger } from './utils/logger.ts';
 import { syncRange } from './runner/syncRange.ts';
@@ -381,6 +383,15 @@ async function main() {
           } else {
             await client.query('BEGIN');
             await insertWrapperSettings(client, [row]);
+            const registryRow = buildTokenRegistryRow({
+              denom: row.denom,
+              height: Number(startFrom ?? 0),
+              txHash: null,
+              source: 'wrapper_settings',
+            });
+            if (registryRow) {
+              await insertTokenRegistry(client, [registryRow]);
+            }
             await client.query('COMMIT');
             log.info(`[start] synced tokenwrapper settings for denom=${row.denom}`);
           }
