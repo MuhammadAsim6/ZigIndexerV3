@@ -30,7 +30,7 @@ mkdir -p /tmp/cosmos-indexer-reset
 if [ "${RESUME:-true}" = "true" ]; then
   echo "[entrypoint] RESUME=true: attempting to detect existing progress in DB"
   # Try to query for progress table
-  if psql -h "$host" -p "$port" -U "$PG_USER" -d "$PG_DB" -c "SELECT 1 FROM pg_tables WHERE tablename='indexer_progress' LIMIT 1;" >/dev/null 2>&1; then
+  if psql -h "$host" -p "$port" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname='core' AND tablename='indexer_progress');" | grep -q '^t$'; then
     echo "[entrypoint] progress table exists — container will start and resume indexing"
   else
     echo "[entrypoint] progress table not found — this looks like a fresh DB. Initial schema init will be performed by Postgres init scripts."

@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS zigchain.wrapper_events (
 ) PARTITION BY RANGE (height);
 
 CREATE TABLE IF NOT EXISTS zigchain.wrapper_events_p0 PARTITION OF zigchain.wrapper_events 
-    FOR VALUES FROM (0) TO (1000000);
+    FOR VALUES FROM (0) TO (500000);
 
 CREATE INDEX IF NOT EXISTS idx_wrapper_events_sender ON zigchain.wrapper_events (sender);
 CREATE INDEX IF NOT EXISTS idx_wrapper_events_denom ON zigchain.wrapper_events (denom);

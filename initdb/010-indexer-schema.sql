@@ -39,7 +39,7 @@ CREATE TABLE core.blocks (
     evidence_count INT DEFAULT 0,
     app_hash     TEXT NULL
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS core.blocks_p0 PARTITION OF core.blocks FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS core.blocks_p0 PARTITION OF core.blocks FOR VALUES FROM (0) TO (500000);
 
 CREATE INDEX IF NOT EXISTS idx_blocks_time ON core.blocks USING BTREE (time);
 CREATE INDEX IF NOT EXISTS idx_blocks_proposer ON core.blocks (proposer_address);
@@ -67,14 +67,14 @@ CREATE TABLE core.validator_set (
     proposer_priority BIGINT NULL,
     PRIMARY KEY (height, operator_address)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS core.validator_set_p0 PARTITION OF core.validator_set FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS core.validator_set_p0 PARTITION OF core.validator_set FOR VALUES FROM (0) TO (500000);
 
 CREATE TABLE core.validator_missed_blocks (
     operator_address TEXT   NOT NULL,
     height           BIGINT NOT NULL,
     PRIMARY KEY (operator_address, height)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS core.validator_missed_blocks_p0 PARTITION OF core.validator_missed_blocks FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS core.validator_missed_blocks_p0 PARTITION OF core.validator_missed_blocks FOR VALUES FROM (0) TO (500000);
 
 -- ============================================================================
 -- 2) TRANSACTIONS / MESSAGES / EVENTS
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS core.transactions (
     time       TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (height, tx_hash)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS core.transactions_p0 PARTITION OF core.transactions FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS core.transactions_p0 PARTITION OF core.transactions FOR VALUES FROM (0) TO (500000);
 CREATE INDEX IF NOT EXISTS idx_txs_hash ON core.transactions (tx_hash);
 
 CREATE TABLE IF NOT EXISTS core.messages (
@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS core.messages (
     signer    TEXT   NULL,
     PRIMARY KEY (height, tx_hash, msg_index)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS core.messages_p0 PARTITION OF core.messages FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS core.messages_p0 PARTITION OF core.messages FOR VALUES FROM (0) TO (500000);
 
 CREATE TABLE core.events (
     tx_hash     TEXT  NOT NULL,
@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS bank.transfers (
     height    BIGINT         NOT NULL,
     PRIMARY KEY (height, tx_hash, msg_index, from_addr, to_addr, denom)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS bank.transfers_p0 PARTITION OF bank.transfers FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS bank.transfers_p0 PARTITION OF bank.transfers FOR VALUES FROM (0) TO (500000);
 
 CREATE TABLE bank.balance_deltas (
     height  BIGINT         NOT NULL,
@@ -169,7 +169,7 @@ CREATE TABLE bank.balance_deltas (
 ) PARTITION BY RANGE (height);
 
 -- ✅ FIXED: Added missing initial partition
-CREATE TABLE IF NOT EXISTS bank.balance_deltas_p0 PARTITION OF bank.balance_deltas FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS bank.balance_deltas_p0 PARTITION OF bank.balance_deltas FOR VALUES FROM (0) TO (500000);
 
 -- ✅ FIXED: Added missing progress tracking table
 CREATE TABLE IF NOT EXISTS core.indexer_progress (
@@ -427,7 +427,7 @@ CREATE TABLE IF NOT EXISTS wasm.executions (
     height    BIGINT  NOT NULL,
     PRIMARY KEY (height, tx_hash, msg_index)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS wasm.executions_p0 PARTITION OF wasm.executions FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS wasm.executions_p0 PARTITION OF wasm.executions FOR VALUES FROM (0) TO (500000);
 
 -- 👇👇 MISSING TABLE ADDED 👇👇
 CREATE TABLE IF NOT EXISTS wasm.events (
@@ -440,7 +440,7 @@ CREATE TABLE IF NOT EXISTS wasm.events (
     attributes  JSONB NOT NULL,
     PRIMARY KEY (height, tx_hash, msg_index, event_index)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS wasm.events_p0 PARTITION OF wasm.events FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS wasm.events_p0 PARTITION OF wasm.events FOR VALUES FROM (0) TO (500000);
 
 -- ✅ REMOVED: Redundant wasm.dex_swaps (Moved to specialized analytics files)
 
@@ -457,7 +457,7 @@ CREATE TABLE IF NOT EXISTS wasm.event_attrs (
     value       TEXT NULL,
     PRIMARY KEY (height, tx_hash, msg_index, event_index, attr_index)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS wasm.event_attrs_p0 PARTITION OF wasm.event_attrs FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS wasm.event_attrs_p0 PARTITION OF wasm.event_attrs FOR VALUES FROM (0) TO (500000);
 
 -- Track admin changes for security auditing
 CREATE TABLE IF NOT EXISTS wasm.admin_changes (
@@ -470,7 +470,7 @@ CREATE TABLE IF NOT EXISTS wasm.admin_changes (
     action      TEXT NOT NULL,  -- 'update' or 'clear'
     PRIMARY KEY (height, tx_hash, msg_index)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS wasm.admin_changes_p0 PARTITION OF wasm.admin_changes FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS wasm.admin_changes_p0 PARTITION OF wasm.admin_changes FOR VALUES FROM (0) TO (500000);
 
 
 -- ============================================================================
@@ -485,7 +485,7 @@ CREATE TABLE authz_feegrant.authz_grants (
     revoked      BOOLEAN     NOT NULL DEFAULT FALSE,
     PRIMARY KEY (granter, grantee, msg_type_url, height)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS authz_feegrant.authz_grants_p0 PARTITION OF authz_feegrant.authz_grants FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS authz_feegrant.authz_grants_p0 PARTITION OF authz_feegrant.authz_grants FOR VALUES FROM (0) TO (500000);
 
 CREATE TABLE authz_feegrant.fee_grants (
     granter    TEXT        NOT NULL,
@@ -496,7 +496,7 @@ CREATE TABLE authz_feegrant.fee_grants (
     revoked    BOOLEAN     NOT NULL DEFAULT FALSE,
     PRIMARY KEY (granter, grantee, height)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS authz_feegrant.fee_grants_p0 PARTITION OF authz_feegrant.fee_grants FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS authz_feegrant.fee_grants_p0 PARTITION OF authz_feegrant.fee_grants FOR VALUES FROM (0) TO (500000);
 
 CREATE INDEX IF NOT EXISTS idx_authz_grants_grantee ON authz_feegrant.authz_grants (grantee, height DESC);
 CREATE INDEX IF NOT EXISTS idx_fee_grants_grantee ON authz_feegrant.fee_grants (grantee, height DESC);
@@ -513,7 +513,7 @@ CREATE TABLE IF NOT EXISTS tokens.cw20_transfers (
     tx_hash   TEXT           NOT NULL,
     PRIMARY KEY (height, tx_hash, contract, from_addr, to_addr)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS tokens.cw20_transfers_p0 PARTITION OF tokens.cw20_transfers FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS tokens.cw20_transfers_p0 PARTITION OF tokens.cw20_transfers FOR VALUES FROM (0) TO (500000);
 
 CREATE INDEX IF NOT EXISTS idx_cw20_from ON tokens.cw20_transfers (contract, from_addr, height DESC);
 CREATE INDEX IF NOT EXISTS idx_cw20_to ON tokens.cw20_transfers (contract, to_addr, height DESC);
@@ -540,7 +540,7 @@ CREATE TABLE core.network_params (
     new_value JSONB       NOT NULL,
     PRIMARY KEY (height, module, param_key)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS core.network_params_p0 PARTITION OF core.network_params FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS core.network_params_p0 PARTITION OF core.network_params FOR VALUES FROM (0) TO (500000);
 
 -- ============================================================================
 -- 10) QUERY-PATTERN INDEXES (For 5.4M+ scale)
@@ -617,7 +617,7 @@ CREATE TABLE IF NOT EXISTS zigchain.wrapper_events (
     metadata  JSONB NULL,
     PRIMARY KEY (height, tx_hash, msg_index, event_index, action)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS zigchain.wrapper_events_p0 PARTITION OF zigchain.wrapper_events FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS zigchain.wrapper_events_p0 PARTITION OF zigchain.wrapper_events FOR VALUES FROM (0) TO (500000);
 
 -- Tokens Factory Supply Events
 CREATE TABLE IF NOT EXISTS tokens.factory_supply_events (
@@ -642,4 +642,4 @@ CREATE TABLE IF NOT EXISTS tokens.factory_supply_events (
         CHECK (length(trim(denom)) > 0),
     PRIMARY KEY (height, tx_hash, msg_index, event_index, denom, action)
 ) PARTITION BY RANGE (height);
-CREATE TABLE IF NOT EXISTS tokens.factory_supply_events_p0 PARTITION OF tokens.factory_supply_events FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS tokens.factory_supply_events_p0 PARTITION OF tokens.factory_supply_events FOR VALUES FROM (0) TO (500000);

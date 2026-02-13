@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS wasm.dex_swaps (
 ) PARTITION BY RANGE (block_height);
 
 CREATE TABLE IF NOT EXISTS wasm.dex_swaps_p0 PARTITION OF wasm.dex_swaps 
-    FOR VALUES FROM (0) TO (1000000);
+    FOR VALUES FROM (0) TO (500000);
 -- Additional partitions created automatically by util.ensure_partition_for_height()
 
 -- Performance Indexes

@@ -2541,6 +2541,7 @@ export class PostgresSink implements Sink {
 
     const pool = getPgPool();
     const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
       let maxH: number | null = null;
@@ -2548,6 +2549,7 @@ export class PostgresSink implements Sink {
         // If we are flushing but have no blocks (e.g. metadata only),
         // skip partition check or use a fallback if absolutely needed.
         await client.query('BEGIN');
+        transactionStarted = true;
       } else {
         const heights = snapshot.blocks.map(r => r.height);
         const minH = Math.min(...heights);
@@ -2555,6 +2557,7 @@ export class PostgresSink implements Sink {
 
         await ensureCorePartitions(client, minH, maxH);
         await client.query('BEGIN');
+        transactionStarted = true;
       }
 
       // 1. Standard
@@ -2710,9 +2713,15 @@ export class PostgresSink implements Sink {
         await upsertProgress(client, this.cfg.pg?.progressId ?? 'default', maxH);
       }
       await client.query('COMMIT');
+      transactionStarted = false;
     } catch (e) {
       log.error(`[flush-error] rollback initiated: ${String(e)}`);
-      await client.query('ROLLBACK');
+      if (transactionStarted) {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+      } else {
+        log.warn('[flush-error] rollback skipped: transaction was not started');
+      }
 
       // ❌ RESTORE BUFFERS ON FAILURE
       // We prepend the snapshot data to the current buffers so they are included in the next retry.

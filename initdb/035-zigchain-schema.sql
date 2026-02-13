@@ -68,8 +68,8 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
     PRIMARY KEY (tx_hash, msg_index, event_index, block_height)
 ) PARTITION BY RANGE (block_height);
 
--- Auto-Partition: 0 to 1M Blocks
-CREATE TABLE IF NOT EXISTS zigchain.dex_swaps_p0 PARTITION OF zigchain.dex_swaps FOR VALUES FROM (0) TO (1000000);
+-- Auto-Partition: 0 to 500k Blocks
+CREATE TABLE IF NOT EXISTS zigchain.dex_swaps_p0 PARTITION OF zigchain.dex_swaps FOR VALUES FROM (0) TO (500000);
 
 CREATE INDEX IF NOT EXISTS idx_dex_swaps_pool ON zigchain.dex_swaps(pool_id);
 CREATE INDEX IF NOT EXISTS idx_dex_swaps_sender ON zigchain.dex_swaps(sender_address);
@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity (
     PRIMARY KEY (tx_hash, msg_index, block_height)
 ) PARTITION BY RANGE (block_height);
 
-CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity_p0 PARTITION OF zigchain.dex_liquidity FOR VALUES FROM (0) TO (1000000);
+CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity_p0 PARTITION OF zigchain.dex_liquidity FOR VALUES FROM (0) TO (500000);
 
 CREATE INDEX IF NOT EXISTS idx_dex_liq_pool ON zigchain.dex_liquidity(pool_id);
 CREATE INDEX IF NOT EXISTS idx_dex_liq_sender ON zigchain.dex_liquidity(sender_address);

@@ -1,12 +1,12 @@
 -- 040-bootstrap-partitions.sql
--- FIXED: Elastic Setup. Only creates the INITIAL partition (0-1M).
+-- FIXED: Elastic Setup. Only creates the INITIAL partition (0-500k for 500k-range tables).
 -- Future partitions will be created automatically by the Indexer App.
 
 DO $$
 DECLARE
     r RECORD;
     h BIGINT;
-    -- ✅ CHANGED: 10M -> 1M. 
+    -- ✅ CHANGED: 10M -> 500k.
     -- Sirf pehla bucket banega. Baaki "Just-in-Time" banenge.
     v_max_bootstrap_height BIGINT := 500000; 
     v_range_size BIGINT;
@@ -18,7 +18,7 @@ BEGIN
         
         v_range_size := r.range_size;
         
-        -- Loop: Sirf 0 se Start hoga (0-1M)
+        -- Loop: Sirf 0 se Start hoga (0-500k for 500k-range tables)
         FOR h IN 0..(v_max_bootstrap_height / v_range_size) - 1 LOOP 
             PERFORM util.ensure_partition_for_height(r.schema_name, r.table_name, h * v_range_size);
         END LOOP;
