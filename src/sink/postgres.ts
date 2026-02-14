@@ -654,6 +654,7 @@ export class PostgresSink implements Sink {
     const denoms = Array.from(rowsByDenom.keys());
     if (denoms.length === 0) return;
 
+    // 1. Determine which denoms need fetching (not in cache)
     const pendingDenoms = denoms.filter((denom) => !this.tokenRegistryMetadataCache.has(denom));
     if (pendingDenoms.length > 0) {
       const concurrency = Math.min(8, pendingDenoms.length);
@@ -668,6 +669,31 @@ export class PostgresSink implements Sink {
       await Promise.all(workers);
     }
 
+    // 2. Share metadata between common aliases (Factory <-> Coin wrapper)
+    for (const denom of denoms) {
+      const meta = this.tokenRegistryMetadataCache.get(denom);
+      if (!meta) {
+        // Try to find an alias that DOES have metadata
+        const lower = denom.toLowerCase();
+        let alias: string | null = null;
+        if (lower.startsWith('factory/')) {
+          const p = denom.split('/');
+          if (p.length >= 3) alias = `coin.${p[1]}.${p.slice(2).join('/')}`;
+        } else if (lower.startsWith('coin.')) {
+          const p = denom.split('.');
+          if (p.length >= 3) alias = `factory/${p[1]}/${p.slice(2).join('.')}`;
+        }
+
+        if (alias && this.tokenRegistryMetadataCache.has(alias)) {
+          const aliasMeta = this.tokenRegistryMetadataCache.get(alias);
+          if (aliasMeta) {
+            this.tokenRegistryMetadataCache.set(denom, aliasMeta);
+          }
+        }
+      }
+    }
+
+    // 3. Apply metadata to the rows
     let enrichedRowCount = 0;
     for (const [denom, denomRows] of rowsByDenom.entries()) {
       const metadata = this.tokenRegistryMetadataCache.get(denom) ?? null;
@@ -780,11 +806,11 @@ export class PostgresSink implements Sink {
     ): void {
       if (denom === null || denom === undefined) return;
       if (typeof denom !== 'string' && typeof denom !== 'number' && typeof denom !== 'bigint') return;
-      const rawDenom = String(denom);
-      if (typeof denom === 'string' && rawDenom.trim().length === 0) {
-        log.warn(`[token-registry] skipped empty/invalid denom at height=${height} tx=${tx_h ?? 'unknown'}`);
+      const rawDenom = String(denom).trim();
+      if (rawDenom.length === 0) {
         return;
       }
+
       const row = buildTokenRegistryRow({
         denom: rawDenom,
         type: type ?? inferTokenType(rawDenom),
@@ -793,54 +819,80 @@ export class PostgresSink implements Sink {
         txHash: tx_h ?? null,
         metadata,
       });
-      if (!row) {
-        log.warn(`[token-registry] skipped empty/invalid denom at height=${height} tx=${tx_h ?? 'unknown'}`);
-        return;
+
+      if (!row) return;
+
+      const upsert = (r: any) => {
+        const existing = tokenRegistryByDenom.get(r.denom);
+        if (!existing) {
+          tokenRegistryByDenom.set(r.denom, r);
+          return;
+        }
+
+        const hasExistingHeight = Number.isFinite(existing.first_seen_height);
+        const hasIncomingHeight = Number.isFinite(r.first_seen_height);
+        let firstSeenHeight = existing.first_seen_height;
+        let firstSeenTx = existing.first_seen_tx ?? r.first_seen_tx ?? null;
+
+        if (!hasExistingHeight && hasIncomingHeight) {
+          firstSeenHeight = r.first_seen_height;
+          firstSeenTx = r.first_seen_tx ?? existing.first_seen_tx ?? null;
+        } else if (
+          hasExistingHeight &&
+          hasIncomingHeight &&
+          Number(r.first_seen_height) < Number(existing.first_seen_height)
+        ) {
+          firstSeenHeight = r.first_seen_height;
+          firstSeenTx = r.first_seen_tx ?? existing.first_seen_tx ?? null;
+        } else if (
+          hasExistingHeight &&
+          hasIncomingHeight &&
+          Number(r.first_seen_height) === Number(existing.first_seen_height)
+        ) {
+          firstSeenTx = existing.first_seen_tx ?? r.first_seen_tx ?? null;
+        }
+
+        tokenRegistryByDenom.set(r.denom, {
+          ...existing,
+          type: existing.type === 'native' && r.type !== 'native' ? r.type : existing.type,
+          base_denom: r.base_denom ?? existing.base_denom,
+          symbol: r.symbol ?? existing.symbol,
+          decimals: r.decimals ?? existing.decimals,
+          creator: r.creator ?? existing.creator,
+          first_seen_height: firstSeenHeight,
+          first_seen_tx: firstSeenTx,
+          metadata:
+            (existing.metadata || r.metadata)
+              ? { ...(existing.metadata || {}), ...(r.metadata || {}) }
+              : null,
+        });
+      };
+
+      upsert(row);
+
+      // ✅ ENHANCEMENT: Cross-Register Factory/Wrapper Denoms
+      // If we see a factory/ denom, check if it's been wrapped.
+      // If we see a coin.* denom, register the underlying factory/ denom.
+      const lowerDenom = rawDenom.toLowerCase();
+      if (row.type === 'factory') {
+        if (lowerDenom.startsWith('factory/')) {
+          const parts = rawDenom.split('/');
+          if (parts.length >= 3) {
+            const creator = parts[1];
+            const subDenom = parts.slice(2).join('/');
+            const wrapperDenom = `coin.${creator}.${subDenom}`;
+            upsert({ ...row, denom: wrapperDenom, metadata: { ...row.metadata, base: row.denom } });
+          }
+        } else if (lowerDenom.startsWith('coin.')) {
+          const parts = rawDenom.split('.');
+          if (parts.length >= 3) {
+            const creator = parts[1];
+            const subDenom = parts.slice(2).join('.');
+            const factoryDenom = `factory/${creator}/${subDenom}`;
+            upsert({ ...row, denom: factoryDenom, metadata: { ...row.metadata, base: row.denom } });
+          }
+        }
       }
-
-      const existing = tokenRegistryByDenom.get(row.denom);
-      if (!existing) {
-        tokenRegistryByDenom.set(row.denom, row);
-        return;
-      }
-
-      const hasExistingHeight = Number.isFinite(existing.first_seen_height);
-      const hasIncomingHeight = Number.isFinite(row.first_seen_height);
-      let firstSeenHeight = existing.first_seen_height;
-      let firstSeenTx = existing.first_seen_tx ?? row.first_seen_tx ?? null;
-
-      if (!hasExistingHeight && hasIncomingHeight) {
-        firstSeenHeight = row.first_seen_height;
-        firstSeenTx = row.first_seen_tx ?? existing.first_seen_tx ?? null;
-      } else if (
-        hasExistingHeight &&
-        hasIncomingHeight &&
-        Number(row.first_seen_height) < Number(existing.first_seen_height)
-      ) {
-        firstSeenHeight = row.first_seen_height;
-        firstSeenTx = row.first_seen_tx ?? existing.first_seen_tx ?? null;
-      } else if (
-        hasExistingHeight &&
-        hasIncomingHeight &&
-        Number(row.first_seen_height) === Number(existing.first_seen_height)
-      ) {
-        firstSeenTx = existing.first_seen_tx ?? row.first_seen_tx ?? null;
-      }
-
-      tokenRegistryByDenom.set(row.denom, {
-        ...existing,
-        type: existing.type === 'native' && row.type !== 'native' ? row.type : existing.type,
-        base_denom: row.base_denom ?? existing.base_denom,
-        symbol: row.symbol ?? existing.symbol,
-        decimals: row.decimals ?? existing.decimals,
-        creator: row.creator ?? existing.creator,
-        first_seen_height: firstSeenHeight,
-        first_seen_tx: firstSeenTx,
-        metadata:
-          (existing.metadata || row.metadata)
-            ? { ...(existing.metadata || {}), ...(row.metadata || {}) }
-            : null,
-      });
     }
 
     // 🟢 BANK BALANCE DELTAS (Helper)

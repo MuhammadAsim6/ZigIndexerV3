@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS tokens.registry (
     type              TEXT NOT NULL,     -- 'native', 'factory', 'cw20', 'ibc'
     base_denom        TEXT,              -- Human readable symbol (uzig, stzig, etc.)
     symbol            TEXT,              -- Display symbol
-    decimals          INT DEFAULT 6,     -- Precision
+    decimals          INT,               -- Precision (NULL if unknown)
     creator           TEXT,              -- Contract address or wallet
     first_seen_height BIGINT,
     first_seen_tx     TEXT,

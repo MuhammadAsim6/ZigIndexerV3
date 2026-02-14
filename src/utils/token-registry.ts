@@ -79,19 +79,21 @@ export function deriveTokenMeta(denom: string, type: TokenRegistryType): {
   creator: string | null;
 } {
   const clean = denom.trim();
+  const lower = clean.toLowerCase();
 
   if (type === 'factory') {
-    if (clean.startsWith('factory/')) {
+    if (lower.startsWith('factory/')) {
       const parts = clean.split('/');
       const creator = normalizeNonEmptyString(parts[1]);
       const subDenom = normalizeNonEmptyString(parts.slice(2).join('/'));
       return { base_denom: subDenom, symbol: subDenom, creator };
     }
 
-    if (clean.startsWith('coin.zig')) {
+    if (lower.startsWith('coin.zig')) {
       const parts = clean.split('.');
       const creator = normalizeNonEmptyString(parts[1]);
       const subDenom = normalizeNonEmptyString(parts.slice(2).join('.'));
+      // For coin.zig* denoms, we often want the underlying sub-denom as symbol
       return { base_denom: subDenom, symbol: subDenom, creator };
     }
 
@@ -100,11 +102,11 @@ export function deriveTokenMeta(denom: string, type: TokenRegistryType): {
   }
 
   if (type === 'ibc') {
-    if (clean.startsWith('transfer/')) {
+    if (lower.startsWith('transfer/')) {
       const leaf = normalizeNonEmptyString(clean.split('/').pop() ?? '');
       return { base_denom: leaf ?? clean, symbol: leaf ?? clean, creator: null };
     }
-    if (clean.startsWith('ibc/')) {
+    if (lower.startsWith('ibc/')) {
       const hash = clean.slice(4);
       const symbol = hash ? `ibc:${hash.slice(0, 8)}` : clean;
       return { base_denom: clean, symbol, creator: null };
@@ -114,6 +116,11 @@ export function deriveTokenMeta(denom: string, type: TokenRegistryType): {
   }
 
   if (type === 'native') {
+    // Check for DEX pool tokens (e.g., zp1, zp2)
+    if (/^zp\d+$/i.test(clean)) {
+      return { base_denom: clean, symbol: clean.toUpperCase(), creator: 'dex_module' };
+    }
+
     // Strip micro-prefix only for pure micro denoms (e.g., uzig -> ZIG).
     const symbol = /^u[a-z0-9]+$/i.test(clean) && clean.length > 1
       ? clean.slice(1).toUpperCase()
@@ -129,7 +136,7 @@ export function buildTokenRegistryRow(input: TokenRegistryRowInput): {
   type: TokenRegistryType;
   base_denom: string;
   symbol: string;
-  decimals: number;
+  decimals: number | null;
   creator: string | null;
   first_seen_height: number | null;
   first_seen_tx: string | null;
@@ -149,7 +156,21 @@ export function buildTokenRegistryRow(input: TokenRegistryRowInput): {
   const symbol = normalizeNonEmptyString(metadata.symbol) ?? derived.symbol ?? cleanDenom;
   const baseDenom = normalizeNonEmptyString(metadata.base_denom) ?? derived.base_denom ?? symbol;
   const creator = normalizeNonEmptyString(metadata.creator) ?? derived.creator ?? null;
-  const decimals = normalizeDecimals(metadata.decimals) ?? deriveDecimalsFromFullMeta(metadata.full_meta) ?? 6;
+
+  // ⚠️ CRITICAL CHANGE: Default to null instead of 6 if unknown.
+  // We default to 6 for 'native' tokens that:
+  // 1. Start with 'u' (standard micro denoms).
+  // 2. Are DEX pool tokens (zp...).
+  let fallbackDecimals: number | null = null;
+  const lowerDenom = cleanDenom.toLowerCase();
+  if (type === 'native') {
+    if (/^u[a-z]/.test(lowerDenom) || /^zp\d+$/.test(lowerDenom)) {
+      fallbackDecimals = 6;
+    }
+  }
+
+  const decimals = normalizeDecimals(metadata.decimals) ?? deriveDecimalsFromFullMeta(metadata.full_meta) ?? fallbackDecimals;
+
   const firstSeenHeight = normalizeHeight(input.height);
   const firstSeenTx = normalizeNonEmptyString(input.txHash ?? null);
 
