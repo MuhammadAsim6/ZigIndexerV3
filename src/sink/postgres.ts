@@ -79,6 +79,9 @@ import { flushTokenRegistry } from './pg/flushers/tokens.js'; // ✅ ADDED
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
 import { buildTokenRegistryRow, inferTokenType, normalizeIbcDenom } from '../utils/token-registry.js';
 import type { TokenRegistrySource, TokenRegistryType } from '../utils/token-registry.js';
+import { deriveConsensusAddress } from '../utils/crypto.js';
+// ✅ Validator ABCI Helper (for lazy discovery)
+import { fetchAllValidatorsViaAbci } from './pg/helpers/staking_abci.js';
 // ✅ Gov ABCI Helper (for fetching proposal data via RPC)
 import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
 // ✅ WASM ABCI Helper (for fetching contract data via RPC)
@@ -437,6 +440,10 @@ export class PostgresSink implements Sink {
   private bufValidators: any[] = [];
   private bufValidatorSet: any[] = [];
   private bufMissedBlocks: any[] = [];
+
+  // ✅ Validator cache for lazy discovery
+  private knownValidatorsHeaders = new Set<string>();
+  private lastValidatorRefreshHeight = 0;
 
   // ✅ IBC Buffer
   private bufIbcPackets: any[] = [];
@@ -1104,12 +1111,33 @@ export class PostgresSink implements Sink {
     const vSet = blockLine.validator_set;
     if (vSet?.validators) {
       for (const v of vSet.validators as any[]) {
+        const cAddr = v.address;
         validatorSetRows.push({
           height,
-          operator_address: v.address,
+          consensus_address: cAddr,
           voting_power: v.voting_power,
           proposer_priority: v.proposer_priority
         });
+
+        // ✅ LAZY DISCOVERY: If this validator is unknown, trigger a metadata sync
+        if (this.rpc && this.protoRoot && !this.knownValidatorsHeaders.has(cAddr)) {
+          // Limit refresh to once per 100 blocks to avoid spamming ABCI
+          if (height > this.lastValidatorRefreshHeight + 100) {
+            this.lastValidatorRefreshHeight = height;
+            fetchAllValidatorsViaAbci(this.rpc, this.protoRoot).then(allVals => {
+              if (allVals.length > 0) {
+                this.bufValidators.push(...allVals.map(val => ({
+                  ...val,
+                  updated_at_height: height,
+                  updated_at_time: time
+                })));
+                for (const val of allVals) {
+                  if (val.consensus_address) this.knownValidatorsHeaders.add(val.consensus_address);
+                }
+              }
+            }).catch(e => log.warn(`[staking] Lazy discovery failed: ${e.message}`));
+          }
+        }
       }
     }
 
@@ -1177,7 +1205,7 @@ export class PostgresSink implements Sink {
         const isAbsent = sig.block_id_flag === 1 || sig.block_id_flag === 'BLOCK_ID_FLAG_ABSENT';
         if (isAbsent && sig.validator_address) {
           missedBlocksRows.push({
-            operator_address: sig.validator_address,
+            consensus_address: sig.validator_address,
             height: height - 1
           });
           log.debug(`[uptime] missed block: ${sig.validator_address} at height ${height - 1} `);
@@ -1935,8 +1963,14 @@ export class PostgresSink implements Sink {
 
         // 🟢 STAKING LOGIC 🟢
         if (isSuccess && (type === '/cosmos.staking.v1beta1.MsgCreateValidator' || type === '/cosmos.staking.v1beta1.MsgEditValidator')) {
+          const pubkey = m.pubkey?.value || m.consensus_pubkey?.value;
+          const consensusPubKey = pubkey ? (typeof pubkey === 'string' ? pubkey : Buffer.from(pubkey).toString('base64')) : null;
+          const consensusAddress = consensusPubKey ? deriveConsensusAddress(consensusPubKey) : null;
+
           validatorsRows.push({
             operator_address: m.validator_address || m.operator_address,
+            consensus_address: consensusAddress,
+            consensus_pubkey: consensusPubKey,
             moniker: m.description?.moniker,
             website: m.description?.website,
             details: m.description?.details,
@@ -1944,7 +1978,7 @@ export class PostgresSink implements Sink {
             max_commission_rate: parseDec(m.commission?.max_rate),
             max_change_rate: parseDec(m.commission?.max_change_rate),
             min_self_delegation: m.min_self_delegation,
-            status: 'BOND_STATUS_BONDED', // Default, would need Query or Event for real-time
+            status: 'BOND_STATUS_BONDED',
             updated_at_height: height,
             updated_at_time: time
           });
@@ -3071,8 +3105,8 @@ export class PostgresSink implements Sink {
       await flushStakeDistr(client, snapshot.stakeDistr);
 
       await upsertValidators(client, snapshot.validators);
-      await execBatchedInsert(client, 'core.validator_set', ['height', 'operator_address', 'voting_power', 'proposer_priority'], snapshot.validatorSet, 'ON CONFLICT (height, operator_address) DO NOTHING');
-      await execBatchedInsert(client, 'core.validator_missed_blocks', ['operator_address', 'height'], snapshot.missedBlocks, 'ON CONFLICT (operator_address, height) DO NOTHING');
+      await execBatchedInsert(client, 'core.validator_set', ['height', 'consensus_address', 'voting_power', 'proposer_priority'], snapshot.validatorSet, 'ON CONFLICT (height, consensus_address) DO NOTHING');
+      await execBatchedInsert(client, 'core.validator_missed_blocks', ['consensus_address', 'height'], snapshot.missedBlocks, 'ON CONFLICT (consensus_address, height) DO NOTHING');
 
       // IBC Data
       if (snapshot.ibcPackets.length > 0 || snapshot.ibcTransfers.length > 0) {

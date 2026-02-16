@@ -62,17 +62,17 @@ CREATE TABLE core.validators (
 
 CREATE TABLE core.validator_set (
     height            BIGINT NOT NULL,
-    operator_address  TEXT   NOT NULL,
+    consensus_address TEXT   NOT NULL,
     voting_power      BIGINT NOT NULL,
     proposer_priority BIGINT NULL,
-    PRIMARY KEY (height, operator_address)
+    PRIMARY KEY (height, consensus_address)
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS core.validator_set_p0 PARTITION OF core.validator_set FOR VALUES FROM (0) TO (500000);
 
 CREATE TABLE core.validator_missed_blocks (
-    operator_address TEXT   NOT NULL,
+    consensus_address TEXT   NOT NULL,
     height           BIGINT NOT NULL,
-    PRIMARY KEY (operator_address, height)
+    PRIMARY KEY (consensus_address, height)
 ) PARTITION BY RANGE (height);
 CREATE TABLE IF NOT EXISTS core.validator_missed_blocks_p0 PARTITION OF core.validator_missed_blocks FOR VALUES FROM (0) TO (500000);
 
