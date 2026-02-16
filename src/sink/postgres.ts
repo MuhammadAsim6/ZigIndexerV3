@@ -77,7 +77,7 @@ import { flushTokenRegistry } from './pg/flushers/tokens.js'; // ✅ ADDED
 
 // ✅ Gov Params Helper (for timestamp calculation)
 import { calculateDepositEnd, calculateVotingEnd } from '../utils/gov_params.js';
-import { buildTokenRegistryRow, inferTokenType } from '../utils/token-registry.js';
+import { buildTokenRegistryRow, inferTokenType, normalizeIbcDenom } from '../utils/token-registry.js';
 import type { TokenRegistrySource, TokenRegistryType } from '../utils/token-registry.js';
 // ✅ Gov ABCI Helper (for fetching proposal data via RPC)
 import { fetchProposalDataViaAbci } from './pg/helpers/gov_abci.js';
@@ -594,26 +594,109 @@ export class PostgresSink implements Sink {
       return null;
     }
 
+    const lower = denom.toLowerCase();
+    // 1. IBC Denoms
+    if (lower.startsWith('ibc/')) {
+      return this.fetchTokenRegistryIbcMetadataViaAbci(denom);
+    }
+    // 2. CW20 Address (zig1... length 63)
+    if (lower.startsWith('zig1') && (denom.length === 63 || denom.length === 39)) {
+      return this.fetchTokenRegistryCw20MetadataViaAbci(denom);
+    }
+    // 3. Default (Bank)
+    return this.fetchTokenRegistryBankMetadataViaAbci(denom);
+  }
+
+  private async fetchTokenRegistryBankMetadataViaAbci(denom: string): Promise<TokenRegistryRpcMetadata | null> {
     try {
-      const ReqType = this.protoRoot.lookupType('cosmos.bank.v1beta1.QueryDenomMetadataRequest');
+      const ReqType = this.protoRoot!.lookupType('cosmos.bank.v1beta1.QueryDenomMetadataRequest');
       const ResType = 'cosmos.bank.v1beta1.QueryDenomMetadataResponse';
       const reqMsg = ReqType.create({ denom });
       const reqBytes = ReqType.encode(reqMsg).finish();
       const reqHex = '0x' + Buffer.from(reqBytes).toString('hex');
-      const response = await this.rpc.queryAbci('/cosmos.bank.v1beta1.Query/DenomMetadata', reqHex);
+      const response = await this.rpc!.queryAbci('/cosmos.bank.v1beta1.Query/DenomMetadata', reqHex);
 
       if (!response || response.code !== 0 || !response.value) {
         this.tokenRegistryMetadataCache.set(denom, null);
         return null;
       }
 
-      const decoded = decodeAnyWithRoot(ResType, Buffer.from(response.value, 'base64'), this.protoRoot) as any;
+      const decoded = decodeAnyWithRoot(ResType, Buffer.from(response.value, 'base64'), this.protoRoot!) as any;
       const parsed = extractTokenRegistryMetadataFromBankResponse(decoded);
       this.tokenRegistryMetadataCache.set(denom, parsed);
       return parsed;
     } catch (err: any) {
       this.tokenRegistryMetadataCache.set(denom, null);
-      log.debug(`[token-registry] skip denom metadata fetch for ${denom}: ${err.message}`);
+      log.debug(`[token-registry] skip bank metadata fetch for ${denom}: ${err.message}`);
+      return null;
+    }
+  }
+
+  private async fetchTokenRegistryCw20MetadataViaAbci(address: string): Promise<TokenRegistryRpcMetadata | null> {
+    try {
+      const ReqType = this.protoRoot!.lookupType('cosmwasm.wasm.v1.QuerySmartContractStateRequest');
+      const ResType = 'cosmwasm.wasm.v1.QuerySmartContractStateResponse';
+      const queryMsg = JSON.stringify({ token_info: {} });
+      const queryBytes = Buffer.from(queryMsg);
+      const reqMsg = ReqType.create({ address, queryData: queryBytes });
+      const reqBytes = ReqType.encode(reqMsg).finish();
+      const reqHex = '0x' + Buffer.from(reqBytes).toString('hex');
+      const response = await this.rpc!.queryAbci('/cosmwasm.wasm.v1.Query/SmartContractState', reqHex);
+
+      if (!response || response.code !== 0 || !response.value) {
+        this.tokenRegistryMetadataCache.set(address, null);
+        return null;
+      }
+
+      const decoded = decodeAnyWithRoot(ResType, Buffer.from(response.value, 'base64'), this.protoRoot!) as any;
+      const data = tryParseJson(Buffer.from(decoded.data, 'base64').toString());
+      if (!data) return null;
+
+      const parsed: TokenRegistryRpcMetadata = {
+        symbol: normalizeNonEmptyString(data.symbol) ?? null,
+        base_denom: address,
+        decimals: normalizeNonNegativeInt(data.decimals),
+        full_meta: normalizePlainObject(data),
+      };
+      this.tokenRegistryMetadataCache.set(address, parsed);
+      return parsed;
+    } catch (err: any) {
+      this.tokenRegistryMetadataCache.set(address, null);
+      log.debug(`[token-registry] skip cw20 metadata fetch for ${address}: ${err.message}`);
+      return null;
+    }
+  }
+
+  private async fetchTokenRegistryIbcMetadataViaAbci(denom: string): Promise<TokenRegistryRpcMetadata | null> {
+    try {
+      const hash = denom.slice(4); // Remove 'ibc/'
+      const ReqType = this.protoRoot!.lookupType('ibc.applications.transfer.v1.QueryDenomTraceRequest');
+      const ResType = 'ibc.applications.transfer.v1.QueryDenomTraceResponse';
+      const reqMsg = ReqType.create({ hash });
+      const reqBytes = ReqType.encode(reqMsg).finish();
+      const reqHex = '0x' + Buffer.from(reqBytes).toString('hex');
+      const response = await this.rpc!.queryAbci('/ibc.applications.transfer.v1.Query/DenomTrace', reqHex);
+
+      if (!response || response.code !== 0 || !response.value) {
+        this.tokenRegistryMetadataCache.set(denom, null);
+        return null;
+      }
+
+      const decoded = decodeAnyWithRoot(ResType, Buffer.from(response.value, 'base64'), this.protoRoot!) as any;
+      const trace = decoded?.denomTrace || decoded?.denom_trace;
+      const baseDenom = normalizeNonEmptyString(trace?.base_denom ?? trace?.baseDenom);
+      if (!baseDenom) return null;
+
+      // Now fetch metadata for the base denom
+      const meta = await this.fetchTokenRegistryMetadataViaAbci(baseDenom);
+      if (meta) {
+        this.tokenRegistryMetadataCache.set(denom, meta);
+        return meta;
+      }
+      return null;
+    } catch (err: any) {
+      this.tokenRegistryMetadataCache.set(denom, null);
+      log.debug(`[token-registry] skip ibc metadata fetch for ${denom}: ${err.message}`);
       return null;
     }
   }
@@ -672,23 +755,22 @@ export class PostgresSink implements Sink {
     // 2. Share metadata between common aliases (Factory <-> Coin wrapper)
     for (const denom of denoms) {
       const meta = this.tokenRegistryMetadataCache.get(denom);
-      if (!meta) {
-        // Try to find an alias that DOES have metadata
-        const lower = denom.toLowerCase();
-        let alias: string | null = null;
-        if (lower.startsWith('factory/')) {
-          const p = denom.split('/');
-          if (p.length >= 3) alias = `coin.${p[1]}.${p.slice(2).join('/')}`;
-        } else if (lower.startsWith('coin.')) {
-          const p = denom.split('.');
-          if (p.length >= 3) alias = `factory/${p[1]}/${p.slice(2).join('.')}`;
-        }
+      const lower = denom.toLowerCase();
+      let alias: string | null = null;
+      if (lower.startsWith('factory/')) {
+        const p = denom.split('/');
+        if (p.length >= 3) alias = `coin.${p[1]}.${p.slice(2).join('/')}`;
+      } else if (lower.startsWith('coin.')) {
+        const p = denom.split('.');
+        if (p.length >= 3) alias = `factory/${p[1]}/${p.slice(2).join('.')}`;
+      }
 
-        if (alias && this.tokenRegistryMetadataCache.has(alias)) {
-          const aliasMeta = this.tokenRegistryMetadataCache.get(alias);
-          if (aliasMeta) {
-            this.tokenRegistryMetadataCache.set(denom, aliasMeta);
-          }
+      if (alias) {
+        const aliasMeta = this.tokenRegistryMetadataCache.get(alias);
+        if (meta && !aliasMeta) {
+          this.tokenRegistryMetadataCache.set(alias, meta);
+        } else if (!meta && aliasMeta) {
+          this.tokenRegistryMetadataCache.set(denom, aliasMeta);
         }
       }
     }
@@ -807,13 +889,14 @@ export class PostgresSink implements Sink {
       if (denom === null || denom === undefined) return;
       if (typeof denom !== 'string' && typeof denom !== 'number' && typeof denom !== 'bigint') return;
       const rawDenom = String(denom).trim();
-      if (rawDenom.length === 0) {
-        return;
-      }
+      if (rawDenom.length === 0) return;
+
+      const rType = type ?? inferTokenType(rawDenom);
+      const normalizedDenom = rType === 'ibc' ? normalizeIbcDenom(rawDenom) : rawDenom;
 
       const row = buildTokenRegistryRow({
-        denom: rawDenom,
-        type: type ?? inferTokenType(rawDenom),
+        denom: normalizedDenom,
+        type: rType,
         source,
         height,
         txHash: tx_h ?? null,
@@ -852,15 +935,20 @@ export class PostgresSink implements Sink {
           firstSeenTx = existing.first_seen_tx ?? r.first_seen_tx ?? null;
         }
 
+        const shouldPreferIncoming = (existing.type === 'native' && r.type !== 'native') ||
+          (!!r.metadata && (!existing.metadata || Object.keys(r.metadata).length > Object.keys(existing.metadata).length));
+
         tokenRegistryByDenom.set(r.denom, {
           ...existing,
           type: existing.type === 'native' && r.type !== 'native' ? r.type : existing.type,
-          base_denom: r.base_denom ?? existing.base_denom,
-          symbol: r.symbol ?? existing.symbol,
-          decimals: r.decimals ?? existing.decimals,
-          creator: r.creator ?? existing.creator,
+          base_denom: (shouldPreferIncoming ? r.base_denom : (r.base_denom ?? existing.base_denom)) ?? existing.base_denom,
+          symbol: (shouldPreferIncoming ? r.symbol : (r.symbol ?? existing.symbol)) ?? existing.symbol,
+          decimals: (shouldPreferIncoming ? r.decimals : (r.decimals ?? existing.decimals)) ?? existing.decimals,
+          creator: (shouldPreferIncoming ? r.creator : (r.creator ?? existing.creator)) ?? existing.creator,
           first_seen_height: firstSeenHeight,
           first_seen_tx: firstSeenTx,
+          is_primary: (r.is_primary !== undefined ? r.is_primary : existing.is_primary) ?? true,
+          is_verified: existing.is_verified && r.is_verified,
           metadata:
             (existing.metadata || r.metadata)
               ? { ...(existing.metadata || {}), ...(r.metadata || {}) }
@@ -881,7 +969,9 @@ export class PostgresSink implements Sink {
             const creator = parts[1];
             const subDenom = parts.slice(2).join('/');
             const wrapperDenom = `coin.${creator}.${subDenom}`;
-            upsert({ ...row, denom: wrapperDenom, metadata: { ...row.metadata, base: row.denom } });
+            // Wrapper is Primary, Factory is Secondary
+            upsert({ ...row, denom: wrapperDenom, metadata: { ...row.metadata, base: row.denom }, is_primary: true });
+            upsert({ ...row, denom: row.denom, is_primary: false });
           }
         } else if (lowerDenom.startsWith('coin.')) {
           const parts = rawDenom.split('.');
@@ -889,7 +979,9 @@ export class PostgresSink implements Sink {
             const creator = parts[1];
             const subDenom = parts.slice(2).join('.');
             const factoryDenom = `factory/${creator}/${subDenom}`;
-            upsert({ ...row, denom: factoryDenom, metadata: { ...row.metadata, base: row.denom } });
+            // Wrapper is Primary, Factory is Secondary
+            upsert({ ...row, denom: row.denom, is_primary: true });
+            upsert({ ...row, denom: factoryDenom, metadata: { ...row.metadata, base: row.denom }, is_primary: false });
           }
         }
       }

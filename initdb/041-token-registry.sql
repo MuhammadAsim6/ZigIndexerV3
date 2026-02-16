@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS tokens.registry (
     first_seen_height BIGINT,
     first_seen_tx     TEXT,
     metadata          JSONB,             -- For extra info like URI, description, or IBC path
+    is_primary        BOOLEAN DEFAULT TRUE,
+    is_verified       BOOLEAN DEFAULT TRUE,
     updated_at        TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -21,4 +23,5 @@ CREATE INDEX IF NOT EXISTS idx_token_registry_height ON tokens.registry(first_se
 -- Ordered View for easier querying
 CREATE OR REPLACE VIEW tokens.registry_view AS
 SELECT * FROM tokens.registry
+WHERE is_primary = TRUE
 ORDER BY first_seen_height ASC, denom ASC;

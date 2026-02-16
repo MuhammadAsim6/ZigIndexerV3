@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 export type TokenRegistryType = 'native' | 'factory' | 'cw20' | 'ibc';
 export type TokenRegistrySource = 'default' | 'wrapper_settings';
 
@@ -7,6 +9,7 @@ export type TokenRegistryRowInput = {
   txHash?: string | null;
   type?: TokenRegistryType;
   source?: TokenRegistrySource;
+  is_primary?: boolean;
   metadata?: {
     symbol?: string | null;
     base_denom?: string | null;
@@ -15,6 +18,20 @@ export type TokenRegistryRowInput = {
     full_meta?: Record<string, unknown> | null;
   };
 };
+
+/**
+ * Normalizes an IBC denom path to its ibc/HASH equivalent.
+ * If the denom is already an ibc/HASH or not a path, it returns it as-is.
+ */
+export function normalizeIbcDenom(denom: string): string {
+  const clean = denom.trim();
+  if (!clean.includes('/')) return clean;
+  if (clean.toLowerCase().startsWith('ibc/')) return clean;
+
+  // Compute SHA256 of the path
+  const hash = crypto.createHash('sha256').update(clean).digest('hex').toUpperCase();
+  return `ibc/${hash}`;
+}
 
 function normalizeNonEmptyString(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -140,6 +157,8 @@ export function buildTokenRegistryRow(input: TokenRegistryRowInput): {
   creator: string | null;
   first_seen_height: number | null;
   first_seen_tx: string | null;
+  is_primary: boolean;
+  is_verified: boolean;
   metadata: Record<string, unknown> | null;
 } | null {
   const cleanDenom = normalizeNonEmptyString(input.denom);
@@ -183,6 +202,8 @@ export function buildTokenRegistryRow(input: TokenRegistryRowInput): {
     creator,
     first_seen_height: firstSeenHeight,
     first_seen_tx: firstSeenTx,
+    is_primary: input.is_primary ?? true,
+    is_verified: true, // Default to true, inserter will adjust if collisions found
     metadata: normalizeMetadata(metadata.full_meta),
   };
 }
