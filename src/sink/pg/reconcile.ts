@@ -161,7 +161,7 @@ async function reconcileAllKnownBalances(
   );
 
   try {
-    for (;;) {
+    for (; ;) {
       const res = await client.query(
         `
           SELECT account, balances
@@ -190,6 +190,9 @@ async function reconcileAllKnownBalances(
             const rpcBal = rpcBalances.get(denom) ?? 0n;
             const diff = rpcBal - dbBal;
             if (diff === 0n) continue;
+            log.info(
+              `[reconcile/full] Correcting ${account} (${denom}) at height ${targetHeight}: DB=${dbBal}, RPC=${rpcBal}, Delta=${diff}`,
+            );
             correctionDeltas.push({
               height: targetHeight,
               account,
@@ -373,7 +376,7 @@ async function fetchAllBalancesViaAbci(
   const allCoins: any[] = [];
   let nextKey: string | null = null;
 
-  for (;;) {
+  for (; ;) {
     const reqPayload: any = {
       address,
       pagination: { limit: 1000 },
