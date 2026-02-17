@@ -51,6 +51,7 @@ export async function flushGovVotes(
     proposal_id: bigint;
     voter: string;
     option: string;
+    option_index: number;
     weight: string | null;
     height: number;
     tx_hash: string;
@@ -58,12 +59,13 @@ export async function flushGovVotes(
 ) {
   if (!rows.length) return;
 
-  const columns = ['proposal_id', 'voter', 'option', 'weight', 'height', 'tx_hash'] as const;
+  const columns = ['proposal_id', 'voter', 'option', 'option_index', 'weight', 'height', 'tx_hash'] as const;
 
   const shaped = rows.map((r) => ({
     proposal_id: r.proposal_id.toString(),
     voter: r.voter,
     option: r.option,
+    option_index: r.option_index,
     weight: r.weight,
     height: r.height,
     tx_hash: r.tx_hash,

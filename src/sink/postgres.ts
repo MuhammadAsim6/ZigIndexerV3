@@ -1284,6 +1284,7 @@ export class PostgresSink implements Sink {
             proposal_id: m.proposal_id,
             voter: m.voter,
             option: m.option?.toString() ?? 'VOTE_OPTION_UNSPECIFIED',
+            option_index: 0,
             weight: "1.0", // ✅ FIX: Simple votes always have 1.0 weight
             height,
             tx_hash,
@@ -1300,11 +1301,13 @@ export class PostgresSink implements Sink {
         // 1b. WEIGHTED VOTE
         if (isSuccess && (type === '/cosmos.gov.v1beta1.MsgVoteWeighted' || type === '/cosmos.gov.v1.MsgVoteWeighted')) {
           const options = Array.isArray(m.options) ? m.options : [];
-          for (const opt of options) {
+          for (let oi = 0; oi < options.length; oi++) {
+            const opt = options[oi];
             govVotesRows.push({
               proposal_id: m.proposal_id,
               voter: m.voter || m.signer || firstSigner,
               option: opt.option?.toString() ?? 'VOTE_OPTION_UNSPECIFIED',
+              option_index: oi,
               weight: opt.weight ?? '1.0', // Weight is a decimal string like "0.5"
               height,
               tx_hash,

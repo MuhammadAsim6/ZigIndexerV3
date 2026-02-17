@@ -250,10 +250,11 @@ CREATE TABLE gov.votes (
     proposal_id BIGINT          NOT NULL,
     voter       TEXT            NOT NULL,
     option      TEXT            NOT NULL,
+    option_index INT            NOT NULL DEFAULT 0,
     weight      NUMERIC(20, 18) NULL,
     height      BIGINT          NOT NULL,
     tx_hash     TEXT            NOT NULL,
-    PRIMARY KEY (proposal_id, voter, height, tx_hash)
+    PRIMARY KEY (proposal_id, voter, height, tx_hash, option_index)
 ) PARTITION BY RANGE (height);
 
 -- ============================================================================
