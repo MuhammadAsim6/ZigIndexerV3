@@ -12,7 +12,7 @@ import { getProgress } from './db/progress.ts';
 import { upsertValidators } from './sink/pg/flushers/validators.ts';
 import { insertWrapperSettings } from './sink/pg/inserters/zigchain.ts';
 import { insertTokenRegistry } from './sink/pg/inserters/tokens.ts';
-import { deriveConsensusAddress } from './utils/crypto.ts';
+import { fetchAllValidatorsViaAbci } from './sink/pg/helpers/staking_abci.ts';
 import { loadProtoRoot, decodeAnyWithRoot } from './decode/dynamicProto.ts';
 import { base64ToBytes } from './utils/bytes.ts';
 import { buildTokenRegistryRow } from './utils/token-registry.js';
@@ -43,46 +43,7 @@ function normalizeNonNegativeInt(value: unknown): number | null {
   return n;
 }
 
-async function fetchAllStakingValidatorsViaAbci(rpc: any, protoRoot: any): Promise<any[]> {
-  const requestType = protoRoot.lookupType('cosmos.staking.v1beta1.QueryValidatorsRequest');
-  const responseType = 'cosmos.staking.v1beta1.QueryValidatorsResponse';
-  const path = '/cosmos.staking.v1beta1.Query/Validators';
-  const out: any[] = [];
-  const seen = new Set<string>();
-  let nextKey: string | null = null;
-  const maxPages = 200;
-
-  for (let page = 0; page < maxPages; page++) {
-    const payload: any = {
-      status: 'BOND_STATUS_UNSPECIFIED',
-      pagination: { limit: 500 },
-    };
-    if (nextKey) payload.pagination.key = base64ToBytes(nextKey);
-
-    const req = requestType.create(payload);
-    const reqHex = '0x' + Buffer.from(requestType.encode(req).finish()).toString('hex');
-    const abciRes = await rpc.queryAbci(path, reqHex);
-    if (!abciRes?.value) break;
-
-    const decoded = decodeAnyWithRoot(responseType, base64ToBytes(abciRes.value), protoRoot) as any;
-    const validators = Array.isArray(decoded?.validators) ? decoded.validators : [];
-    for (const v of validators) {
-      const op = String(v?.operator_address || v?.operatorAddress || v?.address || v?.operator_addr || '');
-      if (!op || seen.has(op)) continue;
-      seen.add(op);
-      out.push(v);
-    }
-
-    const nk = decoded?.pagination?.next_key ?? decoded?.pagination?.nextKey ?? null;
-    if (typeof nk === 'string' && nk.length > 0) {
-      nextKey = nk;
-    } else {
-      break;
-    }
-  }
-
-  return out;
-}
+// fetchAllStakingValidatorsViaAbci removed — now uses unified helper from staking_abci.ts
 
 async function main() {
   const cfg = getConfig();
@@ -182,7 +143,7 @@ async function main() {
     });
     await sink.init();
 
-    // 🛡️ INITIAL SYNC: Fetch validators on startup
+    // 🛡️ INITIAL SYNC: Fetch validators on startup (uses unified helper)
     if (cfg.sinkKind === 'postgres') {
       try {
         log.info('[start] syncing staking validators…');
@@ -190,90 +151,14 @@ async function main() {
         const pool = getPgPool();
         const client = await pool.connect();
         try {
-          const stakingVals = await fetchAllStakingValidatorsViaAbci(rpc, protoRoot);
-          if (stakingVals.length > 0) {
-            log.info(`[start] found ${stakingVals.length} staking validators`);
-          }
-
-          const rows = [];
-          for (const v of (stakingVals as any[])) {
-              const opAddr = v.operator_address || v.operatorAddress || v.address || v.operator_addr;
-              if (!opAddr) continue;
-
-              let consAddr: string | null = null;
-              const pubAny = v.consensus_pubkey || v.consensusPubkey || v.consensusPubKey || v.consensus_pub_key;
-              if (pubAny?.value) {
-                try {
-                  let rawVal: Uint8Array;
-                  if (typeof pubAny.value === 'string') {
-                    rawVal = base64ToBytes(pubAny.value);
-                  } else if (typeof pubAny.value === 'object' && pubAny.value !== null) {
-                    rawVal = new Uint8Array(Object.values(pubAny.value));
-                  } else {
-                    throw new Error('Unsupported pubAny.value type: ' + typeof pubAny.value);
-                  }
-
-                  const decodedPub = decodeAnyWithRoot(pubAny['@type'] || pubAny.type_url || pubAny.typeUrl, rawVal, protoRoot);
-                  const rawKey = decodedPub.key || decodedPub.value;
-
-                  if (rawKey) {
-                    const rawKeyB64 = (typeof rawKey === 'string')
-                      ? rawKey
-                      : Buffer.from(Object.values(rawKey) as any).toString('base64');
-
-                    consAddr = deriveConsensusAddress(rawKeyB64);
-                    log.info(`[start] derived consAddr ${consAddr} for ${opAddr}`);
-                  }
-                } catch (e) {
-                  log.warn(`Failed to derive consAddr for ${opAddr}: ${e}`);
-                }
-              }
-
-              const commRates = v.commission?.commissionRates || v.commission?.commission_rates;
-
-              const toDecimal = (val: string | number | null | undefined): string | null => {
-                if (val == null) return null;
-                try {
-                  const str = String(val);
-                  if (str.includes('.') && parseFloat(str) < 100) return str;
-                  const num = BigInt(str);
-                  const divisor = BigInt('1000000000000000000');
-                  const intPart = num / divisor;
-                  const fracPart = num % divisor;
-                  const fracStr = fracPart.toString().padStart(18, '0');
-                  return `${intPart}.${fracStr}`;
-                } catch { return null; }
-              };
-
-              let rawPubkeyB64: string | null = null;
-              if (pubAny?.value) {
-                try {
-                  if (typeof pubAny.value === 'string') {
-                    rawPubkeyB64 = pubAny.value;
-                  } else if (typeof pubAny.value === 'object' && pubAny.value !== null) {
-                    rawPubkeyB64 = Buffer.from(Object.values(pubAny.value) as any).toString('base64');
-                  }
-                } catch (e) { /* ignore */ }
-              }
-
-            rows.push({
-              operator_address: opAddr,
-              consensus_address: consAddr,
-              consensus_pubkey: rawPubkeyB64,
-              moniker: v.description?.moniker || `Validator ${String(opAddr).slice(-8)}`,
-              website: v.description?.website,
-              details: v.description?.details,
-              commission_rate: toDecimal(commRates?.rate || commRates?.Rate),
-              max_commission_rate: toDecimal(commRates?.maxRate || commRates?.max_rate || commRates?.MaxRate),
-              max_change_rate: toDecimal(commRates?.maxChangeRate || commRates?.max_change_rate || commRates?.MaxChangeRate),
-              min_self_delegation: v.min_self_delegation || v.minSelfDelegation,
-              status: v.status,
+          const validatorRows = await fetchAllValidatorsViaAbci(rpc, protoRoot);
+          if (validatorRows.length > 0) {
+            log.info(`[start] found ${validatorRows.length} staking validators`);
+            const rows = validatorRows.map(v => ({
+              ...v,
               updated_at_height: startFrom,
-              updated_at_time: new Date()
-            });
-          }
-
-          if (rows.length > 0) {
+              updated_at_time: new Date(),
+            }));
             await client.query('BEGIN');
             await client.query('DELETE FROM core.validators');
             await upsertValidators(client, rows);

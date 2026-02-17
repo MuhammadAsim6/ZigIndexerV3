@@ -16,15 +16,17 @@ services:
       POSTGRES_USER: ${PG_USER}
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_INITDB_ARGS: ${PG_INITDB_ARGS}
+      PGPASSWORD: ${PG_PASSWORD}         # <--- ADD THIS (Used by the Entrypoint Script)
     ports:
       - "127.0.0.1:${PG_PORT:-5432}:5432"
+    volumes:
       # ✅ CUSTOM CONFIG: Load optimized settings
       - ./custom_postgres.conf:/etc/postgresql/postgresql.conf:ro
-      - "/media/asim/ubuntu v2/indexer-data:/var/lib/postgresql"
+      - "/media/asim/ubuntu v21/indexer-data:/var/lib/postgresql"
       # ✅ INIT SCRIPTS: Auto-run SQL files in ./initdb on fresh start
       - ./initdb:/docker-entrypoint-initdb.d:ro
       
-    shm_size: 8gb  # ✅ Increased from 1gb for 5.4M+ scale
+    shm_size: 16gb  # ✅ Increased to match shared_buffers in custom_postgres.conf
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
 
   indexer:
@@ -48,6 +50,7 @@ services:
       PG_USER: ${PG_USER}
       PG_PASSWORD: ${PG_PASSWORD}
       PG_DB: ${PG_DB}
+      PGPASSWORD: ${PG_PASSWORD}         # Used by entrypoint psql progress check
       # Optional: override RPC_URL if you want the indexer to target a remote node
       RPC_URL: ${RPC_URL}
       # Node memory default (can be overridden at compose run time)
