@@ -9,6 +9,7 @@ export const MAX_TOTAL_JSON_SIZE = 20_000_000;
 
 // ✅ Maximum number of attributes to keep (10000 - handles massive batched events)
 export const MAX_ATTR_COUNT = 10000;
+const PREVIEW_SIZE = 4096;
 
 /**
  * Truncates large attribute values to prevent PostgreSQL index size errors.
@@ -44,12 +45,20 @@ export function safeSerializeAttributes(attributes: any): string {
         return '[]';
     }
 
-    // ✅ CRITICAL FIX: If already a string, check length FIRST before any operations
+    // If incoming value is a string, try to parse JSON first. If not JSON, wrap safely.
     if (typeof attributes === 'string') {
-        if (attributes.length > MAX_TOTAL_JSON_SIZE) {
-            return attributes.substring(0, MAX_TOTAL_JSON_SIZE - 50) + '...[TRUNCATED_JSON]"]';
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(attributes);
+        } catch {
+            const safeRaw = attributes.length > PREVIEW_SIZE ? attributes.slice(0, PREVIEW_SIZE) : attributes;
+            return JSON.stringify({
+                _non_json: true,
+                _raw: safeRaw,
+                _raw_length: attributes.length,
+            });
         }
-        return attributes;
+        attributes = parsed;
     }
 
     // ✅ Check array length before any processing
@@ -77,7 +86,12 @@ export function safeSerializeAttributes(attributes: any): string {
     }
 
     if (json.length > MAX_TOTAL_JSON_SIZE) {
-        json = json.substring(0, MAX_TOTAL_JSON_SIZE - 50) + '...[TRUNCATED_JSON]"]';
+        return JSON.stringify({
+            _truncated: true,
+            _reason: 'max_total_size',
+            _original_length: json.length,
+            _preview: json.slice(0, PREVIEW_SIZE),
+        });
     }
 
     return json;
