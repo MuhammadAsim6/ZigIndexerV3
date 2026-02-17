@@ -2126,7 +2126,8 @@ export class PostgresSink implements Sink {
 
         // 🟢 MSG_UPDATE_PARAMS (GENERIC) 🟢
         if (type.endsWith('.MsgUpdateParams') && isSuccess) {
-          const moduleMatch = type.match(/^\/([^.]+)\./);
+          // Extract the actual module name (e.g. 'staking' from '/cosmos.staking.v1beta1.MsgUpdateParams')
+          const moduleMatch = type.match(/\.([^.]+)\.v\d/);
           const module = moduleMatch ? moduleMatch[1] : 'unknown';
           const params = m.params || {};
 
@@ -2803,6 +2804,23 @@ export class PostgresSink implements Sink {
       // tx_hash and msg_index are undefined for block events
       extractBalanceDeltas(evType, attrsPairs, undefined, undefined, i);
       extractFactorySupplyFromEvent(evType, attrsPairs, `block_${height}_events`, undefined, i);
+
+      // 🟢 NETWORK PARAMS from block-level events (FinalizeBlock / EndBlock)
+      if (evType === 'param_change') {
+        const module = findAttr(attrsPairs, 'module');
+        const key = findAttr(attrsPairs, 'key');
+        const value = findAttr(attrsPairs, 'value');
+        if (module && key) {
+          networkParamsRows.push({
+            height,
+            time,
+            module,
+            param_key: key,
+            old_value: null,
+            new_value: tryParseJson(value)
+          });
+        }
+      }
     }
 
     // Prefer event-derived mint/burn rows over message-derived fallback rows for the same tx/msg/denom/action.

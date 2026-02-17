@@ -11,10 +11,7 @@ CREATE TABLE IF NOT EXISTS core.unknown_messages (
     signer        TEXT NULL,
     first_seen    TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (height, tx_hash, msg_index)
-) PARTITION BY RANGE (height);
-
-CREATE TABLE IF NOT EXISTS core.unknown_messages_p0 
-    PARTITION OF core.unknown_messages FOR VALUES FROM (0) TO (500000);
+);
 
 -- Index for finding all occurrences of a specific unknown type
 CREATE INDEX IF NOT EXISTS idx_unknown_messages_type ON core.unknown_messages (type_url);
