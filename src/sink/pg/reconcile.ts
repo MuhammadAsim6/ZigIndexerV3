@@ -20,6 +20,44 @@ type RpcHeights = {
   earliest: number;
 };
 
+async function ensureReconcileStateTable(client: PoolClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS core.reconcile_state (
+      state_id TEXT PRIMARY KEY,
+      full_done BOOLEAN NOT NULL DEFAULT FALSE,
+      full_height BIGINT NULL,
+      full_completed_at TIMESTAMPTZ NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+async function isFullReconcileDone(client: PoolClient, stateId: string): Promise<boolean> {
+  const res = await client.query<{ full_done: boolean }>(
+    `SELECT full_done FROM core.reconcile_state WHERE state_id = $1`,
+    [stateId],
+  );
+  return Boolean(res.rows[0]?.full_done);
+}
+
+async function markFullReconcileDone(client: PoolClient, stateId: string, height: number): Promise<void> {
+  await client.query(
+    `
+      INSERT INTO core.reconcile_state (
+        state_id, full_done, full_height, full_completed_at, updated_at
+      )
+      VALUES ($1, TRUE, $2, now(), now())
+      ON CONFLICT (state_id)
+      DO UPDATE SET
+        full_done = TRUE,
+        full_height = GREATEST(COALESCE(core.reconcile_state.full_height, 0), EXCLUDED.full_height),
+        full_completed_at = EXCLUDED.full_completed_at,
+        updated_at = now()
+    `,
+    [stateId, height],
+  );
+}
+
 function asBigInt(v: unknown): bigint {
   if (v == null) return 0n;
   try {
@@ -87,6 +125,7 @@ export async function runReconcileCycle(
   opts: ReconcileRunOptions,
 ): Promise<void> {
   const mode = opts.mode ?? 'full-once-then-negative';
+  const stateId = String(opts.stateId ?? 'default').trim() || 'default';
   if (mode === 'off') return;
 
   const currentHeight = await getIndexedHeight(client);
@@ -111,14 +150,22 @@ export async function runReconcileCycle(
   }
 
   if (mode === 'full-once-then-negative') {
-    log.info(
-      `[reconcile/full] Starting full reconciliation at height ${currentHeight} (batch=${opts.fullBatchSize}).`,
-    );
-    const summary = await reconcileAllKnownBalances(client, rpc, protoRoot, currentHeight, opts.fullBatchSize);
-    if (summary.failedOther > 0) {
-      log.warn(
-        `[reconcile/full] completed with failed rows: failedOther=${summary.failedOther} skippedPruned=${summary.skippedPruned}`,
+    await ensureReconcileStateTable(client);
+    const fullAlreadyDone = await isFullReconcileDone(client, stateId);
+    if (fullAlreadyDone) {
+      log.info(`[reconcile/full] Skipping full reconciliation; already completed for stateId="${stateId}".`);
+    } else {
+      log.info(
+        `[reconcile/full] Starting full reconciliation at height ${currentHeight} (batch=${opts.fullBatchSize}, stateId="${stateId}").`,
       );
+      const summary = await reconcileAllKnownBalances(client, rpc, protoRoot, currentHeight, opts.fullBatchSize);
+      if (summary.failedOther > 0) {
+        log.warn(
+          `[reconcile/full] completed with failed rows for stateId="${stateId}": failedOther=${summary.failedOther} skippedPruned=${summary.skippedPruned}. Full reconcile will retry on next startup.`,
+        );
+      } else {
+        await markFullReconcileDone(client, stateId, currentHeight);
+      }
     }
   }
 
