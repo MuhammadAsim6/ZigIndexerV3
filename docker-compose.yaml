@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:${PG_VERSION:-16}
+    image: postgres:${PG_VERSION}
     container_name: cosmosindexer
     restart: unless-stopped
     healthcheck:
