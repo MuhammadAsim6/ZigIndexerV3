@@ -1219,6 +1219,7 @@ export class PostgresSink implements Sink {
     for (const tx of txs) {
       const tx_hash = tx.hash ?? tx.txhash ?? tx.tx_hash ?? null;
       const txIbcIntents: any[] = [];
+      const txChannelIntents: { port: string; channel?: string; ordering: string }[] = [];
       const tx_index = Number(tx.index ?? tx.tx_index ?? tx?.tx_response?.index ?? 0);
       const code = Number(tx.code ?? tx?.tx_response?.code ?? 0);
       const isSuccess = code === 0;
@@ -2086,6 +2087,31 @@ export class PostgresSink implements Sink {
           });
         }
 
+        // 🟢 IBC CHANNEL OPEN INTENT — Extract ordering from protobuf message body 🟢
+        if (
+          (type === '/ibc.core.channel.v1.MsgChannelOpenInit' || type === '/ibc.core.channel.v1.MsgChannelOpenTry') &&
+          isSuccess
+        ) {
+          const ch = m.channel ?? m;
+          const rawOrdering = ch?.ordering ?? ch?.order;
+          let ordering: string | null = null;
+          if (typeof rawOrdering === 'string') {
+            // Normalize proto enum strings: "ORDER_ORDERED" → "ORDER_ORDERED"
+            ordering = rawOrdering;
+          } else if (typeof rawOrdering === 'number') {
+            // Proto enum: 0=NONE, 1=UNORDERED, 2=ORDERED
+            const orderMap: Record<number, string> = { 0: 'ORDER_NONE_UNSPECIFIED', 1: 'ORDER_UNORDERED', 2: 'ORDER_ORDERED' };
+            ordering = orderMap[rawOrdering] ?? `ORDER_${rawOrdering}`;
+          }
+          if (ordering) {
+            txChannelIntents.push({
+              port: m.port_id ?? m.portId ?? ch?.port_id ?? '',
+              channel: undefined, // channel_id assigned after channel_open_init event
+              ordering
+            });
+          }
+        }
+
         // 🟢 IBC CLIENT CREATION - Extract chain_id from client_state 🟢
         if (type === '/ibc.core.client.v1.MsgCreateClient' && isSuccess) {
           const clientState = m.client_state || m.clientState;
@@ -2668,7 +2694,9 @@ export class PostgresSink implements Sink {
                 port_id: portId,
                 channel_id: channelId,
                 state: event_type,
-                ordering: findAttr(attrsPairs, 'channel_ordering') || findAttr(attrsPairs, 'ordering'),
+                ordering: findAttr(attrsPairs, 'channel_ordering') || findAttr(attrsPairs, 'ordering')
+                  || txChannelIntents.find(ci => ci.port === portId)?.ordering
+                  || null,
                 connection_hops: connectionId ? [connectionId] : null,
                 counterparty_port: findAttr(attrsPairs, 'counterparty_port_id') || findAttr(attrsPairs, 'counterparty_port'),
                 counterparty_channel: findAttr(attrsPairs, 'counterparty_channel_id') || findAttr(attrsPairs, 'counterparty_channel'),

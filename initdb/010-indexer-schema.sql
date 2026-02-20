@@ -377,12 +377,8 @@ CREATE TABLE ibc.connections (
 -- IBC INDEXES (Performance)
 -- ============================================================================
 CREATE INDEX idx_ibc_packets_status ON ibc.packets(status);
-CREATE INDEX idx_ibc_packets_channel ON ibc.packets(channel_id_src);
-CREATE INDEX idx_ibc_transfers_sender ON ibc.transfers(sender);
-CREATE INDEX idx_ibc_transfers_receiver ON ibc.transfers(receiver);
-CREATE INDEX idx_ibc_transfers_status ON ibc.transfers(status);
-CREATE INDEX idx_ibc_transfers_channel ON ibc.transfers(channel_id_src);
-CREATE INDEX idx_ibc_transfers_denom ON ibc.transfers(denom);
+-- Note: idx_ibc_packets_channel removed — subsumed by idx_ibc_channel (channel_id_src, status) in section 10
+-- Note: idx_ibc_transfers_sender/receiver/status/channel/denom moved to section 10 with composite definitions
 
 -- ============================================================================
 -- 6) WASM
@@ -567,6 +563,8 @@ CREATE INDEX IF NOT EXISTS idx_wasm_event_attrs_contract ON wasm.event_attrs (co
 CREATE INDEX IF NOT EXISTS idx_ibc_channel ON ibc.packets (channel_id_src, status);
 CREATE INDEX IF NOT EXISTS idx_ibc_transfers_sender ON ibc.transfers (sender, sequence DESC);
 CREATE INDEX IF NOT EXISTS idx_ibc_transfers_receiver ON ibc.transfers (receiver, sequence DESC);
+CREATE INDEX IF NOT EXISTS idx_ibc_transfers_status ON ibc.transfers (status);
+CREATE INDEX IF NOT EXISTS idx_ibc_transfers_channel ON ibc.transfers (channel_id_src);
 CREATE INDEX IF NOT EXISTS idx_ibc_transfers_denom ON ibc.transfers (denom, sequence DESC);
 
 -- Gov by proposal (governance dashboard)

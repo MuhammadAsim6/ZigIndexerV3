@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS tokens.factory_supply_events_p0 PARTITION OF tokens.f
 
 -- Index for searching supply history of a specific token
 CREATE INDEX IF NOT EXISTS idx_factory_supply_denom ON tokens.factory_supply_events (denom);
-CREATE INDEX IF NOT EXISTS idx_factory_supply_action ON tokens.factory_supply_events (action);
+-- ♻️ IMPROVED: action alone has only 3 values — composite with denom is selective
+CREATE INDEX IF NOT EXISTS idx_factory_supply_action_denom ON tokens.factory_supply_events (action, denom);
 
 
 

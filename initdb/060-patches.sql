@@ -1,31 +1,68 @@
--- 020-patches.sql
--- Purpose: Additional performance indexes.
--- Cleaned up to remove redundancy with the new 010-schema.
+-- 060-patches.sql
+-- Purpose: Additional performance indexes and autovacuum settings.
+-- Updated: 2026-02-20 — Replaced weak indexes with composite versions,
+--          added critical missing indexes.
 
--- TRANSACTIONS: Optimization for success/failure queries
+-- TRANSACTIONS: Optimization for success/failure queries + signers GIN
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'core' AND table_name = 'transactions') THEN
     CREATE INDEX IF NOT EXISTS idx_txs_success ON core.transactions (height DESC, tx_index) WHERE code = 0;
     CREATE INDEX IF NOT EXISTS idx_txs_time ON core.transactions (time DESC);
+    -- 🔴 CRITICAL: GIN index for '$1 = ANY(signers)' queries
+    CREATE INDEX IF NOT EXISTS idx_txs_signers_gin ON core.transactions USING GIN (signers);
   END IF;
 END $$;
 
--- EVENTS: Extra lookup index
--- Note: core.events NOW HAS height (Added in 010), so this is safe.
+-- EVENTS: Composite indexes for event lookups
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'core' AND table_name = 'events') THEN
-    CREATE INDEX IF NOT EXISTS idx_events_type_msg ON core.events (event_type, msg_index);
+    -- ♻️ REPLACED: (event_type, msg_index) → (event_type, height DESC) for range scans
+    CREATE INDEX IF NOT EXISTS idx_events_type_height ON core.events (event_type, height DESC);
     CREATE INDEX IF NOT EXISTS idx_events_attrs_gin ON core.events USING GIN (attributes);
+    -- 🔴 HIGH: Lookup events by tx_hash
+    CREATE INDEX IF NOT EXISTS idx_events_tx_hash ON core.events (tx_hash, height DESC);
   END IF;
 END $$;
 
--- EVENT_ATTRS: Safety index
+-- EVENT_ATTRS: Composite index for key-based lookups
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'core' AND table_name = 'event_attrs') THEN
-    CREATE INDEX IF NOT EXISTS idx_event_attrs_key ON core.event_attrs (key);
+    -- ♻️ REPLACED: (key) → (key, height DESC) for range scans
+    CREATE INDEX IF NOT EXISTS idx_event_attrs_key_height ON core.event_attrs (key, height DESC);
+  END IF;
+END $$;
+
+-- GOV: Voter index for vote lookups
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'gov' AND table_name = 'votes') THEN
+    -- 🔴 HIGH: Filter votes by voter address
+    CREATE INDEX IF NOT EXISTS idx_gov_votes_voter ON gov.votes (voter, proposal_id DESC);
+  END IF;
+END $$;
+
+-- AUTHZ/FEEGRANT: Granter indexes (only grantee existed before)
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'authz_feegrant' AND table_name = 'authz_grants') THEN
+    CREATE INDEX IF NOT EXISTS idx_authz_grants_granter ON authz_feegrant.authz_grants (granter, height DESC);
+  END IF;
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'authz_feegrant' AND table_name = 'fee_grants') THEN
+    CREATE INDEX IF NOT EXISTS idx_fee_grants_granter ON authz_feegrant.fee_grants (granter, height DESC);
+  END IF;
+END $$;
+
+-- WASM: Contract lookup indexes
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'wasm' AND table_name = 'contracts') THEN
+    CREATE INDEX IF NOT EXISTS idx_wasm_contracts_creator ON wasm.contracts (creator);
+    CREATE INDEX IF NOT EXISTS idx_wasm_contracts_code_id ON wasm.contracts (code_id);
+    -- 🟠 MEDIUM: Fuzzy label search (pg_trgm already enabled)
+    CREATE INDEX IF NOT EXISTS idx_wasm_contracts_label_trgm ON wasm.contracts USING GIN (label gin_trgm_ops);
   END IF;
 END $$;
 

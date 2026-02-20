@@ -71,8 +71,9 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_swaps (
 -- Auto-Partition: 0 to 500k Blocks
 CREATE TABLE IF NOT EXISTS zigchain.dex_swaps_p0 PARTITION OF zigchain.dex_swaps FOR VALUES FROM (0) TO (500000);
 
-CREATE INDEX IF NOT EXISTS idx_dex_swaps_pool ON zigchain.dex_swaps(pool_id);
-CREATE INDEX IF NOT EXISTS idx_dex_swaps_sender ON zigchain.dex_swaps(sender_address);
+-- ♻️ IMPROVED: Composite indexes with block_height for sorted queries
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_pool_height ON zigchain.dex_swaps(pool_id, block_height DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_swaps_sender_height ON zigchain.dex_swaps(sender_address, block_height DESC);
 CREATE INDEX IF NOT EXISTS idx_dex_swaps_height ON zigchain.dex_swaps(block_height DESC);
 
 
@@ -96,8 +97,10 @@ CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity (
 
 CREATE TABLE IF NOT EXISTS zigchain.dex_liquidity_p0 PARTITION OF zigchain.dex_liquidity FOR VALUES FROM (0) TO (500000);
 
-CREATE INDEX IF NOT EXISTS idx_dex_liq_pool ON zigchain.dex_liquidity(pool_id);
-CREATE INDEX IF NOT EXISTS idx_dex_liq_sender ON zigchain.dex_liquidity(sender_address);
+-- ♻️ IMPROVED: Composite indexes with block_height for sorted queries
+CREATE INDEX IF NOT EXISTS idx_dex_liq_pool_height ON zigchain.dex_liquidity(pool_id, block_height DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_liq_sender_height ON zigchain.dex_liquidity(sender_address, block_height DESC);
+CREATE INDEX IF NOT EXISTS idx_dex_liq_height ON zigchain.dex_liquidity(block_height DESC);
 
 
 -- ============================================================================
